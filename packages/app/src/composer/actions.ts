@@ -196,6 +196,9 @@ export interface DispatchComposerAgentMessageInput {
   submission: MessageSubmissionWriter;
   activeTurnBehavior?: ActiveTurnBehavior;
   activeTurnId?: string;
+  /** Reuse an existing ID (e.g. a queued message's ID) instead of minting a new
+   * one, so a client message keeps the same identity across a queue drain. */
+  clientMessageId?: string;
 }
 
 export async function dispatchComposerAgentMessage(
@@ -204,7 +207,7 @@ export async function dispatchComposerAgentMessage(
   const wirePayload = splitComposerAttachmentsForSubmit(input.attachments, {
     format: input.attachmentSubmitFormat,
   });
-  const clientMessageId = generateMessageId();
+  const clientMessageId = input.clientMessageId ?? generateMessageId();
   const userMessage = createUserMessage({
     clientMessageId,
     text: input.text,
@@ -294,7 +297,11 @@ export interface SendQueuedComposerMessageNowInput {
   agentId: string;
   messageId: string;
   queue: QueueWriter;
-  submitMessage: (input: { text: string; attachments: ComposerAttachment[] }) => Promise<void>;
+  submitMessage: (input: {
+    text: string;
+    attachments: ComposerAttachment[];
+    clientMessageId: string;
+  }) => Promise<void>;
   failedToSendMessage?: string;
 }
 
@@ -317,7 +324,11 @@ export async function sendQueuedComposerMessageNow(
     return next;
   });
   try {
-    await input.submitMessage({ text: item.text, attachments: item.attachments });
+    await input.submitMessage({
+      text: item.text,
+      attachments: item.attachments,
+      clientMessageId: item.id,
+    });
     return { status: "submitted" };
   } catch (error) {
     input.queue.write((prev) => {

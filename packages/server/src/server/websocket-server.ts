@@ -36,7 +36,7 @@ import type { HostnamesConfig } from "./hostnames.js";
 import { isHostnameAllowed } from "./hostnames.js";
 import {
   Session,
-  type SessionLifecycleIntent,
+  type SessionLifecycleHandler,
   type SessionOptions,
   type SessionRuntimeMetrics,
 } from "./session.js";
@@ -159,6 +159,11 @@ interface WebSocketServerConfig {
   daemonStatusRpc?: boolean;
   relayConfig?: boolean;
   startPaused?: boolean;
+  getRestartStatus?: () => {
+    state: "running" | "preparing" | "paused" | "restoring";
+    generationId?: string;
+    error?: string;
+  };
 }
 
 type WebSocketRuntimeMetrics = SessionRuntimeMetrics & CheckoutDiffMetrics;
@@ -467,7 +472,7 @@ interface SocketSessionOptions {
   onBinaryMessage?: (frame: Uint8Array) => void;
   onBinaryMessageToSource?: (source: object, frame: Uint8Array) => Promise<void>;
   getTransportBufferedAmount?: (source?: object) => number | null;
-  onLifecycleIntent?: (intent: SessionLifecycleIntent) => void;
+  onLifecycleIntent?: SessionLifecycleHandler;
   hubExecutionAgents?: HubExecutionAgents;
   hubRelationships?: HubRelationshipManagement;
 }
@@ -570,7 +575,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly workspaceSetupSnapshots = new Map<string, WorkspaceSetupSnapshot>();
   private readonly workspaceSetupRuntime: WorkspaceSetupRuntime;
   private readonly providerSnapshotManager: ProviderSnapshotManager;
-  private onLifecycleIntent!: ((intent: SessionLifecycleIntent) => void) | null;
+  private onLifecycleIntent!: SessionLifecycleHandler | null;
   private onBranchChanged!:
     | ((workspaceId: string, oldBranch: string | null, newBranch: string | null) => void)
     | null;
@@ -588,6 +593,16 @@ export class VoiceAssistantWebSocketServer {
   private readonly hubRelationships: HubRelationshipManagement | null;
   private connectionLifecycle: "starting" | "accepting" | "stopping" = "accepting";
   private readonly advertiseDaemonStatusRpc: boolean;
+  private readonly getRestartStatus: WebSocketServerConfig["getRestartStatus"];
+
+  async drainAgentRequests(): Promise<void> {
+    await Promise.all([this.messageReceipts.drain(), this.creationService.drain()]);
+  }
+
+  broadcastRestartStatus(): void {
+    for (const [socket, connection] of this.sessions)
+      this.sendToClient(socket, this.createServerInfoMessage(connection.session));
+  }
   private readonly advertiseRelayConfig: boolean;
   private readonly directorySync = new DirectorySyncService();
   private readonly pluginRuntime: SessionOptions["pluginRuntime"];
@@ -631,7 +646,7 @@ export class VoiceAssistantWebSocketServer {
       finalTimeoutMs?: number;
     },
     daemonVersion?: string,
-    onLifecycleIntent?: (intent: SessionLifecycleIntent) => void,
+    onLifecycleIntent?: SessionLifecycleHandler,
     projectRegistry?: ProjectRegistry,
     workspaceRegistry?: WorkspaceRegistry,
     scheduleService?: ScheduleService,
@@ -663,6 +678,7 @@ export class VoiceAssistantWebSocketServer {
     this.workspaceSetupRuntime = workspaceSetupRuntime;
     this.advertiseDaemonStatusRpc = wsConfig.daemonStatusRpc !== false;
     this.advertiseRelayConfig = wsConfig.relayConfig !== false;
+    this.getRestartStatus = wsConfig.getRestartStatus;
     this.connectionLifecycle = wsConfig.startPaused === true ? "starting" : "accepting";
     this.serverId = serverId;
     if (typeof daemonVersion !== "string" || daemonVersion.trim().length === 0) {
@@ -763,7 +779,7 @@ export class VoiceAssistantWebSocketServer {
     speech: SpeechService | null | undefined;
     terminalManager: TerminalManager | null | undefined;
     dictation: { finalTimeoutMs?: number } | undefined;
-    onLifecycleIntent: ((intent: SessionLifecycleIntent) => void) | undefined;
+    onLifecycleIntent: SessionLifecycleHandler | undefined;
     serviceProxy: ServiceProxySubsystem | null | undefined;
     scriptRuntimeStore: WorkspaceScriptRuntimeStore | null | undefined;
     onBranchChanged:
@@ -1419,9 +1435,7 @@ export class VoiceAssistantWebSocketServer {
         }
         return maxBuffered;
       },
-      onLifecycleIntent: (intent) => {
-        this.onLifecycleIntent?.(intent);
-      },
+      onLifecycleIntent: (intent) => this.onLifecycleIntent?.(intent),
       hubExecutionAgents: admission.hubExecutionAgents,
       hubRelationships: this.hubRelationships ?? undefined,
     });
@@ -1771,6 +1785,13 @@ export class VoiceAssistantWebSocketServer {
     return {
       status: "server_info",
       protocolVersion: WS_PROTOCOL_VERSION,
+      ...(this.getRestartStatus
+        ? {
+            restartRecoveryState: this.getRestartStatus().state,
+            restartRecoveryGeneration: this.getRestartStatus().generationId,
+            restartRecoveryError: this.getRestartStatus().error,
+          }
+        : {}),
       serverId: this.serverId,
       hostname: getHostname(),
       version: this.daemonVersion,
@@ -1784,6 +1805,7 @@ export class VoiceAssistantWebSocketServer {
         agentRequestReceipts: true,
         workspaceRequestReceipts: true,
         creationLifecycle: true,
+        ...(this.getRestartStatus ? { restartRecovery: true } : {}),
         hubAgentRpc: true,
         // COMPAT(directorySync): added in v0.3.x, remove gate after 2027-02-12.
         directorySync: true,

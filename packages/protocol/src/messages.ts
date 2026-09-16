@@ -1815,6 +1815,7 @@ export const CancelAgentRequestMessageSchema = z.object({
 
 export const RestartServerRequestMessageSchema = z.object({
   type: z.literal("restart_server_request"),
+  prepareOnly: z.boolean().optional(),
   reason: z.string().optional(),
   requestId: z.string(),
 });
@@ -3524,6 +3525,10 @@ export const ServerInfoStatusPayloadSchema = z
   .object({
     status: z.literal("server_info"),
     protocolVersion: z.number().int().optional(),
+    // COMPAT(restartRecovery): added in fork v0.8.0; remove optional parsing after 2027-03-16.
+    restartRecoveryState: z.enum(["running", "preparing", "paused", "restoring"]).optional(),
+    restartRecoveryGeneration: z.string().optional(),
+    restartRecoveryError: z.string().optional(),
     serverId: z.string().trim().min(1),
     hostname: ServerInfoHostnameSchema.optional(),
     version: ServerInfoVersionSchema.optional(),
@@ -3540,6 +3545,8 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(workspaceRequestReceipts): added in v0.8.0; remove gate after 2027-03-07.
         workspaceRequestReceipts: z.boolean().optional(),
         creationLifecycle: z.boolean().optional(),
+        // COMPAT(restartRecovery): added in fork v0.8.0; remove gate after 2027-03-16.
+        restartRecovery: z.boolean().optional(),
         // COMPAT(hubAgentRpc): added in v0.8.0; remove gate after 2027-03-05.
         hubAgentRpc: z.boolean().optional(),
         providersSnapshot: z.boolean().optional(),
@@ -3781,6 +3788,7 @@ export const AgentRefreshedStatusPayloadSchema = z
 
 export const RestartRequestedStatusPayloadSchema = z.object({
   status: z.literal("restart_requested"),
+  generationId: z.string().optional(),
   clientId: z.string(),
   reason: z.string().optional(),
   requestId: z.string(),

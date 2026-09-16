@@ -1,3 +1,5 @@
+import { requiresRestartAdmission } from "./restart/request-admission.js";
+import { RestartInProgressError } from "./restart/restart-errors.js";
 import { searchTimeline } from "./agent/chat-search/index.js";
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
 import { BrowserAutomationHostCapabilitySchema } from "@getpaseo/protocol/browser-automation/capabilities";
@@ -6,8 +8,7 @@ import type {
   UsageReportEntry,
   ProviderUsage,
 } from "@getpaseo/protocol/messages";
-import { relative } from "node:path";
-import { isAbsolute } from "node:path";
+import { relative, isAbsolute } from "node:path";
 import { CreationService } from "./creation/index.js";
 import type { CreationSnapshot, AgentCreateRequest } from "@getpaseo/protocol/messages";
 import type { MessageReceipts } from "./message-receipts/index.js";
@@ -448,7 +449,7 @@ export interface SessionOptions {
   onBinaryMessage?: (frame: Uint8Array) => void;
   onBinaryMessageToSource?: (source: object, frame: Uint8Array) => Promise<void>;
   getTransportBufferedAmount?: (source?: object) => number | null;
-  onLifecycleIntent?: (intent: SessionLifecycleIntent) => void;
+  onLifecycleIntent?: SessionLifecycleHandler;
   onWorkspaceRecovered?: (workspace: PersistedWorkspaceRecord) => Promise<void>;
   logger: pino.Logger;
   downloadTokenStore: DownloadTokenStore;
@@ -559,6 +560,10 @@ export interface SessionOptions {
   getWebSocketRuntimeMetrics?: () => DaemonWebSocketRuntimeDiagnosticSnapshot | null;
 }
 
+export type SessionLifecycleHandler = (
+  intent: SessionLifecycleIntent,
+) => void | Promise<void | { generationId: string }>;
+
 export type SessionLifecycleIntent =
   | {
       type: "shutdown";
@@ -568,6 +573,7 @@ export type SessionLifecycleIntent =
     }
   | {
       type: "restart";
+      prepareOnly?: boolean;
       clientId: string;
       requestId: string;
       reason: string;
@@ -708,7 +714,7 @@ export class Session {
     | ((source: object, frame: Uint8Array) => Promise<void>)
     | null;
   private readonly getTransportBufferedAmount: (source?: object) => number | null;
-  private readonly onLifecycleIntent: ((intent: SessionLifecycleIntent) => void) | null;
+  private readonly onLifecycleIntent: SessionLifecycleHandler | null;
   private readonly onWorkspaceRecovered:
     | ((workspace: PersistedWorkspaceRecord) => Promise<void>)
     | null;
@@ -2129,7 +2135,13 @@ export class Session {
         return;
       }
       try {
-        await this.dispatchInboundMessage(msg, source);
+        if (requiresRestartAdmission(msg.type)) {
+          await this.agentManager.runRequestAdmission(() =>
+            this.dispatchInboundMessage(msg, source),
+          );
+        } else {
+          await this.dispatchInboundMessage(msg, source);
+        }
       } catch (error) {
         const err = error instanceof Error ? error : new Error(String(error));
         this.sessionLogger.error({ err }, "Error handling message");
@@ -2144,7 +2156,7 @@ export class Session {
                 requestId,
                 requestType: msg.type,
                 error: `Request failed: ${err.message}`,
-                code: "handler_error",
+                code: error instanceof RestartInProgressError ? error.code : "handler_error",
               },
             });
           } catch (emitError) {
@@ -2572,7 +2584,7 @@ export class Session {
       case "dictation_stream_cancel":
         return this.voiceSessions.handleMessage(msg);
       case "restart_server_request":
-        return this.handleRestartServerRequest(msg.requestId, msg.reason);
+        return this.handleRestartServerRequest(msg.requestId, msg.reason, msg.prepareOnly);
       case "shutdown_server_request":
         return this.handleShutdownServerRequest(msg.requestId);
       case "client_heartbeat":
@@ -3096,7 +3108,11 @@ export class Session {
     this.terminalController.handleBinaryFrame(binaryFrame.frame, source);
   }
 
-  private async handleRestartServerRequest(requestId: string, reason?: string): Promise<void> {
+  private async handleRestartServerRequest(
+    requestId: string,
+    reason?: string,
+    prepareOnly?: boolean,
+  ): Promise<void> {
     const lifecycleReason = normalizeClientRestartRpcReason(reason);
     const payload: { status: string } & Record<string, unknown> = {
       status: "restart_requested",
@@ -3107,17 +3123,16 @@ export class Session {
     }
     payload.requestId = requestId;
 
-    this.sessionLogger.warn({ reason: lifecycleReason }, "Restart requested via websocket");
-    this.emit({
-      type: "status",
-      payload,
-    });
-
-    this.emitLifecycleIntent({
+    const result = await this.emitLifecycleIntent({
       type: "restart",
       clientId: this.clientId,
       requestId,
       reason: lifecycleReason,
+      prepareOnly,
+    });
+    this.emit({
+      type: "status",
+      payload: { ...payload, ...(result ? { generationId: result.generationId } : {}) },
     });
   }
 
@@ -3133,7 +3148,7 @@ export class Session {
       },
     });
 
-    this.emitLifecycleIntent({
+    await this.emitLifecycleIntent({
       type: "shutdown",
       clientId: this.clientId,
       requestId,
@@ -3141,15 +3156,11 @@ export class Session {
     });
   }
 
-  private emitLifecycleIntent(intent: SessionLifecycleIntent): void {
-    if (!this.onLifecycleIntent) {
-      return;
-    }
-    try {
-      this.onLifecycleIntent(intent);
-    } catch (error) {
-      this.sessionLogger.error({ err: error, intent }, "Lifecycle intent handler failed");
-    }
+  private async emitLifecycleIntent(
+    intent: SessionLifecycleIntent,
+  ): Promise<void | { generationId: string }> {
+    if (!this.onLifecycleIntent) throw new Error("Daemon lifecycle operations unavailable");
+    return this.onLifecycleIntent(intent);
   }
 
   private async handleDeleteAgentRequest(agentId: string, requestId: string): Promise<void> {
@@ -8119,6 +8130,13 @@ export class Session {
       });
     } catch (error) {
       if (this.delivery.requestSignal.aborted) return;
+      if (error instanceof RestartInProgressError) {
+        this.emit({
+          type: "rpc_error",
+          payload: { requestId: msg.requestId, code: error.code, error: error.message },
+        });
+        return;
+      }
       this.handleAgentRunError(resolved.agentId, error, "Failed to send agent message");
       this.emit({
         type: "send_agent_message_response",

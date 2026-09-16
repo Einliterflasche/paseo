@@ -1,8 +1,17 @@
+import { CheckpointStore } from "./restart/checkpoint-store.js";
+import { RestartController } from "./restart/restart-controller.js";
+import { DaemonCheckpointSchema } from "./restart/daemon-checkpoint.js";
+import {
+  snapshotFinishNotificationWatches,
+  restoreFinishNotificationWatch,
+  retryPendingFinishNotifications,
+  drainFinishNotificationWatches,
+} from "./agent/agent-prompt.js";
 import { describeHookWorkspace } from "./plugins/lifecycle/index.js";
 import express from "express";
 import { createServer as createHTTPServer, type IncomingMessage, type ServerResponse } from "http";
 import { constants, existsSync, unlinkSync } from "fs";
-import { open, rm, stat } from "fs/promises";
+import { open, stat } from "fs/promises";
 import { randomUUID } from "node:crypto";
 import { hostname as getHostname } from "node:os";
 import path from "node:path";
@@ -199,7 +208,6 @@ import {
   type ManagedProcessRegistry,
 } from "./managed-processes/managed-processes.js";
 import { terminateWithTreeKill } from "../utils/tree-kill.js";
-import { withTimeout } from "../utils/promise-timeout.js";
 import { isHostnameAllowed, type HostnamesConfig } from "./hostnames.js";
 import {
   createRequireBearerMiddleware,
@@ -381,6 +389,7 @@ export type DaemonLifecycleIntent =
     }
   | {
       type: "restart";
+      prepareOnly?: boolean;
       clientId: string;
       requestId: string;
       reason: string;
@@ -472,6 +481,12 @@ export interface PaseoDaemon {
   browserToolsBroker: BrowserToolsBroker;
   start(): Promise<void>;
   stop(): Promise<void>;
+  prepareRestart(): Promise<{ generationId: string }>;
+  getRestartStatus(): {
+    state: "running" | "preparing" | "paused" | "restoring";
+    generationId?: string;
+    error?: string;
+  };
   getListenTarget(): ListenTarget | null;
   getServerId(): string;
 }
@@ -581,13 +596,7 @@ export async function createPaseoDaemon(
 ): Promise<PaseoDaemon> {
   configureGitProcessPolicy(config.git ?? resolveGitProcessPolicy({ env: process.env }));
   const logger = rootLogger.child({ module: "bootstrap" });
-  const obsoleteTimelineDirectory = path.join(config.paseoHome, "agent-timelines");
-  await rm(obsoleteTimelineDirectory, { recursive: true, force: true }).catch((error) => {
-    logger.warn(
-      { err: error, path: obsoleteTimelineDirectory },
-      "Failed to remove obsolete agent timeline data",
-    );
-  });
+  // Older transcript stores remain available for inspection or deliberate recovery.
   const bootstrapStart = performance.now();
   const elapsed = () => `${(performance.now() - bootstrapStart).toFixed(0)}ms`;
   const daemonVersion = config.daemonVersion ?? resolveDaemonVersion(import.meta.url);
@@ -1352,7 +1361,36 @@ export async function createPaseoDaemon(
     createPaseoWorktreeWorkspace: createSchedulePaseoWorktreeExternal,
     archiveWorkspace: archiveScheduleWorkspaceExternal,
   });
-  await scheduleService.start();
+  const restartController = new RestartController({
+    store: new CheckpointStore(config.paseoHome, DaemonCheckpointSchema.parse),
+    changed: () => wsServer?.broadcastRestartStatus(),
+    capture: async () => {
+      await scheduleService.pauseForRestart();
+      await agentManager.quiesceForRestart();
+      await workspaceSetupRuntime.drain();
+      await wsServer?.drainAgentRequests();
+      // Setup completion may append after provider quiescence. Export again once
+      // all external writers have settled; already closed sessions are not closed twice.
+      const stableAgents = await agentManager.quiesceForRestart();
+      await drainFinishNotificationWatches(agentManager);
+      return DaemonCheckpointSchema.parse({
+        version: 1,
+        agents: stableAgents,
+        notifications: snapshotFinishNotificationWatches(agentManager),
+        schedules: await scheduleService.snapshotForRestart(),
+      });
+    },
+  });
+  const restartCheckpoint = await restartController.claim();
+  const initializeScheduleRecovery = async () => {
+    if (restartCheckpoint) {
+      await agentManager.installRestartCheckpoint(restartCheckpoint.snapshot.agents);
+      scheduleService.restoreAfterRestart(restartCheckpoint.snapshot.schedules);
+    }
+    await scheduleService.start();
+    if (restartCheckpoint) await scheduleService.pauseForRestart();
+  };
+  await initializeScheduleRecovery();
   agentManager.setAgentArchivedCallback(async (agentId) => {
     try {
       await scheduleService.completeForAgent(agentId);
@@ -1678,6 +1716,7 @@ export async function createPaseoDaemon(
                 daemonStatusRpc: dependencies.serverFeatureOverrides?.daemonStatusRpc,
                 relayConfig: dependencies.serverFeatureOverrides?.relayConfig,
                 startPaused: true,
+                getRestartStatus: () => restartController.status,
               },
               workspaceAutoName,
               daemonAuth,
@@ -1687,12 +1726,26 @@ export async function createPaseoDaemon(
                 finalTimeoutMs: config.dictationFinalTimeoutMs,
               },
               daemonVersion,
-              (intent) => {
-                try {
-                  config.onLifecycleIntent?.(intent);
-                } catch (error) {
-                  logger.error({ err: error, intent }, "Failed to handle daemon lifecycle intent");
+              async (intent) => {
+                if (intent.type === "restart") {
+                  if (!intent.prepareOnly && !config.onLifecycleIntent) {
+                    throw new Error("No daemon replacement handler is configured");
+                  }
+                  const checkpoint = await restartController.prepare();
+                  if (!intent.prepareOnly) {
+                    await restartController.replace(async () => {
+                      setImmediate(() => {
+                        try {
+                          config.onLifecycleIntent?.(intent);
+                        } catch (error) {
+                          logger.error({ err: error }, "Checkpoint ready but replacement failed");
+                        }
+                      });
+                    });
+                  }
+                  return { generationId: checkpoint.generationId };
                 }
+                config.onLifecycleIntent?.(intent);
               },
               projectRegistry,
               workspaceRegistry,
@@ -1777,6 +1830,22 @@ export async function createPaseoDaemon(
       // model loading doesn't block the server from accepting connections.
       speechService.start();
       scriptHealthMonitor.start();
+      if (restartCheckpoint) {
+        try {
+          await agentManager.resumeRestartCheckpoint(restartCheckpoint.snapshot.agents, () => {
+            for (const watch of restartCheckpoint.snapshot.notifications) {
+              restoreFinishNotificationWatch({ agentManager, agentStorage, logger }, watch);
+            }
+            scheduleService.resumeRestoredRuns();
+          });
+          await retryPendingFinishNotifications(agentManager);
+          scheduleService.resumeAfterRestartFailure();
+          restartController.completeRestoration();
+        } catch (error) {
+          restartController.failRestoration(error);
+          logger.error({ err: error }, "Restart restoration paused; saved state retained");
+        }
+      }
     } catch (error) {
       localCredential = null;
       await deleteLocalCredential(config.paseoHome);
@@ -1806,7 +1875,7 @@ export async function createPaseoDaemon(
     // Freeze both ingress and registration before taking the agent closure snapshot.
     wsServer?.prepareForShutdown();
     agentManager.prepareForShutdown();
-    await closeAllAgents(logger, agentManager);
+    await agentManager.closeAgentsForShutdown();
     await agentManager.flushForShutdown().catch(() => undefined);
     detachAgentStoragePersistence();
     await agentStorage.flush().catch(() => undefined);
@@ -1845,34 +1914,11 @@ export async function createPaseoDaemon(
     serviceProxy,
     scriptRuntimeStore,
     browserToolsBroker,
+    prepareRestart: () => restartController.prepare(),
+    getRestartStatus: () => restartController.status,
     start,
     stop,
     getListenTarget: () => boundListenTarget,
     getServerId: () => serverId,
   };
-}
-
-/**
- * Closing an agent asks its provider to close the session and waits for the
- * answer. A provider that never answers must not hold the daemon open, so a
- * close that outlives this deadline is abandoned; `agentProviderRuntime`
- * shutdown runs next and rejects the request that was still pending.
- */
-const AGENT_CLOSE_TIMEOUT_MS = 5_000;
-
-async function closeAllAgents(logger: Logger, agentManager: AgentManager): Promise<void> {
-  const agents = agentManager.listAgents();
-  await Promise.all(
-    agents.map(async (agent) => {
-      try {
-        await withTimeout({
-          promise: agentManager.closeAgent(agent.id),
-          timeoutMs: AGENT_CLOSE_TIMEOUT_MS,
-          label: `close agent ${agent.id}`,
-        });
-      } catch (err) {
-        logger.error({ err, agentId: agent.id }, "Failed to close agent");
-      }
-    }),
-  );
 }

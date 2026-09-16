@@ -1,15 +1,43 @@
 import { randomUUID } from "node:crypto";
-import {
-  TimelineProjection,
-  selectProjectedTimelinePage,
-  type ProjectedTimelineRow,
-} from "./timeline-projection.js";
+import { TimelineProjection, selectProjectedTimelinePage } from "./timeline-projection.js";
+import { AgentTimelineItemPayloadSchema } from "@getpaseo/protocol/messages";
+import { z } from "zod";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type {
   AgentTimelineFetchOptions,
   AgentTimelineFetchResult,
   AgentTimelineRow,
 } from "./agent-timeline-store-types.js";
+
+/**
+ * Raw, unprojected timeline state for one agent (or provider-subagent). Distinct from
+ * `AgentTimelineFetchResult`, which is a paginated/projected UI view — restart checkpoints
+ * must round-trip the exact rows, epoch, and sequence counter, not a fetch window.
+ */
+export const AgentTimelineRowSchema: z.ZodType<AgentTimelineRow, unknown> = z.object({
+  seq: z.number().int().nonnegative(),
+  timestamp: z.string(),
+  item: AgentTimelineItemPayloadSchema,
+  turnId: z.string().optional(),
+  providerMessageId: z.string().optional(),
+});
+
+export const AgentTimelineSnapshotSchema = z
+  .object({
+    epoch: z.string(),
+    nextSeq: z.number().int().nonnegative(),
+    rows: z.array(AgentTimelineRowSchema),
+  })
+  .refine(({ rows, nextSeq }) => {
+    let previous = -1;
+    for (const row of rows) {
+      if (row.seq <= previous || row.seq >= nextSeq) return false;
+      previous = row.seq;
+    }
+    return true;
+  }, "Timeline sequences must increase and precede nextSeq");
+
+export type AgentTimelineSnapshot = z.infer<typeof AgentTimelineSnapshotSchema>;
 
 export interface SeedAgentTimelineOptions {
   items?: readonly AgentTimelineItem[];
@@ -21,6 +49,7 @@ export interface SeedAgentTimelineOptions {
 
 interface AgentTimelineState {
   epoch: string;
+  rows: AgentTimelineRow[];
   projection: TimelineProjection;
   minSeq: number;
   nextSeq: number;
@@ -37,6 +66,45 @@ export class InMemoryAgentTimelineStore {
     return this.states.has(agentId);
   }
 
+  keys(): string[] {
+    return [...this.states.keys()];
+  }
+
+  clear(): void {
+    this.states.clear();
+  }
+
+  /** Raw rows/epoch/nextSeq for one agent, not a projected fetch window. */
+  exportSnapshot(agentId: string): AgentTimelineSnapshot {
+    const state = this.requireState(agentId);
+    return {
+      epoch: state.epoch,
+      nextSeq: state.nextSeq,
+      rows: state.rows.map(cloneRow),
+    };
+  }
+
+  exportAll(): Record<string, AgentTimelineSnapshot> {
+    const result: Record<string, AgentTimelineSnapshot> = {};
+    for (const agentId of this.states.keys()) {
+      result[agentId] = this.exportSnapshot(agentId);
+    }
+    return result;
+  }
+
+  /** Replaces this agent's state exactly with the snapshot, no derivation. */
+  restoreSnapshot(agentId: string, snapshot: AgentTimelineSnapshot): void {
+    const projection = new TimelineProjection();
+    for (const row of snapshot.rows) projection.append(row);
+    this.states.set(agentId, {
+      projection,
+      minSeq: snapshot.rows[0]?.seq ?? 0,
+      epoch: snapshot.epoch,
+      nextSeq: snapshot.nextSeq,
+      rows: snapshot.rows.map(cloneRow),
+    });
+  }
+
   initialize(agentId: string, options?: SeedAgentTimelineOptions): void {
     const timestamp = options?.timestamp ?? new Date().toISOString();
     const rows = options?.rows?.length
@@ -47,8 +115,9 @@ export class InMemoryAgentTimelineStore {
     for (const row of rows) projection.append(row);
     this.states.set(agentId, {
       epoch: options?.epoch ?? randomUUID(),
+      rows,
       projection,
-      minSeq: projection.getRows()[0]?.seqStart ?? 0,
+      minSeq: rows[0]?.seq ?? 0,
       nextSeq,
     });
   }
@@ -63,8 +132,8 @@ export class InMemoryAgentTimelineStore {
       .map((row) => row.item);
   }
 
-  getRows(agentId: string): ProjectedTimelineRow[] {
-    return this.requireState(agentId).projection.getRows().map(cloneRow);
+  getRows(agentId: string): AgentTimelineRow[] {
+    return this.requireState(agentId).rows.map(cloneRow);
   }
 
   getSubmittedUserMessage(agentId: string, clientMessageId: string): AgentTimelineRow | null {
@@ -83,10 +152,15 @@ export class InMemoryAgentTimelineStore {
     clientMessageId: string,
     providerMessageId: string,
   ): AgentTimelineRow | null {
-    return this.requireState(agentId).projection.enrichSubmittedUserMessage(
-      clientMessageId,
-      providerMessageId,
+    const state = this.requireState(agentId);
+    const index = state.rows.findIndex(
+      (row) => row.item.type === "user_message" && row.item.clientMessageId === clientMessageId,
     );
+    if (index < 0) return null;
+    const row = { ...state.rows[index], providerMessageId };
+    state.rows[index] = row;
+    state.projection.enrichSubmittedUserMessage(clientMessageId, providerMessageId);
+    return cloneRow(row);
   }
 
   getEpoch(agentId: string): string {
@@ -144,6 +218,7 @@ export class InMemoryAgentTimelineStore {
     };
     state.nextSeq += 1;
     if (state.minSeq === 0) state.minSeq = row.seq;
+    state.rows.push(row);
     state.projection.append(row);
     return cloneRow(row);
   }

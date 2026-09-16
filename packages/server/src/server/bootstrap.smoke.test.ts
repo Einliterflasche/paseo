@@ -80,7 +80,7 @@ describe("paseo daemon bootstrap", () => {
     }
   });
 
-  test("keeps timeline activity in memory and removes obsolete timeline files at startup", async () => {
+  test("keeps timeline activity in memory and never removes earlier transcript files at startup", async () => {
     const paseoHomeRoot = await mkdtemp(path.join(os.tmpdir(), "paseo-timeline-cleanup-"));
     const paseoHome = path.join(paseoHomeRoot, ".paseo");
     const obsoleteTimelineDirectory = path.join(paseoHome, "agent-timelines");
@@ -90,7 +90,9 @@ describe("paseo daemon bootstrap", () => {
 
     const daemonHandle = await createTestPaseoDaemon({ paseoHomeRoot, cleanup: false });
     try {
-      await expect(access(obsoleteTimelineDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(path.join(obsoleteTimelineDirectory, "obsolete.json"), "utf8")).toBe(
+        "{}\n",
+      );
 
       const agent = await daemonHandle.daemon.agentManager.createAgent(
         { provider: "codex", cwd: agentCwd },
@@ -103,7 +105,9 @@ describe("paseo daemon bootstrap", () => {
       });
       await daemonHandle.daemon.agentManager.flush();
 
-      await expect(access(obsoleteTimelineDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(path.join(obsoleteTimelineDirectory, "obsolete.json"), "utf8")).toBe(
+        "{}\n",
+      );
     } finally {
       await daemonHandle.close();
       await Promise.all([

@@ -44,6 +44,7 @@ type Record = z.infer<typeof RecordSchema>;
 
 /** Owns creation across socket lifetimes. Resource owners perform work; this module commits its milestones. */
 export class CreationService {
+  private readonly writeFailures = new Map<string, unknown>();
   private admission: Promise<unknown> = Promise.resolve();
   private readonly active = new Map<string, Promise<CreationSnapshot>>();
   private readonly receiptOperations = new Map<string, Promise<void>>();
@@ -56,6 +57,18 @@ export class CreationService {
     ) => Promise<void> = async () => {},
     private readonly legacyDirectory?: string,
   ) {}
+
+  async drain(): Promise<void> {
+    await this.admission;
+    while (this.active.size || this.receiptOperations.size) {
+      await Promise.allSettled([...this.active.values(), ...this.receiptOperations.values()]);
+    }
+    if (this.writeFailures.size)
+      throw new AggregateError(
+        [...this.writeFailures.values()],
+        "Creation receipts could not be persisted",
+      );
+  }
 
   async create(input: CreationInput, observer?: Observer): Promise<CreationSnapshot> {
     const identity = identityFor(input.kind, input.key);
@@ -308,9 +321,15 @@ export class CreationService {
   private write(identity: string, record: Record): Promise<void> {
     // Serialize now: the runner mutates the record after queueing this write.
     const contents = JSON.stringify(record, null, 2);
-    return this.accessReceipt(identity, () =>
-      writeFileAtomic(join(this.directory, `${identity}.json`), contents),
-    );
+    return this.accessReceipt(identity, async () => {
+      try {
+        await writeFileAtomic(join(this.directory, `${identity}.json`), contents);
+        this.writeFailures.delete(identity);
+      } catch (error) {
+        this.writeFailures.set(identity, error);
+        throw error;
+      }
+    });
   }
   private read(identity: string): Promise<Record | null> {
     return this.accessReceipt(identity, async () => {

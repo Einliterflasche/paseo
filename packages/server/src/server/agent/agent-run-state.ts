@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { recoveryInput, type RecoveryInput } from "../restart/recovery-input.js";
+import type { AgentPromptInput, AgentRunOptions } from "./agent-sdk-types.js";
 
 import { getAgentStreamEventTurnId, type AgentStreamEvent } from "./agent-sdk-types.js";
 
@@ -42,6 +44,31 @@ export interface ForegroundRunAgentState {
 
 export class AgentRunState {
   private readonly runs = new Map<string, TrackedAgentRun>();
+  private readonly recovery = new Map<string, RecoveryInput[]>();
+
+  rememberInput(
+    agentId: string,
+    prompt: AgentPromptInput,
+    options: AgentRunOptions | undefined,
+    intent: "run" | "steer",
+  ): void {
+    const input = recoveryInput(prompt, options, intent);
+    const current = intent === "run" ? [] : (this.recovery.get(agentId) ?? []);
+    if (!current.some((entry) => entry.id === input.id)) current.push(input);
+    this.recovery.set(agentId, current);
+  }
+
+  recoveryInputs(agentId: string): RecoveryInput[] {
+    return structuredClone(this.recovery.get(agentId) ?? []);
+  }
+
+  restoreInputs(agentId: string, inputs: RecoveryInput[]): void {
+    this.recovery.set(agentId, structuredClone(inputs));
+  }
+
+  forgetInputs(agentId: string): void {
+    this.recovery.delete(agentId);
+  }
 
   createPendingRun(agentId: string): PendingForegroundRun {
     const pendingRun = createPendingForegroundRun();

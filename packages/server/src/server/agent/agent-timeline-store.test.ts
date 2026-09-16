@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
+import { AgentTimelineSnapshotSchema, InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 
 describe("InMemoryAgentTimelineStore", () => {
   it("clamps an overshooting before cursor into the bounded tail window", () => {
@@ -103,6 +103,74 @@ describe("InMemoryAgentTimelineStore", () => {
         },
       ],
     });
+  });
+
+  it("exports raw rows/epoch/nextSeq exactly, not a projected fetch window", () => {
+    const store = new InMemoryAgentTimelineStore();
+    store.initialize("agent-1", {
+      epoch: "epoch-1",
+      nextSeq: 4,
+      rows: [
+        {
+          seq: 1,
+          timestamp: "2026-01-01T00:00:00.000Z",
+          item: { type: "assistant_message", text: "one" },
+          turnId: "turn-1",
+        },
+        {
+          seq: 2,
+          timestamp: "2026-01-01T00:00:01.000Z",
+          item: { type: "assistant_message", text: "two" },
+          providerMessageId: "provider-msg-2",
+        },
+      ],
+    });
+
+    const snapshot = store.exportSnapshot("agent-1");
+    expect(snapshot).toEqual({
+      epoch: "epoch-1",
+      nextSeq: 4,
+      rows: store.getRows("agent-1"),
+    });
+    expect(() => AgentTimelineSnapshotSchema.parse(snapshot)).not.toThrow();
+  });
+
+  it("restoreSnapshot round-trips exactly through exportSnapshot for a fresh agent id", () => {
+    const source = new InMemoryAgentTimelineStore();
+    source.initialize("agent-1", {
+      epoch: "epoch-1",
+      nextSeq: 9,
+      rows: [
+        {
+          seq: 5,
+          timestamp: "2026-01-01T00:00:00.000Z",
+          item: { type: "assistant_message", text: "five" },
+        },
+        {
+          seq: 8,
+          timestamp: "2026-01-01T00:00:03.000Z",
+          item: { type: "assistant_message", text: "eight" },
+        },
+      ],
+    });
+    const snapshot = source.exportSnapshot("agent-1");
+
+    const restored = new InMemoryAgentTimelineStore();
+    restored.restoreSnapshot("agent-2", snapshot);
+
+    expect(restored.exportSnapshot("agent-2")).toEqual(snapshot);
+    expect(restored.getEpoch("agent-2")).toBe("epoch-1");
+    // The restored sequence counter is exactly seeded, not re-derived from row count.
+    expect(restored.append("agent-2", { type: "assistant_message", text: "next" }).seq).toBe(9);
+  });
+
+  it("exportAll covers every tracked agent id, keyed by id", () => {
+    const store = new InMemoryAgentTimelineStore();
+    store.initialize("agent-1", { epoch: "epoch-1" });
+    store.initialize("agent-2", { epoch: "epoch-2" });
+
+    expect(Object.keys(store.exportAll()).sort()).toEqual(["agent-1", "agent-2"]);
+    expect(store.keys().sort()).toEqual(["agent-1", "agent-2"]);
   });
 });
 
@@ -210,4 +278,41 @@ it("includes transitive tool updates in a contiguous projected tail", () => {
   const tail = store.fetch("a", { limit: 1 });
   expect(tail.rows.map((row) => row.seqStart)).toEqual([1, 2, 3, 5]);
   expect(tail).toMatchObject({ startSeq: 1, endSeq: 6, hasOlder: false });
+});
+
+it("keeps exact canonical checkpoints when interleaved projections have non-monotonic endings", () => {
+  const source = new InMemoryAgentTimelineStore();
+  source.initialize("a", { epoch: "recovery-epoch" });
+  const tool = {
+    type: "tool_call" as const,
+    callId: "tool",
+    name: "shell",
+    error: null,
+    detail: { type: "plain_text" as const, label: "shell", text: "output" },
+  };
+  source.append(
+    "a",
+    { ...tool, status: "running" },
+    { turnId: "turn", timestamp: "2026-09-30T00:00:00Z" },
+  );
+  source.append("a", { type: "assistant_message", text: "Displayed answer", messageId: "answer" });
+  source.append("a", { ...tool, status: "completed" }, { turnId: "turn" });
+  const display = source.fetch("a", { limit: 0 });
+  expect(display.rows.map((row) => row.seqEnd)).toEqual([3, 2]);
+  const snapshot = AgentTimelineSnapshotSchema.parse(source.exportSnapshot("a"));
+  expect(snapshot.rows.map((row) => row.seq)).toEqual([1, 2, 3]);
+  const replacement = new InMemoryAgentTimelineStore();
+  replacement.restoreSnapshot("a", snapshot);
+  expect(replacement.exportSnapshot("a")).toEqual(snapshot);
+  expect(replacement.fetch("a", { limit: 0 })).toEqual(display);
+  const catchup = replacement.fetch("a", {
+    direction: "after",
+    cursor: { epoch: snapshot.epoch, seq: 1 },
+    limit: 1,
+  });
+  expect(catchup).toMatchObject({ startSeq: 2, endSeq: 2, hasNewer: true });
+  expect(
+    replacement.append("a", { type: "user_message", text: "Continue", clientMessageId: "accepted" })
+      .seq,
+  ).toBe(4);
 });

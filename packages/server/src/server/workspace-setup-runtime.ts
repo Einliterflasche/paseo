@@ -25,6 +25,10 @@ export class WorkspaceSetupRuntime {
       });
   }
 
+  async drain(): Promise<void> {
+    while (this.runs.size) await Promise.all([...this.runs.values()].map((run) => run.completion));
+  }
+
   async stop(workspaceId: string): Promise<void> {
     const run = this.runs.get(workspaceId);
     if (!run) {

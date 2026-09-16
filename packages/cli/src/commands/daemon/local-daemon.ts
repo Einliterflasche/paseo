@@ -2,7 +2,12 @@ import { Command, Option } from "commander";
 import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
-import { startDaemonInstance, resolvePaseoHome } from "@getpaseo/server/daemon-control";
+import {
+  startDaemonInstance,
+  resolvePaseoHome,
+  readDaemonInstance,
+  daemonLogPath,
+} from "@getpaseo/server/daemon-control";
 const require = createRequire(import.meta.url);
 function resolveServerRunnerFromDir(currentDir: string): string | null {
   const packageJsonPath = path.join(currentDir, "package.json");
@@ -108,4 +113,43 @@ export function rejectRemovedLaunchFlags(command: Command): Command {
     }
   });
   return command;
+}
+
+// Deployment observes the same supervisor-owned instance as the upstream CLI.
+export const DEFAULT_STOP_TIMEOUT_MS = 15_000;
+export interface LocalDaemonState {
+  home: string;
+  listen: string;
+  running: boolean;
+  pidInfo: { pid: number; listen?: string } | null;
+  logPath: string;
+  pidPath: string;
+  stalePidFile: boolean;
+  relayEnabled: boolean;
+  relayEndpoint: string;
+  relayUseTls: boolean;
+  relayPublicUseTls: boolean;
+}
+export async function resolveLocalDaemonState(options: {
+  home?: string;
+}): Promise<LocalDaemonState> {
+  const home = resolvePaseoHome(
+    options.home ? { ...process.env, PASEO_HOME: options.home } : process.env,
+  );
+  const instance = await readDaemonInstance(home);
+  if (!instance?.listen)
+    throw { code: "DAEMON_NOT_READY", message: `No ready daemon instance for ${home}.` };
+  return {
+    home,
+    listen: instance.listen,
+    running: true,
+    pidInfo: { pid: instance.pid, listen: instance.listen },
+    logPath: daemonLogPath(home),
+    pidPath: path.join(home, "paseo.pid"),
+    stalePidFile: false,
+    relayEnabled: false,
+    relayEndpoint: "",
+    relayUseTls: false,
+    relayPublicUseTls: false,
+  };
 }

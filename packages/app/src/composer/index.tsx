@@ -1477,6 +1477,7 @@ function ComposerContentImpl({
         text: string,
         attachments: ComposerAttachment[],
         activeTurnBehavior: "interrupt" | "steer",
+        clientMessageId?: string,
       ) => Promise<void>)
     | null
   >(null);
@@ -1530,7 +1531,7 @@ function ComposerContentImpl({
   }, [focusInput, onFocusInput]);
 
   const submitMessage = useCallback(
-    async (text: string, submitAttachments: ComposerAttachment[]) => {
+    async (text: string, submitAttachments: ComposerAttachment[], clientMessageId?: string) => {
       onMessageSent?.();
       if (onSubmitMessageRef.current) {
         await onSubmitMessageRef.current({ text, attachments: submitAttachments, cwd });
@@ -1544,6 +1545,7 @@ function ComposerContentImpl({
         text,
         submitAttachments,
         appSettings.sendBehavior === "steer" ? "steer" : "interrupt",
+        clientMessageId,
       );
     },
     [appSettings.sendBehavior, cwd, onMessageSent, t],
@@ -1559,6 +1561,7 @@ function ComposerContentImpl({
       text: string,
       sendAttachments: ComposerAttachment[],
       activeTurnBehavior: "interrupt" | "steer",
+      clientMessageId?: string,
     ) => {
       if (!client) {
         throw new Error(t("workspace.terminal.hostDisconnected"));
@@ -1574,6 +1577,7 @@ function ComposerContentImpl({
         encodeImages,
         submission: createMessageSubmissionWriter(serverId),
         activeTurnBehavior,
+        ...(clientMessageId ? { clientMessageId } : {}),
         activeTurnId:
           activeTurnBehavior === "steer"
             ? (selectAgentTurnPresentation(
@@ -1947,8 +1951,8 @@ function ComposerContentImpl({
         agentId,
         messageId: id,
         queue: queueWriter,
-        submitMessage: ({ text, attachments: queuedAttachments }) =>
-          submitMessage(text, queuedAttachments),
+        submitMessage: ({ text, attachments: queuedAttachments, clientMessageId }) =>
+          submitMessage(text, queuedAttachments, clientMessageId),
         failedToSendMessage: t("composer.errors.failedToSend"),
       });
       if (result.status === "failed") {

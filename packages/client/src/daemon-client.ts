@@ -734,6 +734,10 @@ export interface AgentForkContextOptions {
 type AgentRefreshedStatusPayload = z.infer<typeof AgentRefreshedStatusPayloadSchema>;
 type RestartRequestedStatusPayload = z.infer<typeof RestartRequestedStatusPayloadSchema>;
 type ShutdownRequestedStatusPayload = z.infer<typeof ShutdownRequestedStatusPayloadSchema>;
+export interface RestartServerOptions {
+  timeout?: number;
+  prepareOnly?: boolean;
+}
 export interface ShutdownServerOptions {
   requestId?: string;
   timeout?: number;
@@ -3439,40 +3443,113 @@ export class DaemonClient {
   // Agent Interaction
   // ============================================================================
 
+  /**
+   * A restart-in-progress rejection or a lost connection is retried with the
+   * exact same encoded payload and client message ID (only the wire request ID is
+   * fresh each attempt), so a reconnecting client cannot duplicate or drop the
+   * user's send. Validation errors, ID conflicts, and explicit disposal are terminal.
+   */
   async sendAgentMessage(
     agentId: string,
     text: string,
     options?: SendMessageOptions,
   ): Promise<void> {
-    const requestId = this.createRequestId();
     const messageId = options?.messageId ?? crypto.randomUUID();
-    const message = SessionInboundMessageSchema.parse({
+    let requestId = this.createRequestId();
+    // Parsing copies nested input once. Later caller mutations must not change a
+    // retried request's fingerprint or attachment bytes under the same identity.
+    const prepared = SessionInboundMessageSchema.parse({
       type: "send_agent_message_request",
       requestId,
       agentId,
       text,
-      ...(messageId ? { messageId } : {}),
+      messageId,
       ...(options?.activeTurnBehavior ? { activeTurnBehavior: options.activeTurnBehavior } : {}),
       ...(options?.images ? { images: options.images } : {}),
       ...(options?.attachments ? { attachments: options.attachments } : {}),
     });
-    const payload = await this.sendRequest({
-      requestId,
-      message,
-      options: { skipQueue: true },
-      select: (msg) => {
-        if (msg.type !== "send_agent_message_response") {
-          return null;
+    for (;;) {
+      if (this.connectionState.status === "disposed") {
+        throw new Error("Daemon client is disposed");
+      }
+      const message = { ...prepared, requestId };
+      try {
+        const payload = await this.sendRequest({
+          requestId,
+          message,
+          options: { skipQueue: true },
+          select: (msg) => {
+            if (msg.type !== "send_agent_message_response") {
+              return null;
+            }
+            if (msg.payload.requestId !== requestId) {
+              return null;
+            }
+            return msg.payload;
+          },
+        });
+        if (!payload.accepted) {
+          throw new Error(payload.error ?? "sendAgentMessage rejected");
         }
-        if (msg.payload.requestId !== requestId) {
-          return null;
+        return;
+      } catch (error) {
+        if (!this.isRetryableSendAgentMessageError(error)) {
+          throw error;
         }
-        return msg.payload;
-      },
-    });
-    if (!payload.accepted) {
-      throw new Error(payload.error ?? "sendAgentMessage rejected");
+        await this.waitToRetrySendAgentMessage();
+        requestId = this.createRequestId();
+      }
     }
+  }
+
+  private isRetryableSendAgentMessageError(error: unknown): boolean {
+    if (error instanceof DaemonConnectionError && error.code === "DAEMON_CONNECTION_LOST") {
+      // Without automatic reconnection this connection will never come back;
+      // retrying would wait forever.
+      return this.shouldReconnect && this.config.reconnect?.enabled !== false;
+    }
+    return error instanceof DaemonRpcError && error.code === "restart_in_progress";
+  }
+
+  /**
+   * Resolves once the connection is usable for a retry: connected, and (when the
+   * daemon reports one) not mid-restart. Never polls — it is driven entirely by
+   * connection-state and server_info events, so it cannot spin.
+   */
+  private waitToRetrySendAgentMessage(): Promise<void> {
+    const isReady = () => {
+      if (!this.isConnected) {
+        return false;
+      }
+      const state = this.lastServerInfoMessage?.restartRecoveryState;
+      return state === undefined || state === "running";
+    };
+    if (this.connectionState.status === "disposed") {
+      return Promise.reject(new Error("Daemon client is disposed"));
+    }
+    if (isReady()) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+      let unsubscribeStatus = () => {};
+      let unsubscribeConnection = () => {};
+      const cleanup = () => {
+        unsubscribeStatus();
+        unsubscribeConnection();
+      };
+      unsubscribeStatus = this.on("status", () => {
+        if (isReady()) {
+          cleanup();
+          resolve();
+        }
+      });
+      unsubscribeConnection = this.subscribeConnectionStatus((state) => {
+        if (state.status === "disposed") {
+          cleanup();
+          reject(new Error("Daemon client is disposed"));
+        }
+      });
+    });
   }
 
   async sendMessage(agentId: string, text: string, options?: SendMessageOptions): Promise<void> {
@@ -3693,12 +3770,16 @@ export class DaemonClient {
   async restartServer(
     reason?: string,
     requestId?: string,
-    options?: { timeout?: number },
+    options?: RestartServerOptions,
   ): Promise<RestartRequestedStatusPayload> {
+    if (options?.prepareOnly) {
+      this.requireRestartRecoverySupport();
+    }
     const resolvedRequestId = this.createRequestId(requestId);
     const message = SessionInboundMessageSchema.parse({
       type: "restart_server_request",
       ...(reason && reason.trim().length > 0 ? { reason } : {}),
+      ...(options?.prepareOnly ? { prepareOnly: true } : {}),
       requestId: resolvedRequestId,
     });
     return this.sendRequest({
@@ -3720,6 +3801,18 @@ export class DaemonClient {
         return restarted.data;
       },
     });
+  }
+
+  /**
+   * Requests checkpoint preparation without replacing the daemon: used by the
+   * Nix deployment wrapper, which only swaps the process after this resolves
+   * with the ready generation. Gate call sites on `server_info.features.restartRecovery`.
+   */
+  async prepareRestart(
+    reason?: string,
+    requestId?: string,
+  ): Promise<RestartRequestedStatusPayload> {
+    return this.restartServer(reason, requestId, { prepareOnly: true });
   }
 
   async shutdownServer(options?: ShutdownServerOptions): Promise<ShutdownRequestedStatusPayload> {
@@ -6132,6 +6225,13 @@ export class DaemonClient {
     // COMPAT(daemonConfigReload): added in v0.4.0, remove gate after 2027-02-14.
     if (this.lastServerInfoMessage?.features?.daemonConfigReload !== true) {
       throw new Error("Update the host to reload daemon configuration.");
+    }
+  }
+
+  // COMPAT(restartRecovery): added in fork v0.8.0; remove gate after 2027-03-16.
+  private requireRestartRecoverySupport(): void {
+    if (this.lastServerInfoMessage?.features?.restartRecovery !== true) {
+      throw new Error("Update the host to prepare a controlled restart checkpoint.");
     }
   }
 
