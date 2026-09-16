@@ -1,6 +1,12 @@
+import { AgentProviderSchema } from "@getpaseo/protocol/provider-manifest";
+import { z } from "zod";
 import type { AgentProvider, AgentTimelineItem } from "../agent-sdk-types.js";
+import {
+  AgentTimelineSnapshotSchema,
+  InMemoryAgentTimelineStore,
+} from "../agent-timeline-store.js";
+import type { AgentTimelineSnapshot } from "../agent-timeline-store.js";
 import { limitAgentTimelineItemContent } from "../agent-timeline-content.js";
-import { InMemoryAgentTimelineStore } from "../agent-timeline-store.js";
 import type {
   AgentTimelineFetchOptions,
   AgentTimelineFetchResult,
@@ -25,6 +31,48 @@ export interface ProviderSubagentDescriptor {
   cwd: string | null;
   subtitle: string | null;
 }
+
+const ProviderSubagentDescriptorSchema: z.ZodType<ProviderSubagentDescriptor, unknown> = z.object({
+  id: z.string(),
+  parentAgentId: z.string(),
+  parentSubagentId: z.string().nullable(),
+  provider: AgentProviderSchema,
+  title: z.string().nullable(),
+  description: z.string().nullable(),
+  status: z.enum(["running", "completed", "failed", "canceled"]),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  toolCallId: z.string().nullable(),
+  cwd: z.string().nullable(),
+  subtitle: z.string().nullable(),
+});
+
+/**
+ * One provider-subagent's snapshot state, keyed explicitly by its parent agent and its own
+ * id rather than the store's internal composite key. `descriptor` is null when a child
+ * timeline exists (an event was appended) before any upsert produced a descriptor — that
+ * timeline is still owned state and must round-trip through restart.
+ */
+export interface ProviderSubagentSnapshotEntry {
+  parentAgentId: string;
+  subagentId: string;
+  descriptor: ProviderSubagentDescriptor | null;
+  timeline: AgentTimelineSnapshot;
+}
+
+export const ProviderSubagentSnapshotEntrySchema: z.ZodType<
+  ProviderSubagentSnapshotEntry,
+  unknown
+> = z.object({
+  parentAgentId: z.string(),
+  subagentId: z.string(),
+  descriptor: ProviderSubagentDescriptorSchema.nullable(),
+  timeline: AgentTimelineSnapshotSchema,
+});
+
+export const ProviderSubagentStoreSnapshotSchema = z.array(ProviderSubagentSnapshotEntrySchema);
+
+export type ProviderSubagentStoreSnapshot = z.infer<typeof ProviderSubagentStoreSnapshotSchema>;
 
 export type ProviderSubagentInputEvent =
   | {
@@ -175,6 +223,37 @@ export class ProviderSubagentStore {
       hasNewer:
         timeline.hasNewer || (lastRow !== undefined && lastRow.seq < timeline.window.maxSeq),
     };
+  }
+
+  /** All descriptor + timeline state, including timelines with no descriptor yet. */
+  exportSnapshot(): ProviderSubagentStoreSnapshot {
+    const keys = new Set<string>([...this.descriptors.keys(), ...this.timelines.keys()]);
+    const entries: ProviderSubagentSnapshotEntry[] = [];
+    for (const key of keys) {
+      const separatorIndex = key.indexOf("\0");
+      const parentAgentId = key.slice(0, separatorIndex);
+      const subagentId = key.slice(separatorIndex + 1);
+      entries.push({
+        parentAgentId,
+        subagentId,
+        descriptor: this.descriptors.get(key) ?? null,
+        timeline: this.timelines.exportSnapshot(key),
+      });
+    }
+    return entries;
+  }
+
+  /** Replaces all descriptor + timeline state exactly with the snapshot, no derivation. */
+  restoreSnapshot(snapshot: ProviderSubagentStoreSnapshot): void {
+    this.descriptors.clear();
+    this.timelines.clear();
+    for (const entry of snapshot) {
+      const key = storeKey(entry.parentAgentId, entry.subagentId);
+      if (entry.descriptor) {
+        this.descriptors.set(key, entry.descriptor);
+      }
+      this.timelines.restoreSnapshot(key, entry.timeline);
+    }
   }
 
   deleteParent(parentAgentId: string): ProviderSubagentStoreEvent[] {

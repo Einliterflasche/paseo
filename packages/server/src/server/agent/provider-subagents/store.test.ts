@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { ProviderSubagentStore } from "./store.js";
+import { ProviderSubagentStore, ProviderSubagentStoreSnapshotSchema } from "./store.js";
 
 describe("ProviderSubagentStore", () => {
   test("keeps provider children and their timelines scoped to the parent agent", () => {
@@ -102,5 +102,80 @@ describe("ProviderSubagentStore", () => {
     expect(page.rows[0]?.seq).toBe(1);
     expect(page.rows.at(-1)?.seq).toBe(101);
     expect(page.hasOlder).toBe(false);
+  });
+
+  test("exportSnapshot includes a child timeline with no descriptor yet", () => {
+    const subagents = new ProviderSubagentStore();
+    subagents.apply("parent-a", "codex", {
+      type: "timeline",
+      id: "child-1",
+      item: { type: "assistant_message", text: "before any upsert" },
+      timestamp: "2026-07-12T10:00:00.000Z",
+    });
+
+    const snapshot = subagents.exportSnapshot();
+    expect(snapshot).toHaveLength(1);
+    expect(snapshot[0]).toMatchObject({
+      parentAgentId: "parent-a",
+      subagentId: "child-1",
+      descriptor: null,
+    });
+    expect(snapshot[0]?.timeline.rows).toHaveLength(1);
+    expect(() => ProviderSubagentStoreSnapshotSchema.parse(snapshot)).not.toThrow();
+  });
+
+  test("restoreSnapshot round-trips descriptors and every child timeline exactly", () => {
+    const source = new ProviderSubagentStore();
+    source.apply("parent-a", "codex", {
+      type: "upsert",
+      id: "child-1",
+      title: "Explore",
+      status: "running",
+      timestamp: "2026-07-12T10:00:00.000Z",
+    });
+    source.apply("parent-a", "codex", {
+      type: "timeline",
+      id: "child-1",
+      item: { type: "assistant_message", text: "found it" },
+      timestamp: "2026-07-12T10:00:01.000Z",
+    });
+    source.apply("parent-b", "claude", {
+      type: "timeline",
+      id: "child-2",
+      item: { type: "assistant_message", text: "no descriptor for this one" },
+      timestamp: "2026-07-12T10:00:02.000Z",
+    });
+    const snapshot = source.exportSnapshot();
+
+    const restored = new ProviderSubagentStore();
+    restored.restoreSnapshot(snapshot);
+
+    expect(restored.list("parent-a")).toEqual(source.list("parent-a"));
+    expect(restored.fetchTimeline("parent-a", "child-1").rows).toEqual(
+      source.fetchTimeline("parent-a", "child-1").rows,
+    );
+    // A child observed only through a timeline event, never upserted, still round-trips.
+    expect(restored.get("parent-b", "child-2")).toBeNull();
+    expect(restored.fetchTimeline("parent-b", "child-2").rows).toEqual(
+      source.fetchTimeline("parent-b", "child-2").rows,
+    );
+    expect(
+      restored.exportSnapshot().sort((a, b) => a.subagentId.localeCompare(b.subagentId)),
+    ).toEqual(snapshot.sort((a, b) => a.subagentId.localeCompare(b.subagentId)));
+  });
+
+  test("restoreSnapshot clears prior state instead of merging with it", () => {
+    const store = new ProviderSubagentStore();
+    store.apply("parent-a", "codex", {
+      type: "upsert",
+      id: "stale-child",
+      status: "running",
+      timestamp: "2026-07-12T10:00:00.000Z",
+    });
+
+    store.restoreSnapshot([]);
+
+    expect(store.list("parent-a")).toEqual([]);
+    expect(store.exportSnapshot()).toEqual([]);
   });
 });

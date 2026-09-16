@@ -1,4 +1,4 @@
-import { expect, it, test, vi } from "vitest";
+import { describe, expect, it, test, vi } from "vitest";
 import pino, { type Logger } from "pino";
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -9,9 +9,13 @@ import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentManager } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
 import {
+  drainFinishNotificationWatches,
   formatSystemNotificationPrompt,
   isSystemInjectedEnvelope,
+  restoreFinishNotificationWatch,
+  retryPendingFinishNotifications,
   setupFinishNotification,
+  snapshotFinishNotificationWatches,
   waitForAgentRunStartWithTimeout,
 } from "./agent-prompt.js";
 import type { AgentManagerEvent, ManagedAgent } from "./agent-manager.js";
@@ -530,6 +534,234 @@ it("does not notify archived callers", async () => {
 
   expect(streamAgentSpy).not.toHaveBeenCalled();
   expect(replaceAgentRunSpy).not.toHaveBeenCalled();
+});
+
+describe("finish notification restart recovery", () => {
+  function buildManagerAndStorage(options: {
+    lastAssistantMessage: string | null;
+    onPrompt: (prompt: string, messageId: string | undefined) => void;
+    deliveryError?: Error;
+  }): {
+    agentManager: AgentManager;
+    agentStorage: AgentStorage;
+    childAgent: ManagedAgent;
+    emit: (event: AgentManagerEvent) => void;
+    setRestartSuspended: (suspended: boolean) => void;
+  } {
+    let subscriber: ((event: AgentManagerEvent) => void) | null = null;
+    const childAgent: ManagedAgent = Object.create(null);
+    Reflect.set(childAgent, "id", "child-agent");
+    Reflect.set(childAgent, "lifecycle", "idle");
+    Reflect.set(childAgent, "config", { title: "Child Agent" });
+    Reflect.set(childAgent, "pendingPermissions", new Map());
+
+    const callerAgent: ManagedAgent = Object.create(null);
+    Reflect.set(callerAgent, "id", "caller-agent");
+    Reflect.set(callerAgent, "lifecycle", "idle");
+    Reflect.set(callerAgent, "config", { title: "Caller Agent" });
+
+    const agentManager = new AgentManager({ clients: {}, logger: createTestLogger() });
+    const agentsById: Record<string, ManagedAgent> = {
+      "child-agent": childAgent,
+      "caller-agent": callerAgent,
+    };
+    Reflect.set(agentManager, "getAgent", (agentId: string) => agentsById[agentId] ?? null);
+    Reflect.set(agentManager, "subscribe", (callback: (event: AgentManagerEvent) => void) => {
+      subscriber = callback;
+      return () => {
+        subscriber = null;
+      };
+    });
+    Reflect.set(agentManager, "getLastAssistantMessage", async () => options.lastAssistantMessage);
+    let restartSuspended = false;
+    Reflect.set(agentManager, "isRestartSuspended", () => restartSuspended);
+    Reflect.set(agentManager, "tryRunOutOfBand", () => false);
+    Reflect.set(agentManager, "hasInFlightRun", () => false);
+    Reflect.set(agentManager, "steerOrReplaceActiveTurn", async () => {
+      // This is the first call startAgentRun makes and is directly awaited
+      // (unlike the fire-and-forget iterator drain), so it's the reliable
+      // place to make a simulated delivery actually reject.
+      if (options.deliveryError) {
+        throw options.deliveryError;
+      }
+      return { status: "inactive" };
+    });
+    Reflect.set(
+      agentManager,
+      "streamAgent",
+      (_agentId: string, prompt: string, runOptions?: { clientMessageId?: string }) => {
+        options.onPrompt(prompt, runOptions?.clientMessageId);
+        return (async function* noop() {})();
+      },
+    );
+
+    const agentStorage: AgentStorage = Object.create(AgentStorage.prototype);
+    Reflect.set(agentStorage, "get", async (agentId: string) => {
+      if (agentId === "child-agent") {
+        return { title: "Child Agent", labels: { "paseo.parent-agent-id": "caller-agent" } };
+      }
+      if (agentId === "caller-agent") {
+        return { title: "Caller Agent", labels: {} };
+      }
+      return null;
+    });
+
+    return {
+      agentManager,
+      agentStorage,
+      childAgent,
+      emit: (event) => subscriber?.(event),
+      setRestartSuspended: (suspended) => {
+        restartSuspended = suspended;
+      },
+    };
+  }
+
+  test("draining before a snapshot waits for an already-accepted delivery, so it is never captured for redelivery", async () => {
+    const prompts: Array<{ prompt: string; messageId: string | undefined }> = [];
+    const scenario = buildManagerAndStorage({
+      lastAssistantMessage: "done",
+      onPrompt: (prompt, messageId) => prompts.push({ prompt, messageId }),
+    });
+
+    setupFinishNotification({
+      agentManager: scenario.agentManager,
+      agentStorage: scenario.agentStorage,
+      childAgentId: "child-agent",
+      callerAgentId: "caller-agent",
+      logger: createTestLogger(),
+    });
+
+    scenario.childAgent.lifecycle = "running";
+    scenario.emit({ type: "agent_state", agent: scenario.childAgent });
+    scenario.childAgent.lifecycle = "idle";
+    scenario.emit({ type: "agent_state", agent: scenario.childAgent });
+
+    await drainFinishNotificationWatches(scenario.agentManager);
+
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0].prompt).toContain("finished.");
+    // The delivery was awaited to completion by drain(), so nothing is left
+    // to capture — a restart snapshot taken now would redeliver nothing.
+    expect(snapshotFinishNotificationWatches(scenario.agentManager)).toEqual([]);
+  });
+
+  test("a restored watch redelivers a captured pending notification exactly once, using the originally captured message and stable id", async () => {
+    const failedPrompts: string[] = [];
+    const scenario = buildManagerAndStorage({
+      lastAssistantMessage: "original response before restart",
+      onPrompt: (prompt) => failedPrompts.push(prompt),
+      deliveryError: new Error("caller provider unreachable"),
+    });
+
+    setupFinishNotification({
+      agentManager: scenario.agentManager,
+      agentStorage: scenario.agentStorage,
+      childAgentId: "child-agent",
+      callerAgentId: "caller-agent",
+      logger: createTestLogger(),
+    });
+
+    scenario.childAgent.lifecycle = "running";
+    scenario.emit({ type: "agent_state", agent: scenario.childAgent });
+    scenario.childAgent.lifecycle = "idle";
+    scenario.emit({ type: "agent_state", agent: scenario.childAgent });
+
+    // Delivery fails (simulating the caller being frozen mid-restart), so it
+    // survives in `pending` even after everything currently in flight settles.
+    await drainFinishNotificationWatches(scenario.agentManager);
+    expect(failedPrompts).toHaveLength(0);
+
+    const snapshot = snapshotFinishNotificationWatches(scenario.agentManager);
+    expect(snapshot).toHaveLength(1);
+    expect(snapshot[0].pending).toHaveLength(1);
+    const originalPendingId = snapshot[0].pending[0].id;
+    expect(snapshot[0].pending[0].lastAssistantMessage).toBe("original response before restart");
+
+    // A fresh manager/storage stands in for the new daemon process.
+    const delivered: Array<{ prompt: string; messageId: string | undefined }> = [];
+    const restored = buildManagerAndStorage({
+      // Deliberately different from the captured value, to prove restore
+      // does not re-fetch it.
+      lastAssistantMessage: "SHOULD NOT APPEAR: recomputed after restart",
+      onPrompt: (prompt, messageId) => delivered.push({ prompt, messageId }),
+    });
+
+    restoreFinishNotificationWatch(
+      {
+        agentManager: restored.agentManager,
+        agentStorage: restored.agentStorage,
+        logger: createTestLogger(),
+      },
+      snapshot[0],
+    );
+
+    // Restored watches hold their pending delivery until explicitly retried
+    // (the manager is still frozen mid-restart when watches are reattached).
+    expect(delivered).toHaveLength(0);
+
+    retryPendingFinishNotifications(restored.agentManager);
+    await drainFinishNotificationWatches(restored.agentManager);
+
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0].messageId).toBe(originalPendingId);
+    expect(delivered[0].prompt).toContain("original response before restart");
+    expect(delivered[0].prompt).not.toContain("SHOULD NOT APPEAR");
+    // Delivered and drained: nothing left to redeliver on a second retry.
+    retryPendingFinishNotifications(restored.agentManager);
+    await drainFinishNotificationWatches(restored.agentManager);
+    expect(delivered).toHaveLength(1);
+  });
+
+  test("no delivery while the manager reports restart-suspended, even for an event that arrives mid-restore; exactly one delivery once the gate reopens and is retried", async () => {
+    const delivered: string[] = [];
+    const scenario = buildManagerAndStorage({
+      lastAssistantMessage: "finished during restore",
+      onPrompt: (prompt) => delivered.push(prompt),
+    });
+
+    setupFinishNotification({
+      agentManager: scenario.agentManager,
+      agentStorage: scenario.agentStorage,
+      childAgentId: "child-agent",
+      callerAgentId: "caller-agent",
+      logger: createTestLogger(),
+    });
+
+    // Simulate: the daemon is mid-restart (preparing/restoring/paused), and
+    // this child happens to finish and emit its event during that window —
+    // e.g. because it inherited restore authority from an AsyncLocalStorage
+    // scope and sendPromptToAgent would technically be admitted. The watch
+    // must not deliver anyway.
+    scenario.setRestartSuspended(true);
+    scenario.childAgent.lifecycle = "running";
+    scenario.emit({ type: "agent_state", agent: scenario.childAgent });
+    scenario.childAgent.lifecycle = "idle";
+    scenario.emit({ type: "agent_state", agent: scenario.childAgent });
+
+    await drainFinishNotificationWatches(scenario.agentManager);
+    expect(delivered).toHaveLength(0);
+
+    // Still suspended: an explicit retry attempt also must not deliver.
+    retryPendingFinishNotifications(scenario.agentManager);
+    await drainFinishNotificationWatches(scenario.agentManager);
+    expect(delivered).toHaveLength(0);
+
+    // The pending obligation must have survived being held, not been
+    // dropped by the snapshot/flush chain.
+    const snapshot = snapshotFinishNotificationWatches(scenario.agentManager);
+    expect(snapshot).toHaveLength(1);
+    expect(snapshot[0].pending).toHaveLength(1);
+
+    // Gate reopens: exactly one delivery, driven by the explicit retry.
+    scenario.setRestartSuspended(false);
+    retryPendingFinishNotifications(scenario.agentManager);
+    await drainFinishNotificationWatches(scenario.agentManager);
+
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toContain("finished during restore");
+    expect(snapshotFinishNotificationWatches(scenario.agentManager)).toEqual([]);
+  });
 });
 
 // Deliberately independent literals rather than the production constants these tests

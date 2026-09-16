@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { Logger } from "pino";
+import { z } from "zod";
 import type { AgentManager } from "../agent/agent-manager.js";
 import type { AgentSessionConfig } from "../agent/agent-sdk-types.js";
 import type { AgentStorage } from "../agent/agent-storage.js";
@@ -14,6 +15,7 @@ import {
 } from "../agent/agent-prompt.js";
 import { resolveCreateAgentTitles } from "../agent/create-agent-title.js";
 import { type BoundCreateAgentCommand, formatProviderModel } from "../agent/create-agent/create.js";
+import { AgentRestartSuspendedError, RestartInProgressError } from "../restart/restart-errors.js";
 import type { PersistedWorkspaceRecord } from "../workspace-registry.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../worktree-session.js";
 import { ScheduleStore } from "./store.js";
@@ -225,6 +227,55 @@ interface ScheduleWorkspaceCreateInput {
   firstAgentContext: FirstAgentContext;
 }
 
+/** One schedule run still owned by this process when a controlled restart began. */
+export interface ScheduleRestartRunRecord {
+  scheduleId: string;
+  runId: string;
+  agentId: string;
+  workspaceId: string | null;
+  manual: boolean;
+}
+
+export interface ScheduleRestartSnapshot {
+  runs: ScheduleRestartRunRecord[];
+}
+
+export const ScheduleRestartRunRecordSchema = z.object({
+  scheduleId: z.string(),
+  runId: z.string(),
+  agentId: z.string(),
+  workspaceId: z.string().nullable(),
+  manual: z.boolean(),
+});
+
+/** Validate a checkpointed schedule snapshot before claiming/executing it. */
+export const ScheduleRestartSnapshotSchema = z.object({
+  runs: z.array(ScheduleRestartRunRecordSchema),
+});
+
+/**
+ * What a schedule target's `start*` method returns once its SHORT admission
+ * (assignment + turn start) is done. `completion` represents the rest of the run —
+ * the model turn — already in flight but not yet awaited. runSchedule() awaits this
+ * handle itself under trackAdmission(), then awaits `completion` separately, outside
+ * it: pauseForRestart()'s drain only ever needs to wait for the handle, never for a
+ * still-running model turn.
+ */
+export interface ScheduleExecutionHandle {
+  completion: Promise<ScheduleExecutionResult>;
+}
+
+interface FinishRunParams {
+  scheduleId: string;
+  runId: string;
+  status: "succeeded" | "failed";
+  agentId: string | null;
+  output: string | null;
+  error: string | null;
+  targetGone: boolean;
+  manual: boolean;
+}
+
 export interface ScheduleServiceOptions {
   paseoHome: string;
   logger: Logger;
@@ -259,9 +310,42 @@ export class ScheduleService {
   private readonly runner: (
     schedule: StoredSchedule,
     runId: string,
-  ) => Promise<ScheduleExecutionResult>;
+  ) => Promise<ScheduleExecutionHandle>;
   private readonly runningScheduleIds = new Set<string>();
+  // Manual-run context for whatever is currently in runningScheduleIds. Not
+  // persisted on ScheduleRun (the protocol type owns that schema); ephemeral,
+  // rebuilt on every runSchedule() and only read back by snapshotForRestart().
+  private readonly activeRunContext = new Map<string, { runId: string; manual: boolean }>();
+  // runIds a restart checkpoint claimed: recoverInterruptedRuns() must not
+  // fail them, and executeSchedule() must not start a replacement for them.
+  private readonly restoredRunIds = new Set<string>();
+  // Registered by restoreAfterRestart(), attached by resumeRestoredRuns()
+  // once the manager has the owning agents registered.
+  private pendingRestoredRuns: ScheduleRestartRunRecord[] = [];
   private tickTimer: ReturnType<typeof setInterval> | null = null;
+  // Owned pause state for a controlled restart — see pauseForRestart().
+  private paused = false;
+  // One entry per schedule whose SHORT admission (assignment + turn start, not
+  // the model turn itself) is still in flight — see trackAdmission()/pauseForRestart().
+  private readonly admissionSettlement = new Map<string, Promise<unknown>>();
+  // finishRun()'s store write, tracked while it's in flight. A run's genuine
+  // completion can land at any time, including right as a checkpoint starts;
+  // snapshotForRestart() drains this set first so it never captures a run as
+  // "running" purely because its terminal write hadn't settled yet — that
+  // would point the checkpoint at an agent the manager's own snapshot no
+  // longer considers resumable, causing a false failed reattachment for a
+  // run that had actually already finished.
+  private readonly pendingFinishWrites = new Set<Promise<void>>();
+  private readonly admissionFailures = new Map<string, unknown>();
+  // Failures from finishRun()'s store write, keyed by `${scheduleId}:${runId}` and kept
+  // even after the rejected write itself has left pendingFinishWrites (a settled
+  // promise, rejected or not, is still "drained"). A run whose terminal write never
+  // reached the store is not the same as one that's still running: snapshotForRestart()
+  // must not silently proceed as if the write had landed — the caller's own
+  // understanding of the run's outcome would then be more current than, and
+  // inconsistent with, whatever generation gets checkpointed. Cleared on a later
+  // successful write for the same key.
+  private readonly finishRunWriteFailures = new Map<string, unknown>();
 
   constructor(options: ScheduleServiceOptions) {
     this.store = new ScheduleStore(join(options.paseoHome, "schedules"));
@@ -273,12 +357,29 @@ export class ScheduleService {
     this.createPaseoWorktreeWorkspace = options.createPaseoWorktreeWorkspace;
     this.archiveWorkspace = options.archiveWorkspace;
     this.now = options.now ?? (() => new Date());
-    this.runner = options.runner ?? ((schedule, runId) => this.executeSchedule(schedule, runId));
+    // The public test seam still returns a flat ScheduleExecutionResult — wrapped once,
+    // centrally, into a handle whose admission is trivially "already decided": tests
+    // using a custom runner are exercising completion/failure semantics, not admission
+    // timing, and none of them need to observe or control that split.
+    this.runner = options.runner
+      ? (schedule, runId) => Promise.resolve({ completion: options.runner!(schedule, runId) })
+      : (schedule, runId) => this.executeSchedule(schedule, runId);
   }
 
   async start(): Promise<void> {
     await this.recoverInterruptedRuns();
     await this.sweepOrphanedSchedules();
+    this.resumeTicking();
+  }
+
+  async stop(): Promise<void> {
+    if (this.tickTimer) {
+      clearInterval(this.tickTimer);
+      this.tickTimer = null;
+    }
+  }
+
+  private resumeTicking(): void {
     if (this.tickTimer) {
       return;
     }
@@ -291,10 +392,236 @@ export class ScheduleService {
     this.tickTimer = timer;
   }
 
-  async stop(): Promise<void> {
+  /**
+   * Freeze admission of new schedule fires ahead of a controlled restart, then wait for
+   * every run whose SHORT admission (assignment + turn start, not the model turn itself)
+   * is still in flight to finish reaching it. Runs that are already admitted and running
+   * keep executing after this returns — the agent manager's own quiesce/suspend path is
+   * what interrupts those — this only owns the short window before that.
+   *
+   * The caller must not freeze the agent manager's own admission gate until this
+   * resolves: doing so first can only reject an admission that was already the correct
+   * outcome of racing a frozen manager, but doing it before every in-flight schedule
+   * admission has settled would make some of those a RestartInProgressError — rejected
+   * out from under a schedule that had every reason to expect to run, in ways this
+   * service can't retroactively tell apart from having stayed due. Awaiting the drain
+   * here first makes that unreachable: a schedule-triggered admission is either fully
+   * decided (this returned) or was never let through `paused` to attempt one.
+   *
+   * Clearing the tick timer alone is not enough: a `tick()` call already in its for-loop
+   * over due schedules keeps going after this returns, so the owned `paused` flag is what
+   * `tick()` and `runOnce()` actually check before admitting each run — otherwise a
+   * second due schedule could start fresh admission after the drain below has already
+   * finished waiting for it.
+   */
+  async pauseForRestart(): Promise<void> {
+    this.paused = true;
     if (this.tickTimer) {
       clearInterval(this.tickTimer);
       this.tickTimer = null;
+    }
+    while (this.admissionSettlement.size > 0) {
+      await Promise.allSettled(this.admissionSettlement.values());
+    }
+  }
+
+  /**
+   * Owns both ends of admission tracking around a single promise — the caller never signals
+   * completion itself, so there is no separate call to forget. Must be invoked as the first
+   * thing runSchedule() does after adding to runningScheduleIds, with no `await` in between,
+   * so pauseForRestart() can never run in the gap between `paused` being checked (in
+   * tick()/runOnce()) and this being recorded — JS won't preempt that synchronous span.
+   *
+   * `admission` should resolve once its SHORT admission step (assignment + turn start) is
+   * done, not once the whole model turn finishes — see startSchedule()'s per-target methods,
+   * which return a handle whose own `completion` promise is deliberately awaited outside
+   * this tracker.
+   */
+  private trackAdmission<T>(scheduleId: string, admission: Promise<T>): Promise<T> {
+    const tracked = admission.finally(() => {
+      if (this.admissionSettlement.get(scheduleId) === tracked) {
+        this.admissionSettlement.delete(scheduleId);
+      }
+    });
+    this.admissionSettlement.set(scheduleId, tracked);
+    return tracked;
+  }
+
+  /** Resume ticking after a restart preparation failed and the daemon stays up. */
+  resumeAfterRestartFailure(): void {
+    this.paused = false;
+    this.resumeTicking();
+  }
+
+  /**
+   * Capture the schedule runs this process still owns when a controlled
+   * restart begins. Read from the store (the source of truth for run
+   * fields) rather than a duplicated in-memory copy.
+   *
+   * Throws if a running run has no agent assigned yet (admitted but not far
+   * enough along to have a native session to resume) — that leaves the
+   * daemon paused with the old state intact rather than checkpointing a run
+   * with nothing to reattach to.
+   *
+   * Drains any in-flight finishRun() writes first: a run can genuinely complete at any
+   * time, including right as this is called, and finishRun()'s store write is async. Reading
+   * the store before that write lands would capture the run as still "running" purely
+   * because of write latency — pointing the checkpoint at an agent the manager's own
+   * snapshot no longer considers resumable (it already saw the real completion), which
+   * would make restore falsely fail reattachment for a run that had actually finished.
+   *
+   * A drained write can still have been a rejection: Promise.allSettled() treats a
+   * rejected promise as "settled" too, which is correct for draining but not for
+   * trusting what it wrote. If any drained finishRun() write actually failed, its
+   * terminal state never reached the store — the checkpoint can't safely represent
+   * this run's real outcome, so this throws instead of proceeding as if the store were
+   * current.
+   */
+  async snapshotForRestart(): Promise<ScheduleRestartSnapshot> {
+    if (this.admissionFailures.size > 0) {
+      throw new AggregateError(
+        [...this.admissionFailures.values()],
+        "Schedule admission did not settle before restart",
+      );
+    }
+    while (this.pendingFinishWrites.size > 0) {
+      await Promise.allSettled(this.pendingFinishWrites);
+    }
+    if (this.finishRunWriteFailures.size > 0) {
+      const [key, error] = [...this.finishRunWriteFailures.entries()][0];
+      throw new Error(
+        `Schedule run ${key} failed to persist its terminal state and cannot be safely ` +
+          `checkpointed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const runs: ScheduleRestartRunRecord[] = [];
+    for (const scheduleId of this.runningScheduleIds) {
+      const schedule = await this.store.get(scheduleId);
+      const runningRun = schedule?.runs.find((run) => run.status === "running");
+      if (!schedule || !runningRun) {
+        continue;
+      }
+      if (!runningRun.agentId) {
+        throw new Error(
+          `Schedule ${scheduleId} run ${runningRun.id} has no agent assigned yet; cannot checkpoint mid-admission`,
+        );
+      }
+      runs.push({
+        scheduleId,
+        runId: runningRun.id,
+        agentId: runningRun.agentId,
+        workspaceId: runningRun.workspaceId ?? null,
+        manual: this.activeRunContext.get(scheduleId)?.manual ?? false,
+      });
+    }
+    return { runs };
+  }
+
+  /**
+   * Register the schedule runs a restart checkpoint claimed. Call before
+   * `start()` so `recoverInterruptedRuns()` excludes them instead of failing
+   * them. Does not wait on anything yet — the owning agents are not
+   * necessarily registered with the agent manager at this point.
+   */
+  restoreAfterRestart(snapshot: ScheduleRestartSnapshot): void {
+    for (const run of snapshot.runs) {
+      this.restoredRunIds.add(run.runId);
+      this.runningScheduleIds.add(run.scheduleId);
+      this.activeRunContext.set(run.scheduleId, { runId: run.runId, manual: run.manual });
+    }
+    this.pendingRestoredRuns.push(...snapshot.runs);
+  }
+
+  /**
+   * Attach to the runs `restoreAfterRestart` registered. Call once their
+   * agents are registered with the agent manager (and their continuation
+   * turns are about to start, per the manager's own restore ordering) —
+   * never starts a replacement run or agent, only waits for the original
+   * agent to reach a terminal state and completes the original run under
+   * its original scheduleId/runId.
+   */
+  resumeRestoredRuns(): void {
+    const runs = this.pendingRestoredRuns;
+    this.pendingRestoredRuns = [];
+    for (const run of runs) {
+      void this.reattachRestoredRun(run).catch((error) => {
+        this.admissionFailures.set(run.scheduleId, error);
+        this.logger.error(
+          { err: error, scheduleId: run.scheduleId, runId: run.runId },
+          "Failed to reattach restored schedule run",
+        );
+      });
+    }
+  }
+
+  private async reattachRestoredRun(run: ScheduleRestartRunRecord): Promise<void> {
+    const schedule = await this.store.get(run.scheduleId);
+    const archiveOnFinish =
+      schedule?.target.type === "new-agent" ? schedule.target.config.archiveOnFinish : undefined;
+    // Only archive once the run's outcome is durably recorded — a workspace archived out
+    // from under a run whose terminal write failed would be irrecoverable, for a run the
+    // store still shows as "running" and finishRunWriteFailures is about to block
+    // checkpointing over.
+    let persisted = false;
+    try {
+      const waitResult = await this.agentManager.waitForAgentEvent(run.agentId, {
+        waitForActive: true,
+      });
+      if (waitResult.permission) {
+        throw new Error(`Scheduled agent ${run.agentId} is waiting for permission`);
+      }
+      if (waitResult.status === "error") {
+        throw new Error(waitResult.lastMessage ?? `Scheduled agent ${run.agentId} failed`);
+      }
+      ({ persisted } = await this.settleRun({
+        scheduleId: run.scheduleId,
+        runId: run.runId,
+        status: "succeeded",
+        agentId: run.agentId,
+        output: buildRunOutput({
+          output: null,
+          timelineText: "",
+          finalText: waitResult.lastMessage ?? "",
+        }),
+        error: null,
+        targetGone: false,
+        manual: run.manual,
+      }));
+    } catch (error) {
+      if (error instanceof AgentRestartSuspendedError) {
+        return;
+      }
+      ({ persisted } = await this.settleRun({
+        scheduleId: run.scheduleId,
+        runId: run.runId,
+        status: "failed",
+        agentId: run.agentId,
+        output: null,
+        error: error instanceof Error ? error.message : String(error),
+        targetGone: false,
+        manual: run.manual,
+      }));
+    } finally {
+      if (
+        persisted &&
+        run.workspaceId &&
+        shouldArchiveScheduleRunWorkspace({ agentId: run.agentId, archiveOnFinish })
+      ) {
+        try {
+          await this.archiveWorkspace(run.workspaceId);
+        } catch (error) {
+          this.logger.warn(
+            {
+              err: error,
+              agentId: run.agentId,
+              workspaceId: run.workspaceId,
+              scheduleId: run.scheduleId,
+              runId: run.runId,
+            },
+            "Failed to archive scheduled workspace after restart reattach",
+          );
+        }
+      }
     }
   }
 
@@ -535,6 +862,9 @@ export class ScheduleService {
   }
 
   async runOnce(id: string): Promise<StoredSchedule> {
+    if (this.paused) {
+      throw new RestartInProgressError();
+    }
     const schedule = await this.inspect(id);
     if (schedule.status === "completed") {
       throw new Error(`Schedule ${id} is already completed`);
@@ -547,9 +877,19 @@ export class ScheduleService {
   }
 
   async tick(): Promise<void> {
+    if (this.paused) {
+      return;
+    }
     const now = this.now();
     const schedules = await this.store.list();
     for (const schedule of schedules) {
+      // Re-checked every iteration: pauseForRestart() can be requested while
+      // this loop is already in progress (it doesn't cancel an in-progress
+      // tick), and no schedule after that point may start fresh admission
+      // into an already-frozen manager.
+      if (this.paused) {
+        return;
+      }
       if (schedule.status !== "active" || !schedule.nextRunAt) {
         continue;
       }
@@ -599,7 +939,9 @@ export class ScheduleService {
       let updated = { ...current };
       let dirty = false;
 
-      const runningIndex = updated.runs.findIndex((run) => run.status === "running");
+      const runningIndex = updated.runs.findIndex(
+        (run) => run.status === "running" && !this.restoredRunIds.has(run.id),
+      );
       if (runningIndex !== -1) {
         const runs = [...updated.runs];
         const runningRun = runs[runningIndex];
@@ -692,9 +1034,14 @@ export class ScheduleService {
     now: Date,
     options?: { manual?: boolean },
   ): Promise<void> {
+    // Recheck after callers' awaited reads, before registering any new work.
+    if (this.paused) {
+      throw new RestartInProgressError();
+    }
     const manual = options?.manual === true;
     this.runningScheduleIds.add(schedule.id);
     const runId = randomUUID();
+    this.activeRunContext.set(schedule.id, { runId, manual });
     const runningRun: ScheduleRun = {
       id: runId,
       scheduledFor: manual ? now.toISOString() : (schedule.nextRunAt ?? now.toISOString()),
@@ -705,11 +1052,21 @@ export class ScheduleService {
       output: null,
       error: null,
     };
-    const scheduleWithRun = await this.appendRunningRun(schedule.id, runningRun);
 
     try {
-      const result = await this.runner(scheduleWithRun, runId);
-      await this.finishRun({
+      // Track the first store write too: no await may separate the admission check
+      // from registration, or pauseForRestart() could miss this run.
+      const handle = await this.trackAdmission(
+        schedule.id,
+        (async () => {
+          const scheduleWithRun = await this.appendRunningRun(schedule.id, runningRun);
+          return this.runner(scheduleWithRun, runId);
+        })(),
+      );
+      const result = await handle.completion;
+      // A failed save must not reach the execution-error handler and rewrite success
+      // as failure. Retain ownership until the actual outcome is durable.
+      await this.settleRun({
         scheduleId: schedule.id,
         runId,
         status: "succeeded",
@@ -720,7 +1077,30 @@ export class ScheduleService {
         manual,
       });
     } catch (error) {
-      await this.finishRun({
+      if (error instanceof AgentRestartSuspendedError) {
+        // Restart interruption, not a real failure: leave the run "running"
+        // in the store and this schedule in runningScheduleIds so
+        // snapshotForRestart() captures it instead of finishRun() failing
+        // and archiving it here.
+        this.logger.info(
+          { scheduleId: schedule.id, runId, agentId: error.agentId },
+          "Schedule run suspended for restart",
+        );
+        return;
+      }
+      if (error instanceof RestartInProgressError) {
+        this.admissionFailures.set(schedule.id, error);
+        // The admission drain should prevent this. Keep the row and block checkpointing:
+        // even an assigned agentId does not prove the manager accepted the work.
+        this.logger.error(
+          { scheduleId: schedule.id, runId },
+          "Schedule admission was rejected after registration; checkpoint blocked",
+        );
+        return;
+      }
+      // A genuine execution failure (not a persistence failure — see settleRun() above,
+      // which never rethrows, so this catch only ever sees execution/admission errors).
+      await this.settleRun({
         scheduleId: schedule.id,
         runId,
         status: "failed",
@@ -730,8 +1110,6 @@ export class ScheduleService {
         targetGone: error instanceof ScheduleTargetGoneError,
         manual,
       });
-    } finally {
-      this.runningScheduleIds.delete(schedule.id);
     }
   }
 
@@ -747,16 +1125,39 @@ export class ScheduleService {
     return requireSchedule(updated, scheduleId);
   }
 
-  private async finishRun(params: {
-    scheduleId: string;
-    runId: string;
-    status: "succeeded" | "failed";
-    agentId: string | null;
-    output: string | null;
-    error: string | null;
-    targetGone: boolean;
-    manual: boolean;
-  }): Promise<void> {
+  /** Save the decided outcome without reclassifying a write failure as execution failure. */
+  private async settleRun(params: FinishRunParams): Promise<{ persisted: boolean }> {
+    try {
+      await this.finishRun(params);
+      this.runningScheduleIds.delete(params.scheduleId);
+      this.activeRunContext.delete(params.scheduleId);
+      this.restoredRunIds.delete(params.runId);
+      return { persisted: true };
+    } catch (error) {
+      this.logger.error(
+        { err: error, scheduleId: params.scheduleId, runId: params.runId, status: params.status },
+        "Failed to persist a schedule run's terminal state",
+      );
+      return { persisted: false };
+    }
+  }
+
+  private async finishRun(params: FinishRunParams): Promise<void> {
+    const key = `${params.scheduleId}:${params.runId}`;
+    const write = this.writeFinishRun(params);
+    this.pendingFinishWrites.add(write);
+    try {
+      await write;
+      this.finishRunWriteFailures.delete(key);
+    } catch (error) {
+      this.finishRunWriteFailures.set(key, error);
+      throw error;
+    } finally {
+      this.pendingFinishWrites.delete(write);
+    }
+  }
+
+  private async writeFinishRun(params: FinishRunParams): Promise<void> {
     const updatedSchedule = await this.store.update(params.scheduleId, (schedule) => {
       const now = this.now();
       const completedRuns = schedule.runs.map((run) =>
@@ -811,6 +1212,30 @@ export class ScheduleService {
     requireSchedule(updatedSchedule, params.scheduleId);
   }
 
+  /**
+   * Record the agent an in-flight run is attached to, for target kinds (existing-agent
+   * schedules) that have no workspace to record alongside it. Written as soon as the
+   * agent is known — synchronously at admission here, unlike new-agent schedules where
+   * it only exists after agent creation — so snapshotForRestart() can always checkpoint
+   * a run that has actually started, not just new-agent ones.
+   */
+  private async recordRunAgentId(params: {
+    scheduleId: string;
+    runId: string;
+    agentId: string;
+  }): Promise<void> {
+    const updatedSchedule = await this.store.update(params.scheduleId, (schedule) => ({
+      ...schedule,
+      updatedAt: this.now().toISOString(),
+      runs: schedule.runs.map((run) =>
+        run.id === params.runId && run.status === "running"
+          ? { ...run, agentId: params.agentId }
+          : run,
+      ),
+    }));
+    requireSchedule(updatedSchedule, params.scheduleId);
+  }
+
   private async recordRunWorkspace(params: {
     scheduleId: string;
     runId: string;
@@ -836,29 +1261,47 @@ export class ScheduleService {
   private async executeSchedule(
     schedule: StoredSchedule,
     runId: string,
-  ): Promise<ScheduleExecutionResult> {
+  ): Promise<ScheduleExecutionHandle> {
     if (schedule.target.type === "agent") {
-      const wrappedPrompt = formatSystemNotificationPrompt(buildScheduleFireBody(schedule, runId));
-      const record = await this.agentStorage.get(schedule.target.agentId);
-      if (!record) {
-        throw new ScheduleTargetGoneError(`Agent ${schedule.target.agentId} no longer exists`);
-      }
-      if (record.archivedAt) {
-        throw new ScheduleTargetGoneError(`Agent ${schedule.target.agentId} is archived`);
-      }
+      return this.startAgentTargetSchedule(schedule.target, schedule, runId);
+    }
+    return this.startNewAgentTargetSchedule(schedule, runId);
+  }
 
-      const agent = await ensureAgentLoaded(schedule.target.agentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.logger,
-      });
-      if (this.agentManager.hasInFlightRun(agent.id)) {
-        throw new Error(`Agent ${agent.id} already has an active run`);
-      }
-      await startAgentRun(this.agentManager, agent.id, wrappedPrompt, this.logger, {
-        replaceRunning: true,
-        activeTurnBehavior: "steer",
-      });
+  private async startAgentTargetSchedule(
+    target: Extract<ScheduleTarget, { type: "agent" }>,
+    schedule: StoredSchedule,
+    runId: string,
+  ): Promise<ScheduleExecutionHandle> {
+    const wrappedPrompt = formatSystemNotificationPrompt(buildScheduleFireBody(schedule, runId));
+    const record = await this.agentStorage.get(target.agentId);
+    if (!record) {
+      throw new ScheduleTargetGoneError(`Agent ${target.agentId} no longer exists`);
+    }
+    if (record.archivedAt) {
+      throw new ScheduleTargetGoneError(`Agent ${target.agentId} is archived`);
+    }
+
+    const agent = await ensureAgentLoaded(target.agentId, {
+      agentManager: this.agentManager,
+      agentStorage: this.agentStorage,
+      logger: this.logger,
+    });
+    if (this.agentManager.hasInFlightRun(agent.id)) {
+      throw new Error(`Agent ${agent.id} already has an active run`);
+    }
+    // Written before admission, not after completion: a restart mid-turn must find this
+    // run's agentId already on the store row, or snapshotForRestart() has nothing to
+    // checkpoint against and refuses the whole checkpoint.
+    await this.recordRunAgentId({ scheduleId: schedule.id, runId, agentId: agent.id });
+    // startAgentRun() only awaits the short admission (assignment + turn start); it drains
+    // the rest of the turn in the background, so by the time it resolves, this method's
+    // own admission work is done — the caller only awaits what's returned below.
+    await startAgentRun(this.agentManager, agent.id, wrappedPrompt, this.logger, {
+      replaceRunning: true,
+      activeTurnBehavior: "steer",
+    });
+    const completion = (async (): Promise<ScheduleExecutionResult> => {
       const waitResult = await this.agentManager.waitForAgentEvent(agent.id, {
         waitForActive: true,
       });
@@ -876,8 +1319,14 @@ export class ScheduleService {
           finalText: waitResult.lastMessage ?? "",
         }),
       };
-    }
+    })();
+    return { completion };
+  }
 
+  private async startNewAgentTargetSchedule(
+    schedule: StoredSchedule,
+    runId: string,
+  ): Promise<ScheduleExecutionHandle> {
     const config = schedule.target.type === "new-agent" ? schedule.target.config : null;
     if (!config) {
       throw new Error(`Schedule ${schedule.id} target changed during execution`);
@@ -921,6 +1370,62 @@ export class ScheduleService {
         workspaceId: workspace.workspaceId,
         agentId,
       });
+      // Admission is done here: the agent exists and is about to dispatch. The rest
+      // (dispatch + the whole model turn) is `completion`, deliberately not awaited by
+      // this method — see runNewAgentTargetCompletion(). The archive-on-finish handling
+      // below intentionally covers only failures reaching this point (workspace/agent
+      // creation itself); runNewAgentTargetCompletion() owns it for everything after.
+      const completion = this.runNewAgentTargetCompletion({
+        schedule,
+        runId,
+        config,
+        workspace,
+        agentId,
+        created,
+        agent,
+      });
+      return { completion };
+    } catch (error) {
+      const suspendedForRestart =
+        error instanceof AgentRestartSuspendedError || error instanceof RestartInProgressError;
+      if (
+        !suspendedForRestart &&
+        workspace &&
+        shouldArchiveScheduleRunWorkspace({ agentId, archiveOnFinish: config.archiveOnFinish })
+      ) {
+        try {
+          await this.archiveWorkspace(workspace.workspaceId);
+        } catch (archiveError) {
+          this.logger.warn(
+            {
+              err: archiveError,
+              agentId,
+              workspaceId: workspace.workspaceId,
+              scheduleId: schedule.id,
+              runId,
+            },
+            "Failed to archive scheduled workspace after admission failure",
+          );
+        }
+      }
+      throw error;
+    }
+  }
+
+  private async runNewAgentTargetCompletion(input: {
+    schedule: StoredSchedule;
+    runId: string;
+    config: Extract<ScheduleTarget, { type: "new-agent" }>["config"];
+    workspace: PersistedWorkspaceRecord;
+    agentId: string;
+    created: Awaited<ReturnType<BoundCreateAgentCommand>>;
+    agent: Awaited<ReturnType<BoundCreateAgentCommand>>["snapshot"];
+  }): Promise<ScheduleExecutionResult> {
+    const { schedule, runId, config, workspace, agentId, created, agent } = input;
+    // A restart suspension must not archive the workspace out from under the run it's
+    // about to be reattached to after restart.
+    let suspendedForRestart = false;
+    try {
       if (created.initialPromptError) {
         throw created.initialPromptError;
       }
@@ -946,9 +1451,14 @@ export class ScheduleService {
           finalText: result.finalText,
         }),
       };
+    } catch (error) {
+      if (error instanceof AgentRestartSuspendedError || error instanceof RestartInProgressError) {
+        suspendedForRestart = true;
+      }
+      throw error;
     } finally {
       if (
-        workspace &&
+        !suspendedForRestart &&
         shouldArchiveScheduleRunWorkspace({ agentId, archiveOnFinish: config.archiveOnFinish })
       ) {
         try {

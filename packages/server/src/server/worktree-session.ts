@@ -698,18 +698,22 @@ export async function createPaseoWorktreeWorkflow(
       setupContinuation: {
         kind: "agent",
         startAfterAgentCreate: ({ agentId }) => {
-          void runAsyncWorktreeBootstrap({
-            agentId,
-            workspaceId: workspace.workspaceId,
-            worktree: createdWorktree.worktree,
-            workspaceCwd: workspace.cwd,
-            shouldBootstrap: createdWorktree.created,
-            terminalManager: setupContinuation.terminalManager,
-            appendTimelineItem: (item) => setupContinuation.appendTimelineItem({ agentId, item }),
-            emitLiveTimelineItem: (item) =>
-              setupContinuation.emitLiveTimelineItem({ agentId, item }),
-            logger: setupContinuation.logger,
-          });
+          const run = () =>
+            runAsyncWorktreeBootstrap({
+              agentId,
+              workspaceId: workspace.workspaceId,
+              worktree: createdWorktree.worktree,
+              workspaceCwd: workspace.cwd,
+              shouldBootstrap: createdWorktree.created,
+              terminalManager: setupContinuation.terminalManager,
+              appendTimelineItem: (item) => setupContinuation.appendTimelineItem({ agentId, item }),
+              emitLiveTimelineItem: (item) =>
+                setupContinuation.emitLiveTimelineItem({ agentId, item }),
+              logger: setupContinuation.logger,
+            });
+          if (dependencies.startWorkspaceSetup)
+            dependencies.startWorkspaceSetup(workspace.workspaceId, run);
+          else void run();
         },
       },
     };

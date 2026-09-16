@@ -1,4 +1,5 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { RestartInProgressError } from "../../restart/restart-errors.js";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, expect, test } from "vitest";
@@ -15,6 +16,28 @@ async function fixture() {
   directories.push(directory);
   return { directory, requests: new AgentRequests(directory) };
 }
+
+test("receipt write failure cannot certify a drained restart or dispatch the message", async () => {
+  const { directory } = await fixture();
+  const blockedPath = path.join(directory, "not-a-directory");
+  const requests = new AgentRequests(blockedPath);
+  let dispatched = false;
+  await expect(
+    requests.send({
+      agentId: "agent",
+      messageId: "one",
+      request: {},
+      prepare: async () => {
+        await writeFile(blockedPath, "preserve me");
+      },
+      send: async () => {
+        dispatched = true;
+      },
+    }),
+  ).rejects.toThrow();
+  expect(dispatched).toBe(false);
+  await expect(requests.drain()).rejects.toThrow("Request receipts could not be persisted");
+});
 
 test("concurrent and reconstructed creates return the same durable agent", async () => {
   const { requests, directory } = await fixture();
@@ -140,4 +163,42 @@ test("failed local message preparation does not leave an ambiguous receipt", asy
   available = false;
   await requests.send(input);
   expect(sends).toBe(1);
+});
+
+test("known restart rejection is retryable but a different payload with that ID is never dispatched", async () => {
+  const { requests, directory } = await fixture();
+  let calls = 0;
+  const input = {
+    agentId: "agent",
+    messageId: "restart-send",
+    request: { text: "keep me" },
+    send: async () => {
+      throw new RestartInProgressError();
+    },
+  };
+  await expect(requests.send(input)).rejects.toBeInstanceOf(RestartInProgressError);
+  const resumed = new AgentRequests(directory);
+  await expect(
+    resumed.send({
+      ...input,
+      request: { text: "replace me" },
+      send: async () => {
+        calls++;
+      },
+    }),
+  ).rejects.toThrow("agent_request_key_conflict");
+  expect(calls).toBe(0);
+  await resumed.send({
+    ...input,
+    send: async () => {
+      calls++;
+    },
+  });
+  await resumed.send({
+    ...input,
+    send: async () => {
+      calls++;
+    },
+  });
+  expect(calls).toBe(1);
 });

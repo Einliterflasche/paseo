@@ -283,6 +283,7 @@ export interface DaemonServerInfo {
   desktopManaged?: boolean;
   capabilities?: ServerCapabilities;
   features?: ServerInfoStatusPayload["features"];
+  restartRecoveryState?: ServerInfoStatusPayload["restartRecoveryState"];
 }
 
 export interface AgentTimelineCursorState {
@@ -678,6 +679,7 @@ function isSessionServerInfoUnchanged(input: {
   nextCapabilities: ServerCapabilities | undefined;
   nextFeatures: ServerInfoStatusPayload["features"] | undefined;
   nextServerId: string;
+  nextRestartRecoveryState: ServerInfoStatusPayload["restartRecoveryState"] | undefined;
 }): boolean {
   const {
     currentServerInfo,
@@ -686,6 +688,7 @@ function isSessionServerInfoUnchanged(input: {
     nextDesktopManaged,
     nextCapabilities,
     nextFeatures,
+    nextRestartRecoveryState,
   } = input;
   const prevHostname = currentServerInfo?.hostname?.trim() || null;
   const prevVersion = currentServerInfo?.version?.trim() || null;
@@ -695,7 +698,8 @@ function isSessionServerInfoUnchanged(input: {
     prevVersion === nextVersion &&
     currentServerInfo?.desktopManaged === nextDesktopManaged &&
     areServerCapabilitiesEqual(currentServerInfo?.capabilities, nextCapabilities) &&
-    areServerInfoFeaturesEqual(currentServerInfo?.features, nextFeatures)
+    areServerInfoFeaturesEqual(currentServerInfo?.features, nextFeatures) &&
+    currentServerInfo?.restartRecoveryState === nextRestartRecoveryState
   );
 }
 
@@ -833,6 +837,7 @@ export const useSessionStore = create<SessionStore>()(
           const nextDesktopManaged = info.desktopManaged;
           const nextCapabilities = info.capabilities;
           const nextFeatures = info.features;
+          const nextRestartRecoveryState = info.restartRecoveryState;
 
           if (
             isSessionServerInfoUnchanged({
@@ -843,6 +848,7 @@ export const useSessionStore = create<SessionStore>()(
               nextCapabilities,
               nextFeatures,
               nextServerId: info.serverId,
+              nextRestartRecoveryState,
             })
           ) {
             return prev;
@@ -863,6 +869,9 @@ export const useSessionStore = create<SessionStore>()(
                     : {}),
                   ...(nextCapabilities ? { capabilities: nextCapabilities } : {}),
                   ...(nextFeatures ? { features: nextFeatures } : {}),
+                  ...(nextRestartRecoveryState
+                    ? { restartRecoveryState: nextRestartRecoveryState }
+                    : {}),
                 },
               },
             },

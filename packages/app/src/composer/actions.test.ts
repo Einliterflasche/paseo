@@ -435,6 +435,24 @@ describe("dispatchComposerAgentMessage", () => {
     expect(client.calls[0]?.options.activeTurnBehavior).toBe("steer");
   });
 
+  it("reuses a caller-supplied client message ID instead of minting a new one", async () => {
+    const client = createFakeSendClient();
+    const stream = createFakeStream();
+
+    await dispatchComposerAgentMessage({
+      client,
+      agentId: "agent",
+      text: "retained id",
+      attachments: [],
+      encodeImages: async () => [],
+      submission: stream,
+      clientMessageId: "explicit-id-1",
+    });
+
+    expect(client.calls[0]?.options.messageId).toBe("explicit-id-1");
+    expect(stream.tail.get("agent")?.[0]).toMatchObject({ clientMessageId: "explicit-id-1" });
+  });
+
   it("stamps only a steer optimistic row with the daemon active turn ID", async () => {
     const client = createFakeSendClient();
     const stream = createFakeStream();
@@ -805,12 +823,16 @@ describe("sendQueuedComposerMessageNow", () => {
     expect(submitted).toEqual([]);
   });
 
-  it("removes the queued entry and submits its text + attachments", async () => {
+  it("removes the queued entry and submits its text + attachments + original ID", async () => {
     const review = reviewWorkspaceAttachment("Queued for send.");
     const queue = createFakeQueue(
       new Map([["agent", [{ id: "msg-1", text: "send me", attachments: [review] }]]]),
     );
-    const submitted: Array<{ text: string; attachments: ComposerAttachment[] }> = [];
+    const submitted: Array<{
+      text: string;
+      attachments: ComposerAttachment[];
+      clientMessageId: string;
+    }> = [];
     const result = await sendQueuedComposerMessageNow({
       agentId: "agent",
       messageId: "msg-1",
@@ -821,7 +843,33 @@ describe("sendQueuedComposerMessageNow", () => {
     });
     expect(result).toEqual({ status: "submitted" });
     expect(queue.state.get("agent")).toEqual([]);
-    expect(submitted).toEqual([{ text: "send me", attachments: [review] }]);
+    expect(submitted).toEqual([
+      { text: "send me", attachments: [review], clientMessageId: "msg-1" },
+    ]);
+  });
+
+  it("passes the queued item's own ID through instead of minting a new one", async () => {
+    const queue = createFakeQueue(
+      new Map([["agent", [{ id: "queued-id-123", text: "hi", attachments: [] }]]]),
+    );
+    const client = createFakeSendClient();
+    const result = await sendQueuedComposerMessageNow({
+      agentId: "agent",
+      messageId: "queued-id-123",
+      queue,
+      submitMessage: ({ text, attachments, clientMessageId }) =>
+        dispatchComposerAgentMessage({
+          client,
+          agentId: "agent",
+          text,
+          attachments,
+          encodeImages: passthroughEncodeImages,
+          submission: createFakeStream(),
+          clientMessageId,
+        }),
+    });
+    expect(result).toEqual({ status: "submitted" });
+    expect(client.calls[0]?.options.messageId).toBe("queued-id-123");
   });
 
   it("restores the queued entry to the front and surfaces the error message on failure", async () => {

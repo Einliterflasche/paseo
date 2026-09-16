@@ -4835,12 +4835,15 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.closed = true;
     this.clearPendingPermissions();
     this.pendingSubAgentNotificationsByThreadId.clear();
-    this.subscribers.clear();
     this.activeForegroundTurnId = null;
     this.activeClientMessageId = null;
     this.pendingForegroundTurnIdentification?.resolve(null);
     this.pendingForegroundTurnIdentification = null;
+    // Disposing the app-server client can still deliver a final notification
+    // through the handler registered in establishConnection(); keep
+    // subscribers attached until dispose settles so that event isn't dropped.
     await this.disposeClient();
+    this.subscribers.clear();
     this.currentThreadId = null;
   }
 

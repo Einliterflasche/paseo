@@ -48,6 +48,7 @@ import { BROWSER_AUTOMATION_COMMAND_NAMES } from "@getpaseo/protocol/browser-aut
 import {
   useSessionStore,
   type Agent,
+  type DaemonServerInfo,
   type WorkspaceDescriptor,
   type ProjectDescriptor,
 } from "@/stores/session-store";
@@ -1378,6 +1379,10 @@ interface AgentDirectoryRefreshInput {
   page?: FetchAgentsOptions["page"];
 }
 
+function isRestartRecoveryRestoring(state: DaemonServerInfo["restartRecoveryState"]): boolean {
+  return state === "preparing" || state === "restoring" || state === "paused";
+}
+
 export class HostRuntimeStore {
   private controllers = new Map<string, HostRuntimeController>();
   private serverListeners = new Map<string, Set<() => void>>();
@@ -1393,6 +1398,10 @@ export class HostRuntimeStore {
   private lastConnectionStatusByServer = new Map<string, HostRuntimeConnectionStatus>();
   private connectionStatusStartedAtByServer = new Map<string, number>();
   private queuedAgentDrainInFlight = new Set<string>();
+  private restartRecoveryStateByServer = new Map<
+    string,
+    DaemonServerInfo["restartRecoveryState"]
+  >();
   private directorySyncByServer = new Map<string, DirectorySync>();
   private nextCancellationRequestId = 0;
   private timelineReplicaByServer = new Map<string, TimelineReplica>();
@@ -1412,6 +1421,24 @@ export class HostRuntimeStore {
     this.storage = input?.storage ?? AsyncStorage;
     this.replicaCache = new ReplicaCache(input?.replicaRowStore ?? createReplicaRowStore());
     this.revokePushNotifications = input?.revokePushNotifications ?? revokePushNotifications;
+    // A resumed agent can finish restoring with no further agent_update at all
+    // (nothing changed once it's back), so onAgentStoppedRunning alone cannot be
+    // trusted to retrigger a drain. Watch the restart-recovery transition directly:
+    // this is the only source of truth for "safe to send again" once queue drains
+    // are frozen during a controlled restart.
+    useSessionStore.subscribe((state) => {
+      for (const [serverId, session] of Object.entries(state.sessions)) {
+        const next = session.serverInfo?.restartRecoveryState;
+        const prev = this.restartRecoveryStateByServer.get(serverId);
+        if (prev === next) {
+          continue;
+        }
+        this.restartRecoveryStateByServer.set(serverId, next);
+        if (isRestartRecoveryRestoring(prev) && !isRestartRecoveryRestoring(next)) {
+          this.drainQueuedAgentMessagesForServer(serverId);
+        }
+      }
+    });
   }
 
   // --- Host registry ---
@@ -2178,7 +2205,13 @@ export class HostRuntimeStore {
     const session = store.sessions[serverId];
     const queue = session?.queuedMessages.get(agentId);
     const client = session?.client;
-    if (!client || !queue?.length || session.initializingAgents.get(agentId) === true) {
+    const isRestoring = isRestartRecoveryRestoring(session?.serverInfo?.restartRecoveryState);
+    if (
+      !client ||
+      !queue?.length ||
+      session.initializingAgents.get(agentId) === true ||
+      isRestoring
+    ) {
       return;
     }
     this.queuedAgentDrainInFlight.add(drainKey);
@@ -2191,7 +2224,7 @@ export class HostRuntimeStore {
           useSessionStore.getState().sessions[serverId]?.queuedMessages.get(queuedAgentId) ?? [],
         write: (update) => useSessionStore.getState().setQueuedMessages(serverId, update),
       },
-      submitMessage: async ({ text, attachments }) => {
+      submitMessage: async ({ text, attachments, clientMessageId }) => {
         const supportsForgeAttachments =
           useSessionStore.getState().sessions[serverId]?.serverInfo?.features?.forgeSearch === true;
         await dispatchComposerAgentMessage({
@@ -2204,6 +2237,7 @@ export class HostRuntimeStore {
           }),
           encodeImages,
           submission: createMessageSubmissionWriter(serverId),
+          clientMessageId,
         });
       },
     })
@@ -2220,6 +2254,18 @@ export class HostRuntimeStore {
       .finally(() => {
         this.queuedAgentDrainInFlight.delete(drainKey);
       });
+  }
+
+  /** Retries every agent's queued message for a server, e.g. once restart
+   * recovery finishes and a resumed agent produces no further agent_update. */
+  drainQueuedAgentMessagesForServer(serverId: string): void {
+    const session = useSessionStore.getState().sessions[serverId];
+    if (!session) {
+      return;
+    }
+    for (const agentId of session.queuedMessages.keys()) {
+      this.drainQueuedAgentMessage(serverId, agentId);
+    }
   }
 
   applyAgentTurnLiveness(

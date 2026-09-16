@@ -2920,6 +2920,59 @@ describe("HostRuntimeStore", () => {
     useSessionStore.getState().clearSession(host.serverId);
   });
 
+  it("skips draining while restart recovery is in progress, then drains once running with no further agent update", async () => {
+    const host = makeHost({ serverId: "srv_restart_recovery_drain" });
+    const fakeClient = new FakeDaemonClient();
+    const store = new HostRuntimeStore({
+      deps: {
+        createClient: () => fakeClient as unknown as DaemonClient,
+        connectToDaemon: async () => ({
+          client: fakeClient as unknown as DaemonClient,
+          serverId: host.serverId,
+          hostname: null,
+        }),
+        getClientId: async () => "cid_restart_recovery_drain",
+      },
+    });
+    const sessionStore = useSessionStore.getState();
+    sessionStore.initializeSession(host.serverId, fakeClient as unknown as DaemonClient, 1);
+    sessionStore.updateSessionServerInfo(host.serverId, {
+      serverId: host.serverId,
+      hostname: null,
+      version: null,
+      restartRecoveryState: "restoring",
+    });
+    sessionStore.setQueuedMessages(
+      host.serverId,
+      new Map([["agent", [{ id: "stranded", text: "send once running", attachments: [] }]]]),
+    );
+
+    // An agent_update-driven drain attempt (e.g. onAgentStoppedRunning firing while
+    // the daemon is mid-restart) must not send anything yet.
+    store.drainQueuedAgentMessage(host.serverId, "agent");
+    await Promise.resolve();
+    expect(fakeClient.sentAgentMessages).toHaveLength(0);
+    expect(
+      useSessionStore.getState().sessions[host.serverId]?.queuedMessages.get("agent"),
+    ).toHaveLength(1);
+
+    // The daemon reports it's running again. Nothing else changes for this agent —
+    // no further agent_update arrives — yet the queued send must still go out.
+    sessionStore.updateSessionServerInfo(host.serverId, {
+      serverId: host.serverId,
+      hostname: null,
+      version: null,
+      restartRecoveryState: "running",
+    });
+
+    await fakeClient.waitForSentMessages(1);
+    expect(fakeClient.sentAgentMessages.map(([agentId, text]) => [agentId, text])).toEqual([
+      ["agent", "send once running"],
+    ]);
+
+    useSessionStore.getState().clearSession(host.serverId);
+  });
+
   it("uses legacy GitHub attachments when draining a queue for an old daemon", async () => {
     const host = makeHost({ serverId: "srv_legacy_queue_attachment" });
     const fakeClient = new FakeDaemonClient();

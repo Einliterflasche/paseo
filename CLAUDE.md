@@ -4,6 +4,10 @@ Paseo is a mobile app for monitoring and controlling your local AI coding agents
 
 **Supported agents:** Claude Code, Codex, GitHub Copilot, OpenCode, and Pi.
 
+For this fork, read [fork maintenance](docs/fork-maintenance.md) before making
+changes or updating upstream, and [migration requirements](docs/fork-requirements.md)
+before changing behavior.
+
 ## Repository map
 
 This is an npm workspace monorepo:
@@ -23,6 +27,9 @@ At the start of non-trivial work, list `docs/` and skim anything relevant to the
 
 | Doc                                                                  | What's in it                                                                                                                   |
 | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| [docs/fork-maintenance.md](docs/fork-maintenance.md)                 | Fork branches, commit prefix, rebasing, and deployment baseline                                                                |
+| [docs/fork-requirements.md](docs/fork-requirements.md)               | Raphael's requirements for the move from Slack to Paseo                                                                        |
+| [docs/restart-recovery-plan.md](docs/restart-recovery-plan.md)       | Controlled restart checkpoints, automatic continuation, and accepted crash limitation                                          |
 | [docs/product.md](docs/product.md)                                   | What Paseo is, who it's for, where it's going                                                                                  |
 | [docs/architecture.md](docs/architecture.md)                         | System design, package layering, WebSocket protocol, agent lifecycle, data flow                                                |
 | [docs/agent-lifecycle.md](docs/agent-lifecycle.md)                   | Agent states, parent/child relationships, archive semantics, tabs vs archive, subagents track                                  |
@@ -115,7 +122,7 @@ and updating `next`, integrating it after a release, and releasing a hotfix from
 
 ## Critical rules
 
-- **NEVER restart the main Paseo daemon on port 6767 without permission** — it manages all running agents. If you're an agent, restarting it kills your own process.
+- **Preserve Paseo service continuity during every deployment.** Build and validate first, then use the checkpointed restart/deploy path in [fork maintenance](docs/fork-maintenance.md). Preserve accepted messages, displayed history, and unfinished work; resume agents automatically after the brief reconnect. Run activation and verification outside `paseo.service`. Never bypass a failed checkpoint with raw stop/start, signals, `--force`, a direct NixOS switch, or a reboot. Verify restoration of the expected generation before reporting success. An existing user request to deploy authorizes this safe path; do not ask again merely because it restarts the daemon.
 - **NEVER assume a timeout means the service needs restarting** — timeouts can be transient.
 - **NEVER add auth checks to tests** — agent providers handle their own auth.
 - **Before changing app routes, startup routing, remembered workspace restore, or active workspace selection, read [docs/expo-router.md](docs/expo-router.md).**

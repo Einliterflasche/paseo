@@ -1901,6 +1901,66 @@ describe("ClaudeAgentSession context window usage", () => {
     };
   }
 
+  /**
+   * A query whose iterator, after yielding `initMessages`, blocks on `next()`
+   * and signals `entered` once it does — so a caller can wait for genuine
+   * "the pump is idle, blocked waiting for more" state before treating a
+   * subsequently pushed message as unambiguously late (arriving during
+   * close()'s interrupt()/return(), not racing startup). interrupt() is what
+   * pushes the late message and wakes the blocked next().
+   */
+  function createDeferredEntryQueryFactory(
+    initMessages: Array<Record<string, unknown>>,
+    lateMessage: Record<string, unknown>,
+  ): { queryFactory: ReturnType<typeof vi.fn>; entered: Promise<void> } {
+    const queue: Array<Record<string, unknown>> = [...initMessages];
+    let signalEntered: (() => void) | null = null;
+    const entered = new Promise<void>((resolve) => {
+      signalEntered = resolve;
+    });
+    let releaseGate: (() => void) | null = null;
+    let gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+
+    const queryFactory = vi.fn(() => ({
+      next: vi.fn(async () => {
+        if (queue.length > 0) {
+          return { done: false, value: queue.shift() };
+        }
+        signalEntered?.();
+        await gate;
+        if (queue.length === 0) {
+          return { done: true, value: undefined };
+        }
+        return { done: false, value: queue.shift() };
+      }),
+      interrupt: vi.fn(async () => {
+        queue.push(lateMessage);
+        releaseGate?.();
+      }),
+      return: vi.fn(async () => {
+        releaseGate?.();
+      }),
+      // Deliberately does not end the iterator: close() calls this
+      // synchronously before awaiting interrupt()/return(), and ending the
+      // stream here would retire the pump before interrupt() gets a chance
+      // to push its late message.
+      close: vi.fn(() => {}),
+      setPermissionMode: vi.fn(async () => undefined),
+      setModel: vi.fn(async () => undefined),
+      getContextUsage: vi.fn(async () => undefined),
+      supportedModels: vi.fn(async () => []),
+      supportedCommands: vi.fn(async () => []),
+      rewindFiles: vi.fn(async () => ({ canRewind: true })),
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    }));
+
+    return { queryFactory, entered };
+  }
+
   function createMessageStartEvent(
     usage: Record<string, unknown> = {
       input_tokens: 100,
@@ -3103,6 +3163,42 @@ describe("ClaudeAgentSession context window usage", () => {
         messageId: "assistant-third-party-1",
       },
     ]);
+  });
+
+  test("close() delivers assistant text that arrives from the SDK during interrupt() instead of dropping it if subscribers were cleared too early", async () => {
+    const lateText = "partial output flushed during interrupt";
+    const lateAssistantMessage = {
+      type: "assistant",
+      message: { content: [{ type: "text", text: lateText }] },
+      session_id: "session-1",
+      uuid: "late-assistant-text",
+    };
+    const { queryFactory, entered } = createDeferredEntryQueryFactory(
+      [createInitMessage()],
+      lateAssistantMessage,
+    );
+
+    const session = await new ClaudeAgentClient({
+      logger,
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    }).createSession({ provider: "claude", cwd: process.cwd() });
+    const events: AgentStreamEvent[] = [];
+    const unsubscribe = session.subscribe((event) => events.push(event));
+
+    await session.startTurn("investigate something long-running");
+    // Wait until the pump has consumed the init message and is genuinely
+    // blocked in next() for more — only then is the message interrupt()
+    // pushes unambiguously "late" (arriving during close()'s teardown)
+    // rather than racing the session's own startup processing.
+    await entered;
+
+    // close() must not clear subscribers before the pump has had a chance
+    // to observe and dispatch the message interrupt() causes to arrive.
+    await session.close();
+    unsubscribe();
+
+    expect(JSON.stringify(events)).toContain(lateText);
   });
 });
 

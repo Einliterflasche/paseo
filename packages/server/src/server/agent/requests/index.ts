@@ -2,20 +2,42 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
+import { RestartInProgressError } from "../../restart/restart-errors.js";
 import { writeJsonFileAtomic } from "../../atomic-file.js";
 
 const ReceiptSchema = z.object({
   fingerprint: z.string(),
   agentId: z.string(),
-  state: z.enum(["pending", "completed"]),
+  state: z.enum(["pending", "completed", "not_dispatched"]),
 });
 type Receipt = z.infer<typeof ReceiptSchema>;
 
 /** One daemon-owned request journal, shared by all of its socket sessions. */
 export class AgentRequests {
   private readonly pending = new Map<string, Promise<string>>();
+  private readonly writeFailures = new Map<string, unknown>();
 
   constructor(private readonly directory: string) {}
+
+  async drain(): Promise<void> {
+    while (this.pending.size) await Promise.allSettled(this.pending.values());
+    if (this.writeFailures.size) {
+      throw new AggregateError(
+        [...this.writeFailures.values()],
+        "Request receipts could not be persisted",
+      );
+    }
+  }
+
+  private async writeReceipt(file: string, receipt: Receipt): Promise<void> {
+    try {
+      await writeJsonFileAtomic(file, receipt);
+      this.writeFailures.delete(file);
+    } catch (error) {
+      this.writeFailures.set(file, error);
+      throw error;
+    }
+  }
 
   create(input: {
     key: string;
@@ -88,27 +110,33 @@ export class AgentRequests {
   ): Promise<string> {
     const file = path.join(this.directory, `${key}.json`);
     const existing = await readReceipt(file);
-    if (existing) {
+    if (existing && existing.fingerprint !== fingerprint)
+      throw new Error("agent_request_key_conflict");
+    if (existing && existing.state !== "not_dispatched") {
       if (existing.fingerprint !== fingerprint) throw new Error("agent_request_key_conflict");
       if (existing.state === "completed") return existing.agentId;
       if (!(await operation.recover(existing.agentId))) {
         throw new Error("agent_request_outcome_unknown");
       }
-      await writeJsonFileAtomic(file, { ...existing, state: "completed" });
+      await this.writeReceipt(file, { ...existing, state: "completed" });
       return existing.agentId;
     }
     await operation.prepare?.();
     const receipt: Receipt = { fingerprint, agentId: operation.agentId, state: "pending" };
-    await writeJsonFileAtomic(file, receipt);
+    await this.writeReceipt(file, receipt);
     try {
       await operation.run(receipt.agentId);
     } catch (error) {
+      if (error instanceof RestartInProgressError) {
+        await this.writeReceipt(file, { ...receipt, state: "not_dispatched" });
+        throw error;
+      }
       // Keyed creation has no initial prompt. Once its normal cleanup finished,
       // absence of an agent confirms that retrying cannot duplicate one.
       if (await operation.retrySafe?.(receipt.agentId)) await rm(file, { force: true });
       throw error;
     }
-    await writeJsonFileAtomic(file, { ...receipt, state: "completed" });
+    await this.writeReceipt(file, { ...receipt, state: "completed" });
     return receipt.agentId;
   }
 }

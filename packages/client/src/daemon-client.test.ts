@@ -175,6 +175,12 @@ function respondToScheduleRequest(
   );
 }
 
+async function flush(ticks = 5): Promise<void> {
+  for (let i = 0; i < ticks; i += 1) {
+    await Promise.resolve();
+  }
+}
+
 const clients: DaemonClient[] = [];
 
 afterEach(async () => {
@@ -3444,6 +3450,404 @@ test("sends explicit shutdown_server_request via shutdownServer", async () => {
     clientId: "clsk_unit_test",
     requestId: "req-shutdown-1",
   });
+});
+
+test("sendAgentMessage retries with the same client message ID after a lost acknowledgement, once, as a single row", async () => {
+  useHeartbeatClock();
+  try {
+    const logger = createMockLogger();
+    const first = createMockTransport();
+    const second = createMockTransport();
+    const transports = [first, second];
+    let transportIndex = 0;
+
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "clsk_retry_ack_test",
+      logger,
+      reconnect: { enabled: true, baseDelayMs: 5, maxDelayMs: 5 },
+      transportFactory: () => {
+        const next = transports[Math.min(transportIndex, transports.length - 1)];
+        transportIndex += 1;
+        return next.transport;
+      },
+    });
+    clients.push(client);
+
+    const connectPromise = client.connect();
+    first.triggerOpen();
+    await connectPromise;
+
+    const options = {
+      messageId: "cm-lost-ack",
+      images: [{ data: "AAECAw==", mimeType: "image/png" }],
+    };
+    const sendPromise = client.sendAgentMessage("agent-1", "hello", options);
+    await flush();
+    expect(first.sent).toHaveLength(1);
+    const firstRequest = parseSentFrame(first.sent[0]);
+    expect(firstRequest).toMatchObject({
+      type: "send_agent_message_request",
+      agentId: "agent-1",
+      text: "hello",
+      messageId: "cm-lost-ack",
+    });
+
+    // The acknowledgement never arrives; the transport drops instead.
+    first.triggerClose({ code: 1006, reason: "network lost" });
+    expect(client.getConnectionState().status).toBe("disconnected");
+    options.images[0]!.data = "mutated after admission";
+    options.messageId = "different identity";
+
+    await vi.advanceTimersByTimeAsync(10);
+    expect(client.getConnectionState().status).toBe("connecting");
+    second.triggerOpen();
+    expect(client.getConnectionState().status).toBe("connected");
+
+    await flush();
+    // Exactly one retry: same client message ID, a fresh wire request ID.
+    expect(second.sent).toHaveLength(1);
+    const retriedRequest = parseSentFrame(second.sent[0]);
+    expect(retriedRequest).toMatchObject({
+      type: "send_agent_message_request",
+      agentId: "agent-1",
+      text: "hello",
+      messageId: "cm-lost-ack",
+    });
+    expect(retriedRequest.requestId).not.toBe(firstRequest.requestId);
+    expect(retriedRequest.images).toEqual([{ data: "AAECAw==", mimeType: "image/png" }]);
+
+    second.triggerMessage(
+      wrapSessionMessage({
+        type: "send_agent_message_response",
+        payload: {
+          requestId: retriedRequest.requestId,
+          agentId: "agent-1",
+          accepted: true,
+          error: null,
+        },
+      }),
+    );
+
+    await expect(sendPromise).resolves.toBeUndefined();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("sendAgentMessage does not retry while restart recovery is restoring, and resumes once running", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_restart_recovery_test",
+    logger: createMockLogger(),
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "status",
+      payload: {
+        status: "server_info",
+        serverId: "srv_restart_recovery",
+        hostname: null,
+        version: null,
+        restartRecoveryState: "restoring",
+      },
+    }),
+  );
+
+  const sendPromise = client.sendAgentMessage("agent-1", "hello", { messageId: "cm-restart" });
+  await flush();
+  expect(mock.sent).toHaveLength(1);
+  const firstRequest = parseSentFrame(mock.sent[0]);
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "rpc_error",
+      payload: {
+        requestId: firstRequest.requestId,
+        error:
+          "The daemon is preparing or recovering a restart; retry this request when it is ready.",
+        requestType: "send_agent_message_request",
+        code: "restart_in_progress",
+      },
+    }),
+  );
+  await flush();
+  // Still restoring: no resend yet.
+  expect(mock.sent).toHaveLength(1);
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "status",
+      payload: {
+        status: "server_info",
+        serverId: "srv_restart_recovery",
+        hostname: null,
+        version: null,
+        restartRecoveryState: "running",
+      },
+    }),
+  );
+  await flush();
+  expect(mock.sent).toHaveLength(2);
+  const retriedRequest = parseSentFrame(mock.sent[1]);
+  expect(retriedRequest.messageId).toBe("cm-restart");
+  expect(retriedRequest.requestId).not.toBe(firstRequest.requestId);
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "send_agent_message_response",
+      payload: {
+        requestId: retriedRequest.requestId,
+        agentId: "agent-1",
+        accepted: true,
+        error: null,
+      },
+    }),
+  );
+
+  await expect(sendPromise).resolves.toBeUndefined();
+});
+
+test("sendAgentMessage does not retry a rejected send (validation/ID conflict)", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_invalid_send_test",
+    logger: createMockLogger(),
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const sendPromise = client.sendAgentMessage("agent-1", "hello", { messageId: "cm-invalid" });
+  await flush();
+  expect(mock.sent).toHaveLength(1);
+  const request = parseSentFrame(mock.sent[0]);
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "send_agent_message_response",
+      payload: {
+        requestId: request.requestId,
+        agentId: "agent-1",
+        accepted: false,
+        error: "duplicate client message id",
+      },
+    }),
+  );
+
+  await expect(sendPromise).rejects.toThrow("duplicate client message id");
+  expect(mock.sent).toHaveLength(1);
+});
+
+test("sendAgentMessage does not retry a non-restart rpc error", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_non_restart_rpc_error_test",
+    logger: createMockLogger(),
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const sendPromise = client.sendAgentMessage("agent-1", "hello", { messageId: "cm-bad-rpc" });
+  await flush();
+  const request = parseSentFrame(mock.sent[0]);
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "rpc_error",
+      payload: {
+        requestId: request.requestId,
+        error: "agent not found",
+        requestType: "send_agent_message_request",
+        code: "not_found",
+      },
+    }),
+  );
+
+  await expect(sendPromise).rejects.toThrow(/agent not found/);
+  expect(mock.sent).toHaveLength(1);
+});
+
+test("sendAgentMessage stops retrying once the client is explicitly disposed", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_dispose_during_retry_test",
+    logger: createMockLogger(),
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "status",
+      payload: {
+        status: "server_info",
+        serverId: "srv_dispose_during_retry",
+        hostname: null,
+        version: null,
+        restartRecoveryState: "restoring",
+      },
+    }),
+  );
+
+  const sendPromise = client.sendAgentMessage("agent-1", "hello", { messageId: "cm-dispose" });
+  await flush();
+  const request = parseSentFrame(mock.sent[0]);
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "rpc_error",
+      payload: {
+        requestId: request.requestId,
+        error: "restart in progress",
+        requestType: "send_agent_message_request",
+        code: "restart_in_progress",
+      },
+    }),
+  );
+  await flush();
+
+  await client.close();
+
+  await expect(sendPromise).rejects.toThrow(/disposed/i);
+  // No further sends were attempted while waiting on a client that will never resume.
+  expect(mock.sent).toHaveLength(1);
+});
+
+test("sendAgentMessage does not retry transport loss when reconnection is disabled", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_no_reconnect_test",
+    logger: createMockLogger(),
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const sendPromise = client.sendAgentMessage("agent-1", "hello", { messageId: "cm-no-reconnect" });
+  await flush();
+  expect(mock.sent).toHaveLength(1);
+
+  mock.triggerClose({ code: 1006, reason: "network lost" });
+
+  await expect(sendPromise).rejects.toThrow(/network lost|disconnected|closed|connection lost/i);
+  expect(mock.sent).toHaveLength(1);
+});
+
+test("prepareRestart requests checkpoint preparation without replacing the daemon", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_prepare_restart_test",
+    logger: createMockLogger(),
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen({ features: { restartRecovery: true } });
+  await connectPromise;
+
+  const promise = client.prepareRestart("deploy", "req-prepare-1");
+
+  expect(mock.sent).toHaveLength(1);
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request).toEqual({
+    type: "restart_server_request",
+    reason: "deploy",
+    prepareOnly: true,
+    requestId: "req-prepare-1",
+  });
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "status",
+      payload: {
+        status: "restart_requested",
+        clientId: "clsk_prepare_restart_test",
+        reason: "deploy",
+        requestId: "req-prepare-1",
+        generationId: "gen-1",
+      },
+    }),
+  );
+
+  await expect(promise).resolves.toEqual({
+    status: "restart_requested",
+    clientId: "clsk_prepare_restart_test",
+    reason: "deploy",
+    requestId: "req-prepare-1",
+    generationId: "gen-1",
+  });
+});
+
+test("prepareRestart is rejected by a daemon that does not advertise restartRecovery", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_prepare_restart_unsupported_test",
+    logger: createMockLogger(),
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  await expect(client.prepareRestart("deploy", "req-prepare-2")).rejects.toThrow(
+    /update the host/i,
+  );
+  expect(mock.sent).toHaveLength(0);
+
+  // A plain restart (no prepareOnly) stays ungated for backward compatibility.
+  const plainRestart = client.restartServer("settings_update", "req-restart-plain");
+  expect(mock.sent).toHaveLength(1);
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "status",
+      payload: {
+        status: "restart_requested",
+        clientId: "clsk_prepare_restart_unsupported_test",
+        reason: "settings_update",
+        requestId: "req-restart-plain",
+      },
+    }),
+  );
+  await expect(plainRestart).resolves.toMatchObject({ requestId: "req-restart-plain" });
 });
 
 test("restartServer remains restart-only and sends restart_server_request", async () => {

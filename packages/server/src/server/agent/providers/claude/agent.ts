@@ -2679,7 +2679,10 @@ class ClaudeAgentSession implements AgentSession {
     this.closed = true;
     this.rejectAllPendingPermissions(new Error("Claude session closed"));
     this.cancelCurrentTurn?.();
-    this.subscribers.clear();
+    // Subscribers and the query pump stay live through teardown below: the
+    // interrupt/return calls can still push final SDK messages through the
+    // pump, and clearing subscribers before that drains would silently
+    // discard them. Only clear once the pump has settled.
     this.activeForegroundTurnId = null;
     this.activeForegroundQuery = null;
     this.activeForegroundInput = null;
@@ -2694,6 +2697,10 @@ class ClaudeAgentSession implements AgentSession {
     await this.awaitWithTimeout(this.query?.return?.(), "close query return");
     this.query = null;
     this.input = null;
+    // Let the pump observe the teardown and finish delivering whatever it
+    // already had in flight before we stop notifying subscribers.
+    await this.awaitWithTimeout(this.queryPumpPromise ?? undefined, "close query pump drain");
+    this.subscribers.clear();
     // Terminate the entire process tree (claude + MCP children) to prevent
     // orphan accumulation. The SDK's internal cleanup may only kill the
     // direct child process.

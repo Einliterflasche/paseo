@@ -361,6 +361,9 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
         : {}),
       ...(serverInfo.capabilities ? { capabilities: serverInfo.capabilities } : {}),
       ...(serverInfo.features ? { features: serverInfo.features } : {}),
+      ...(serverInfo.restartRecoveryState
+        ? { restartRecoveryState: serverInfo.restartRecoveryState }
+        : {}),
     });
   }, [client, serverId, updateSessionServerInfo]);
 
@@ -614,6 +617,9 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
             : {}),
           ...(serverInfo.capabilities ? { capabilities: serverInfo.capabilities } : {}),
           ...(serverInfo.features ? { features: serverInfo.features } : {}),
+          ...(serverInfo.restartRecoveryState
+            ? { restartRecoveryState: serverInfo.restartRecoveryState }
+            : {}),
         });
         return;
       }

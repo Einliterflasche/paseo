@@ -34,6 +34,7 @@ import {
   FileBackedWorkspaceRegistry,
 } from "../workspace-registry.js";
 import { archiveByScope, type ActiveWorkspaceRef } from "../workspace-archive-service.js";
+import { AgentRestartSuspendedError, RestartInProgressError } from "../restart/restart-errors.js";
 import {
   ScheduleService,
   ScheduleTargetGoneError,
@@ -3276,5 +3277,560 @@ describe("ScheduleService", () => {
     now = new Date("2026-01-01T00:01:00.000Z");
     expect(await service.completeForAgent(agentId)).toBe(1);
     expect(await service.completeForAgent(agentId)).toBe(0);
+  });
+
+  test("controlled restart: a restart suspension leaves the run running instead of failing or archiving it", async () => {
+    const archiveWorkspace = vi.fn(async () => {});
+    const agentId = "44444444-4444-4444-8444-444444444444";
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      archiveWorkspace,
+      now: () => now,
+      runner: async () => {
+        throw new AgentRestartSuspendedError(agentId);
+      },
+    });
+
+    const created = await service.create({
+      prompt: "long running task",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+
+    now = new Date("2026-01-01T00:01:00.000Z");
+    await service.tick();
+
+    // Suspended, not failed: no finishRun call landed, so the run is still
+    // "running" in the store and the schedule is still considered busy.
+    const inspected = await service.inspect(created.id);
+    expect(inspected.runs).toHaveLength(1);
+    expect(inspected.runs[0].status).toBe("running");
+    expect(archiveWorkspace).not.toHaveBeenCalled();
+    await expect(service.runOnce(created.id)).rejects.toThrow("already running");
+  });
+
+  test("controlled restart: snapshotForRestart throws instead of checkpointing a run with no agent assigned yet", async () => {
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner: () => new Promise<ScheduleExecutionResult>(() => {}), // never settles
+    });
+
+    const created = await service.create({
+      prompt: "stalls before an agent exists",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+
+    now = new Date("2026-01-01T00:01:00.000Z");
+    void service.tick();
+    await vi.waitFor(async () => {
+      expect((await service.inspect(created.id)).runs).toHaveLength(1);
+    });
+
+    await expect(service.snapshotForRestart()).rejects.toThrow(/no agent assigned/);
+  });
+
+  test("controlled restart: restoreAfterRestart excludes a claimed run from recoverInterruptedRuns, and resumeRestoredRuns reattaches without starting a new agent or run", async () => {
+    const agentId = "55555555-5555-4555-8555-555555555555";
+    const agentManager = new AgentManager({ logger: createTestLogger() });
+    // Go through the real executeSchedule flow (default runner) so the run
+    // record has an agentId recorded before the suspension, the way a real
+    // restart interruption would find it mid-turn.
+    agentManager.runAgent = (async () => {
+      throw new AgentRestartSuspendedError(agentId);
+    }) as AgentManager["runAgent"];
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      createAgent: async (input) => {
+        const snapshot = {
+          id: agentId,
+          provider: "claude",
+          cwd: input.cwd ?? tempDir,
+          workspaceId: input.workspaceId,
+          status: "idle",
+          lifecycle: "idle",
+        };
+        return {
+          snapshot: snapshot as Awaited<
+            ReturnType<ScheduleServiceOptions["createAgent"]>
+          >["snapshot"],
+          liveSnapshot: snapshot as Awaited<
+            ReturnType<ScheduleServiceOptions["createAgent"]>
+          >["liveSnapshot"],
+          background: true,
+          initialPromptStarted: false,
+          initialPromptError: null,
+        };
+      },
+      now: () => now,
+    });
+
+    const created = await service.create({
+      prompt: "resumable task",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+    now = new Date("2026-01-01T00:01:00.000Z");
+    await service.tick();
+
+    const snapshot = await service.snapshotForRestart();
+    expect(snapshot.runs).toHaveLength(1);
+    expect(snapshot.runs[0]).toMatchObject({ scheduleId: created.id, agentId });
+
+    // Simulate a fresh process: a new ScheduleService instance reading the
+    // same on-disk store, with restoreAfterRestart() called before start().
+    const restoredRunner = vi.fn();
+    const restoredCreateAgent = vi.fn();
+    Reflect.set(
+      agentManager,
+      "waitForAgentEvent",
+      vi.fn(async () => ({
+        status: "idle" as const,
+        permission: null,
+        lastMessage: "done after restart",
+      })),
+    );
+    const restoredService = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      createAgent: restoredCreateAgent,
+      now: () => now,
+      runner: restoredRunner,
+    });
+    restoredService.restoreAfterRestart(snapshot);
+    await restoredService.start();
+    try {
+      // recoverInterruptedRuns (part of start()) must not have failed the
+      // claimed run.
+      const afterStart = await restoredService.inspect(created.id);
+      expect(afterStart.runs[0].status).toBe("running");
+
+      restoredService.resumeRestoredRuns();
+      await vi.waitFor(async () => {
+        const after = await restoredService.inspect(created.id);
+        expect(after.runs[0].status).toBe("succeeded");
+      });
+      const finished = await restoredService.inspect(created.id);
+      expect(finished.runs).toHaveLength(1);
+      expect(finished.runs[0].agentId).toBe(agentId);
+      expect(finished.runs[0].output).toBe("done after restart");
+      expect(restoredCreateAgent).not.toHaveBeenCalled();
+      expect(restoredRunner).not.toHaveBeenCalled();
+    } finally {
+      await restoredService.stop();
+    }
+  });
+
+  test("controlled restart: pauseForRestart stops ticking without touching an explicit stop()'s own behavior", async () => {
+    const runner = vi.fn(async () => ({ agentId: null, output: "ok" }));
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner,
+    });
+    await service.create({
+      prompt: "ticking job",
+      cadence: { type: "every", everyMs: 1 },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+
+    await service.start();
+    service.pauseForRestart();
+    const callsAfterPause = runner.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(runner.mock.calls.length).toBe(callsAfterPause);
+
+    // stop() remains a plain, idempotent timer clear — pauseForRestart didn't
+    // change its behavior.
+    await expect(service.stop()).resolves.toBeUndefined();
+  });
+
+  test("controlled restart: pauseForRestart requested mid-tick stops the in-progress loop before a second due schedule is admitted", async () => {
+    const dispatched: string[] = [];
+    let service!: ScheduleService;
+    const runner = vi.fn(async (schedule: StoredSchedule) => {
+      dispatched.push(schedule.prompt);
+      // Simulate a restart request arriving while the first-admitted run is
+      // in flight (e.g. the daemon decided to restart because of this very
+      // run). tick()'s for-loop must notice this before moving on to
+      // whichever schedule the store hands it next — the store's iteration
+      // order isn't a contract this test should assume.
+      if (dispatched.length === 1) {
+        service.pauseForRestart();
+      }
+      return { agentId: null, output: "ok" };
+    });
+    service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner,
+    });
+
+    const first = await service.create({
+      prompt: "first",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+    const second = await service.create({
+      prompt: "second",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+
+    now = new Date("2026-01-01T00:01:00.000Z");
+    await service.tick();
+
+    expect(dispatched).toHaveLength(1);
+    const dispatchedFirst = dispatched[0] === "first" ? first : second;
+    const notYetDispatched = dispatched[0] === "first" ? second : first;
+
+    const dispatchedAfter = await service.inspect(dispatchedFirst.id);
+    expect(dispatchedAfter.runs).toHaveLength(1);
+    expect(dispatchedAfter.runs[0].status).toBe("succeeded");
+
+    // The other schedule was never dispatched, never marked failed, and
+    // remains due for the next tick once the restart is resolved.
+    const pendingAfter = await service.inspect(notYetDispatched.id);
+    expect(pendingAfter.runs).toHaveLength(0);
+    expect(pendingAfter.status).toBe("active");
+    expect(pendingAfter.nextRunAt).not.toBeNull();
+
+    // runOnce() also refuses new admission while paused.
+    await expect(service.runOnce(notYetDispatched.id)).rejects.toMatchObject({
+      code: "restart_in_progress",
+    });
+
+    service.resumeAfterRestartFailure();
+    await service.tick();
+    expect(dispatched).toHaveLength(2);
+    expect(dispatched).toContain(notYetDispatched.prompt);
+    await service.stop();
+  });
+
+  test("controlled restart: existing-agent target records agentId before admission so snapshotForRestart can checkpoint it", async () => {
+    const manager = new AgentManager({
+      logger: createTestLogger(),
+      clients: createTestAgentClients(),
+      registry: agentStorage,
+    });
+    const agent = await manager.createAgent({ provider: "claude", cwd: tempDir }, undefined, {
+      workspaceId: undefined,
+    });
+    Reflect.set(
+      manager,
+      "waitForAgentEvent",
+      vi.fn(() => new Promise(() => {})), // never settles: stays "mid-turn"
+    );
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: manager,
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+    });
+    const created = await service.create({
+      prompt: "Check scheduled work",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "agent", agentId: agent.id },
+    });
+
+    void service.runOnce(created.id);
+    await vi.waitFor(async () => {
+      const inspected = await service.inspect(created.id);
+      expect(inspected.runs[0]?.agentId).toBe(agent.id);
+    });
+
+    const snapshot = await service.snapshotForRestart();
+    expect(snapshot.runs).toEqual([
+      expect.objectContaining({ scheduleId: created.id, agentId: agent.id }),
+    ]);
+  });
+
+  test("controlled restart: pauseForRestart's drain covers appendRunningRun's own store write, not just runner()", async () => {
+    const releaseAppend = Promise.withResolvers<void>();
+    let appendCallSeen = false;
+    const originalUpdate = ScheduleStore.prototype.update;
+    const updateSpy = vi
+      .spyOn(ScheduleStore.prototype, "update")
+      .mockImplementation(async function (this: ScheduleStore, ...args) {
+        if (!appendCallSeen) {
+          appendCallSeen = true;
+          await releaseAppend.promise;
+        }
+        return originalUpdate.apply(this, args);
+      });
+    const runner = vi.fn(async () => ({ agentId: null, output: "ok" }));
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner,
+    });
+    const created = await service.create({
+      prompt: "delayed append",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+
+    const runOncePromise = service.runOnce(created.id);
+    await vi.waitFor(() => expect(appendCallSeen).toBe(true));
+
+    // pauseForRestart() must not resolve while runSchedule()'s appendRunningRun() write
+    // (and therefore the run it's about to admit into this.runner()) is still stuck —
+    // the whole span from admission start through the runner call is one tracked
+    // operation, with no gap pauseForRestart()'s drain can miss.
+    let pauseResolved = false;
+    const pausePromise = service.pauseForRestart().then(() => {
+      pauseResolved = true;
+      return undefined;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(pauseResolved).toBe(false);
+    expect(runner).not.toHaveBeenCalled();
+
+    releaseAppend.resolve();
+    await pausePromise;
+    expect(pauseResolved).toBe(true);
+    expect(runner).toHaveBeenCalledTimes(1);
+
+    updateSpy.mockRestore();
+    await runOncePromise;
+    service.resumeAfterRestartFailure();
+    await service.stop();
+  });
+
+  test("controlled restart: runOnce cannot admit a run started after pauseForRestart(), even if pause lands during its own earlier await", async () => {
+    const releaseInspect = Promise.withResolvers<void>();
+    let getCallSeen = false;
+    const originalGet = ScheduleStore.prototype.get;
+    const getSpy = vi.spyOn(ScheduleStore.prototype, "get").mockImplementation(async function (
+      this: ScheduleStore,
+      ...args
+    ) {
+      if (!getCallSeen) {
+        getCallSeen = true;
+        await releaseInspect.promise;
+      }
+      return originalGet.apply(this, args);
+    });
+    const runner = vi.fn(async () => ({ agentId: null, output: "ok" }));
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner,
+    });
+    const created = await service.create({
+      prompt: "raced by pause",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+
+    // runOnce()'s own early `if (this.paused)` check passes here (still false) — the
+    // race is in the await gap right after, before runSchedule() itself re-checks.
+    const runOncePromise = service.runOnce(created.id);
+    await vi.waitFor(() => expect(getCallSeen).toBe(true));
+
+    await service.pauseForRestart();
+    releaseInspect.resolve();
+
+    await expect(runOncePromise).rejects.toMatchObject({ code: "restart_in_progress" });
+    expect(runner).not.toHaveBeenCalled();
+    const inspected = await service.inspect(created.id);
+    expect(inspected.runs).toHaveLength(0);
+
+    getSpy.mockRestore();
+    service.resumeAfterRestartFailure();
+    await service.stop();
+  });
+
+  test("controlled restart: rejected admission blocks the checkpoint even after an agent is assigned", async () => {
+    const agentId = "55555555-5555-4555-8555-555555555555";
+    const store = new ScheduleStore(join(tempDir, "schedules"));
+    const assignAgent = (record: StoredSchedule): StoredSchedule => ({
+      ...record,
+      runs: [{ ...record.runs[0]!, agentId }],
+    });
+    const runner = vi.fn(async (schedule: StoredSchedule) => {
+      await store.update(schedule.id, assignAgent);
+      throw new RestartInProgressError();
+    });
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner,
+    });
+    const created = await service.create({
+      prompt: "rejected after assignment",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+    await service.runOnce(created.id);
+    expect(runner).toHaveBeenCalledTimes(1);
+    expect((await service.inspect(created.id)).runs).toEqual([
+      expect.objectContaining({
+        agentId,
+        status: "running",
+        endedAt: null,
+      }),
+    ]);
+    await expect(service.runOnce(created.id)).rejects.toThrow("already running");
+    await expect(service.snapshotForRestart()).rejects.toThrow("Schedule admission did not settle");
+  });
+
+  test.each(["suspended", "write failed"] as const)(
+    "controlled restart: restored run stays owned when %s",
+    async (outcome) => {
+      const agentId = "55555555-5555-4555-8555-555555555555";
+      const runId = "66666666-6666-4666-8666-666666666666";
+      const manager = new AgentManager({ logger: createTestLogger() });
+      const wait = vi.spyOn(manager, "waitForAgentEvent").mockImplementation(async () => {
+        if (outcome === "suspended") throw new AgentRestartSuspendedError(agentId);
+        return { status: "idle", permission: null, lastMessage: "finished" };
+      });
+      const archiveWorkspace = vi.fn(async () => {});
+      const runner = vi.fn(async () => ({ agentId, output: "unexpected second run" }));
+      const service = createScheduleService({
+        paseoHome: tempDir,
+        logger: createTestLogger(),
+        agentManager: manager,
+        agentStorage,
+        providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+        archiveWorkspace,
+        now: () => now,
+        runner,
+      });
+      const created = await service.create({
+        prompt: "restored task",
+        cadence: { type: "every", everyMs: 60_000 },
+        target: {
+          type: "new-agent",
+          config: { provider: "claude", cwd: tempDir, archiveOnFinish: true },
+        },
+      });
+      const store = new ScheduleStore(join(tempDir, "schedules"));
+      const run = {
+        id: runId,
+        agentId,
+        workspaceId: "wks_restored",
+        scheduledFor: now.toISOString(),
+        startedAt: now.toISOString(),
+        endedAt: null,
+        status: "running" as const,
+        output: null,
+        error: null,
+      };
+      await store.update(created.id, (record) => ({ ...record, runs: [run] }));
+      const snapshot = {
+        runs: [
+          {
+            scheduleId: created.id,
+            runId,
+            agentId,
+            workspaceId: "wks_restored",
+            manual: true,
+          },
+        ],
+      };
+      service.restoreAfterRestart(snapshot);
+      // A transient failure must not trigger a contradictory second write that succeeds.
+      const update = vi.spyOn(ScheduleStore.prototype, "update");
+      if (outcome === "write failed") update.mockRejectedValueOnce(new Error("disk unavailable"));
+      service.resumeRestoredRuns();
+      await vi.waitFor(() => expect(wait).toHaveBeenCalledOnce());
+      if (outcome === "write failed") {
+        await expect(service.snapshotForRestart()).rejects.toThrow(/failed to persist/);
+        expect(update).toHaveBeenCalledOnce();
+      } else {
+        expect(await service.snapshotForRestart()).toEqual(snapshot);
+        expect(update).not.toHaveBeenCalled();
+      }
+      expect((await service.inspect(created.id)).runs).toEqual([run]);
+      await expect(service.runOnce(created.id)).rejects.toThrow("already running");
+      expect(runner).not.toHaveBeenCalled();
+      expect(archiveWorkspace).not.toHaveBeenCalled();
+      update.mockRestore();
+    },
+  );
+
+  test("controlled restart: a failed terminal write is never silently rewritten as a different outcome, and blocks snapshotForRestart", async () => {
+    const originalUpdate = ScheduleStore.prototype.update;
+    let appendSeen = false;
+    const updateSpy = vi
+      .spyOn(ScheduleStore.prototype, "update")
+      .mockImplementation(async function (this: ScheduleStore, ...args) {
+        if (appendSeen) {
+          // The second store.update() call for this run is finishRun()'s write — fail
+          // before touching disk, so the row is left exactly as appendRunningRun wrote
+          // it ("running"), not silently written then reported as failed anyway.
+          throw new Error("simulated disk failure");
+        }
+        appendSeen = true;
+        return originalUpdate.apply(this, args);
+      });
+    const runner = vi.fn(async () => ({ agentId: "agent-succeeded", output: "real success" }));
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner,
+    });
+    const created = await service.create({
+      prompt: "succeeds but fails to persist",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+
+    await service.runOnce(created.id);
+    updateSpy.mockRestore();
+
+    // The run genuinely succeeded; its terminal write failed. The row must still say
+    // "running" (never silently rewritten to "failed"), and ownership must stay held —
+    // a schedule whose true outcome isn't durably recorded must not admit a new run.
+    const inspected = await service.inspect(created.id);
+    expect(inspected.runs[0]?.status).toBe("running");
+    await expect(service.runOnce(created.id)).rejects.toThrow("already running");
+
+    await expect(service.snapshotForRestart()).rejects.toThrow(
+      /failed to persist its terminal state/,
+    );
   });
 });
