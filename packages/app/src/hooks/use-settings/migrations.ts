@@ -16,6 +16,9 @@ const STEER_DEFAULT_MIGRATION = "steer-default";
 /** Existing mobile installs materialized the old 15px content default in storage. */
 const MOBILE_CONTENT_16_MIGRATION = "mobile-content-16";
 
+/** One was persisted as the old default. Migrate it once; later explicit choices stick. */
+const CATPPUCCIN_SYNTAX_DEFAULT_MIGRATION = "catppuccin-syntax-default";
+
 /**
  * Brings stored settings up to date, returning what the caller should use. Owns both writes so
  * the marker can only ever be written after the settings it describes: a failed marker write
@@ -47,6 +50,13 @@ export async function migrateAppSettings(
   if (options.native && !applied.has(MOBILE_CONTENT_16_MIGRATION)) {
     migrated = migrated.contentFontSize === 15 ? { ...migrated, contentFontSize: 16 } : migrated;
     applied.add(MOBILE_CONTENT_16_MIGRATION);
+    addedMigration = true;
+  }
+
+  if (!applied.has(CATPPUCCIN_SYNTAX_DEFAULT_MIGRATION)) {
+    migrated =
+      migrated.syntaxTheme === "one" ? { ...migrated, syntaxTheme: "catppuccin" } : migrated;
+    applied.add(CATPPUCCIN_SYNTAX_DEFAULT_MIGRATION);
     addedMigration = true;
   }
 

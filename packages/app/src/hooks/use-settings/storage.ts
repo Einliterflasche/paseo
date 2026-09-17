@@ -21,6 +21,7 @@ import {
 import { isNative } from "@/constants/platform";
 import {
   DEFAULT_CONTENT_MAX_WIDTH,
+  DEFAULT_SYNTAX_THEME,
   FONT_SIZE,
   PLUGIN_THEME_PREFERENCE,
   THEME_OPTIONS,
@@ -89,7 +90,7 @@ export interface AppSettings {
   codeFontSize: number; // clamped px, default 12
   /** Max width of chat and markdown content in px; null follows the current default. */
   contentMaxWidth: number | null;
-  syntaxTheme: SyntaxThemeId; // default "one"
+  syntaxTheme: SyntaxThemeId;
   workspaceTitleSource: WorkspaceTitleSource;
   sidebarWorkspaceTrailing: SidebarWorkspaceTrailing;
   sidebarRowItems: SidebarRowItems;
@@ -148,7 +149,7 @@ export const DEFAULT_CLIENT_SETTINGS: AppSettings = {
   contentFontSize: DEFAULT_CONTENT_FONT_SIZE,
   codeFontSize: DEFAULT_CODE_FONT_SIZE,
   contentMaxWidth: null,
-  syntaxTheme: "one",
+  syntaxTheme: DEFAULT_SYNTAX_THEME,
   workspaceTitleSource: "title",
   sidebarWorkspaceTrailing: "diff",
   sidebarRowItems: DEFAULT_SIDEBAR_ROW_ITEMS,
@@ -240,7 +241,7 @@ const StoredAppSettingsSchema = z
       .null()
       .or(clampedNumber(MIN_CONTENT_MAX_WIDTH, MAX_CONTENT_MAX_WIDTH))
       .catch(null),
-    syntaxTheme: z.string().refine(isSyntaxThemeId).catch("one"),
+    syntaxTheme: z.string().refine(isSyntaxThemeId).catch(DEFAULT_SYNTAX_THEME),
     workspaceTitleSource: z.enum(["title", "branch"]).catch("title"),
     sidebarWorkspaceTrailing: z.enum(["diff", "timestamp", "none"]).catch("diff"),
     sidebarRowItems: SidebarRowItemsSchema,
