@@ -6,6 +6,7 @@ import type {
   StartDaemonIfEnabledInput,
 } from "@/runtime/daemon-start-service";
 import type { Href } from "expo-router";
+import type { InitialDaemonConnectionState } from "@/runtime/host-runtime";
 import {
   buildHostRootRoute,
   buildHostWorkspaceRoute,
@@ -112,6 +113,7 @@ interface ResolveStartupRouteBaseInput {
 
 export interface ResolveIndexStartupRouteInput extends ResolveStartupRouteBaseInput {
   route: IndexStartupRouteTarget;
+  initialDaemonConnection: InitialDaemonConnectionState;
   anyOnlineHostServerId: string | null;
   workspaceSelection: ActiveWorkspaceSelection | null;
   workspaceSelectionStatus: WorkspaceSelectionStatus;
@@ -207,7 +209,7 @@ function resolveReadyIndexStartupRoute(input: ResolveIndexStartupRouteInput): St
     return { kind: "redirect", href: buildHostRootRoute(savedHostServerId) };
   }
 
-  if (input.hasGivenUpWaitingForHost) {
+  if (input.initialDaemonConnection || input.hasGivenUpWaitingForHost) {
     return { kind: "redirect", href: WELCOME_ROUTE };
   }
 

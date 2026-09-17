@@ -6,7 +6,11 @@ import {
   resolveStartupRoute,
   resolveWorkspaceSelectionStatus,
 } from "@/navigation/host-runtime-bootstrap";
-import { useHostRegistryStatus, useHosts } from "@/runtime/host-runtime";
+import {
+  useHostRegistryStatus,
+  useHosts,
+  useInitialDaemonConnection,
+} from "@/runtime/host-runtime";
 import { useHasHydratedWorkspaces, useWorkspaceExists } from "@/stores/session-store-hooks";
 import {
   useIsLastWorkspaceSelectionHydrated,
@@ -22,6 +26,7 @@ export default function Index() {
   const anyOnlineHostServerId = useEarliestOnlineHostServerId();
   const hosts = useHosts();
   const hostRegistryStatus = useHostRegistryStatus();
+  const initialDaemonConnection = useInitialDaemonConnection();
   const workspaceSelection = useLastWorkspaceSelection();
   const isWorkspaceSelectionLoaded = useIsLastWorkspaceSelectionHydrated();
   const workspaceSelectionServerId = workspaceSelection?.serverId ?? null;
@@ -36,6 +41,7 @@ export default function Index() {
     route: { kind: "index", pathname },
     startupBlocker: bootstrapState.startupBlocker,
     hostRegistryStatus,
+    initialDaemonConnection,
     hosts,
     anyOnlineHostServerId,
     workspaceSelection,

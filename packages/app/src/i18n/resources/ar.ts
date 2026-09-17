@@ -1553,6 +1553,12 @@ export const ar: TranslationResources = {
     },
   },
   onboarding: {
+    thisServer: {
+      title: "الاتصال بهذا الخادم",
+      otherHost: "الاتصال بمضيف آخر",
+      incorrectPassword: "كلمة المرور غير صحيحة",
+      connectionError: "تعذّر الاتصال: {{detail}}",
+    },
     title: "مرحبا بكم في Paseo",
     subtitle: "قم بتوصيل جهاز الكمبيوتر الخاص بك للبدء",
     actions: {

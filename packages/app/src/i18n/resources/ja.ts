@@ -1570,6 +1570,12 @@ export const ja: TranslationResources = {
     },
   },
   onboarding: {
+    thisServer: {
+      title: "このサーバーに接続",
+      otherHost: "別のホストに接続",
+      incorrectPassword: "パスワードが正しくありません",
+      connectionError: "接続できません: {{detail}}",
+    },
     title: "Paseoへようこそ",
     subtitle: "始めるにはコンピューターに接続してください",
     actions: {

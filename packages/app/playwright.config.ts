@@ -34,7 +34,8 @@ export default defineConfig({
   projects: [
     {
       name: "browser",
-      testIgnore: ["**/*.real.spec.ts"],
+      // Packaged onboarding has its own config and requires the production web export.
+      testIgnore: ["**/*.real.spec.ts", "**/daemon-web-onboarding.spec.ts"],
       use: { ...devices["Desktop Chrome"] },
     },
     {

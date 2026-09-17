@@ -274,8 +274,6 @@ class FakeDaemonClient {
 
 afterEach(() => {
   vi.useRealTimers();
-  delete (globalThis as Record<string, unknown>).__PASEO_INITIAL_DAEMON_CONNECTION__;
-  delete (globalThis as { window?: unknown }).window;
 });
 
 function useHostRuntimeClock(): void {
@@ -3997,43 +3995,231 @@ describe("HostRuntimeStore", () => {
 });
 
 describe("readInitialDaemonConnectionHint", () => {
-  it("returns null when no hint is present", () => {
-    expect(readInitialDaemonConnectionHint({ isWebRuntime: true })).toBeNull();
+  it("does not infer an ordinary hosted web client is a daemon", () => {
+    expect(
+      readInitialDaemonConnectionHint({
+        isWebRuntime: true,
+        hint: undefined,
+        location: { href: "https://app.example.com:8443/" },
+      }),
+    ).toBeNull();
   });
 
-  it("parses a valid listen-only hint", () => {
-    (globalThis as Record<string, unknown>).__PASEO_INITIAL_DAEMON_CONNECTION__ = {
-      listen: "localhost:6767",
-    };
-    expect(readInitialDaemonConnectionHint({ isWebRuntime: true })).toEqual({
-      listen: "localhost:6767",
-      useTls: false,
-    });
+  it.each([
+    ["https://browser.example.com:8443/welcome", "browser.example.com:8443", true],
+    ["http://browser.example.com:8080/", "browser.example.com:8080", false],
+    ["https://browser.example.com/", "browser.example.com:443", true],
+    ["http://browser.example.com/", "browser.example.com:80", false],
+    ["https://[2001:db8::1]:8443/", "[2001:db8::1]:8443", true],
+    ["http://[::1]/", "[::1]:80", false],
+  ])("derives the endpoint and TLS from %s", (href, listen, useTls) => {
+    expect(
+      readInitialDaemonConnectionHint({
+        isWebRuntime: true,
+        hint: { listen: "internal-proxy:6767", useTls: false },
+        location: { href },
+      }),
+    ).toEqual({ listen, useTls });
   });
 
-  it("preserves useTls when explicitly true", () => {
-    (globalThis as Record<string, unknown>).__PASEO_INITIAL_DAEMON_CONNECTION__ = {
-      listen: "paseo.example.com:443",
-      useTls: true,
-    };
-    expect(readInitialDaemonConnectionHint({ isWebRuntime: true })).toEqual({
-      listen: "paseo.example.com:443",
-      useTls: true,
-    });
+  it.each(["localhost:6767", { useTls: true }, null])("ignores invalid hint %j", (hint) => {
+    expect(
+      readInitialDaemonConnectionHint({
+        isWebRuntime: true,
+        hint,
+        location: { href: "https://browser.example.com/" },
+      }),
+    ).toBeNull();
   });
 
-  it("ignores invalid shapes", () => {
-    (globalThis as Record<string, unknown>).__PASEO_INITIAL_DAEMON_CONNECTION__ = "localhost:6767";
-    expect(readInitialDaemonConnectionHint({ isWebRuntime: true })).toBeNull();
-
-    (globalThis as Record<string, unknown>).__PASEO_INITIAL_DAEMON_CONNECTION__ = {
-      useTls: true,
-    };
-    expect(readInitialDaemonConnectionHint({ isWebRuntime: true })).toBeNull();
+  it("does not enable same-origin login outside the web runtime", () => {
+    expect(
+      readInitialDaemonConnectionHint({
+        isWebRuntime: false,
+        hint: { listen: "internal-proxy:6767" },
+        location: { href: "https://browser.example.com/" },
+      }),
+    ).toBeNull();
   });
+
+  it.each(["paseo://app/", "file:///app.html", "invalid url"])(
+    "ignores an unsupported browser location %s",
+    (href) => {
+      expect(
+        readInitialDaemonConnectionHint({
+          isWebRuntime: true,
+          hint: { listen: "internal-proxy:6767" },
+          location: { href },
+        }),
+      ).toBeNull();
+    },
+  );
 });
 
 describe("HostRuntimeStore initial connection hint bootstrap", () => {
+  it("keeps password failures on the initial host and saves only a successful connection", async () => {
+    const hint = { listen: "browser-host:8443", useTls: true };
+    const seenConnections: HostConnection[] = [];
+    const storage = createMemoryHostRuntimeStorage();
+    const store = new HostRuntimeStore({
+      deps: {
+        createClient: () => new FakeDaemonClient() as unknown as DaemonClient,
+        connectToDaemon: async ({ host: probeHost, connection }) => {
+          seenConnections.push(connection);
+          if (connection.type !== "directTcp" || !probeHost.password) {
+            throw new DaemonAuthenticationError("password_required");
+          }
+          if (probeHost.password !== "correct-password") {
+            throw new DaemonAuthenticationError("incorrect_password");
+          }
+          return {
+            client: makeConnectedProbeClient(5) as unknown as DaemonClient,
+            serverId: "srv_hint",
+            hostname: "initial host",
+          };
+        },
+        getClientId: async () => "cid_test_runtime",
+        readInitialConnectionHint: () => hint,
+      },
+      storage,
+    });
+
+    await store.boot();
+
+    expect(store.getInitialDaemonConnection()).toEqual({
+      hint,
+      status: "password-required",
+      error: null,
+    });
+    expect(store.getHosts()).toEqual([]);
+    expect(await storage.getItem("@paseo:daemon-registry")).toBeNull();
+    expect(seenConnections).toEqual([
+      { id: "direct:browser-host:8443", type: "directTcp", endpoint: hint.listen, useTls: true },
+    ]);
+
+    await store.connectInitialDaemon("wrong-password");
+
+    expect(store.getInitialDaemonConnection()).toEqual({
+      hint,
+      status: "password-required",
+      error: "Incorrect password",
+    });
+    expect(store.getHosts()).toEqual([]);
+    expect(await storage.getItem("@paseo:daemon-registry")).toBeNull();
+
+    await store.connectInitialDaemon("correct-password");
+
+    expect(store.getInitialDaemonConnection()).toEqual({ hint, status: "connected" });
+    expect(store.getHosts()).toHaveLength(1);
+    expect(store.getHosts()[0].connections).toEqual([
+      {
+        id: "direct:browser-host:8443",
+        type: "directTcp",
+        endpoint: hint.listen,
+        useTls: true,
+      },
+    ]);
+    expect(store.getHosts()[0]?.password).toBe("correct-password");
+    expect(seenConnections).toHaveLength(3);
+    store.syncHosts([]);
+  });
+
+  it("shows connection failures, permits retry, and ignores duplicate submissions", async () => {
+    const hint = { listen: "browser-host:8080", useTls: false };
+    const attempt = new Deferred<void>();
+    let probeCount = 0;
+    const store = new HostRuntimeStore({
+      deps: {
+        createClient: () => new FakeDaemonClient() as unknown as DaemonClient,
+        connectToDaemon: async () => {
+          probeCount += 1;
+          if (probeCount === 1) {
+            throw new Error("Connection timed out");
+          }
+          await attempt.promise;
+          return {
+            client: makeConnectedProbeClient(5) as unknown as DaemonClient,
+            serverId: "srv_hint",
+            hostname: "initial host",
+          };
+        },
+        getClientId: async () => "cid_test_runtime",
+        readInitialConnectionHint: () => hint,
+      },
+      storage: createMemoryHostRuntimeStorage(),
+    });
+
+    await store.boot();
+    expect(store.getInitialDaemonConnection()).toEqual({
+      hint,
+      status: "error",
+      error: "Connection timed out",
+    });
+    expect(probeCount).toBe(1);
+    const retry = store.connectInitialDaemon();
+    const duplicate = store.connectInitialDaemon();
+    expect(store.getInitialDaemonConnection()).toEqual({ hint, status: "connecting" });
+    expect(probeCount).toBe(2);
+    attempt.resolve();
+    await Promise.all([retry, duplicate]);
+    expect(store.getInitialDaemonConnection()).toEqual({ hint, status: "connected" });
+    expect(probeCount).toBe(2);
+    store.syncHosts([]);
+  });
+
+  it.each(["profile", "connection"] as const)(
+    "reuses a saved %s password without an extra unauthenticated probe",
+    async (passwordStorage) => {
+      const hint = { listen: "browser-host:8443", useTls: true };
+      const savedConnection: HostConnection = {
+        id: "direct:browser-host:8443",
+        type: "directTcp",
+        endpoint: hint.listen,
+        useTls: true,
+      };
+      const host = makeHost({
+        password: "saved-password",
+        connections: [savedConnection],
+        preferredConnectionId: savedConnection.id,
+      });
+      const { password: _password, ...withoutPassword } = host;
+      const storedHost =
+        passwordStorage === "profile"
+          ? host
+          : {
+              ...withoutPassword,
+              connections: [{ ...savedConnection, password: "saved-password" }],
+            };
+      const seenConnections: HostConnection[] = [];
+      const store = new HostRuntimeStore({
+        deps: {
+          createClient: () => new FakeDaemonClient() as unknown as DaemonClient,
+          connectToDaemon: async ({ host: probeHost, connection }) => {
+            expect(probeHost.password).toBe("saved-password");
+            seenConnections.push(connection);
+            return {
+              client: makeConnectedProbeClient(5) as unknown as DaemonClient,
+              serverId: host.serverId,
+              hostname: host.label,
+            };
+          },
+          getClientId: async () => "cid_test_runtime",
+          readInitialConnectionHint: () => hint,
+        },
+        storage: createMemoryHostRuntimeStorage({
+          "@paseo:daemon-registry": JSON.stringify([storedHost]),
+        }),
+      });
+
+      await store.boot();
+      await waitForHostOnline(store, host.serverId);
+      expect(store.getInitialDaemonConnection()).toEqual({ hint, status: "connected" });
+      expect(seenConnections).toEqual([savedConnection]);
+      expect(store.getHosts()).toEqual([host]);
+      store.syncHosts([]);
+    },
+  );
+
   it("starts saved remote-host probes while desktop daemon startup is still pending", async () => {
     const host = makeHost({
       serverId: "srv_remote_saved",
@@ -4413,9 +4599,6 @@ describe("HostRuntimeStore initial connection hint bootstrap", () => {
       storage: createMemoryHostRuntimeStorage(),
     });
 
-    (globalThis as { window?: unknown }).window = {
-      location: { host: "metro-host:8081", protocol: "http:" },
-    };
     store.boot();
     await firstProbe.promise;
 

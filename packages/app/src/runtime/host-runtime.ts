@@ -1416,22 +1416,53 @@ export interface InitialDaemonConnectionHint {
   useTls?: boolean;
 }
 
+export type InitialDaemonConnectionState =
+  | null
+  | { hint: InitialDaemonConnectionHint; status: "connecting" | "connected" }
+  | {
+      hint: InitialDaemonConnectionHint;
+      status: "password-required" | "error";
+      error: string | null;
+    };
+
 const InitialDaemonConnectionHintSchema: z.ZodType<InitialDaemonConnectionHint> = z.object({
   listen: z.string().trim().min(1),
   useTls: z.boolean().optional().default(false),
 });
 
 export function readInitialDaemonConnectionHint(input?: {
-  isWebRuntime?: boolean;
+  isWebRuntime: boolean;
+  hint: unknown;
+  location: Pick<Location, "href"> | null;
 }): InitialDaemonConnectionHint | null {
   const isWebRuntime = input?.isWebRuntime ?? isWeb;
   if (!isWebRuntime || typeof globalThis === "undefined") {
     return null;
   }
-  const result = InitialDaemonConnectionHintSchema.safeParse(
-    Reflect.get(globalThis, INITIAL_DAEMON_CONNECTION_HINT_GLOBAL_KEY),
-  );
-  return result.success ? result.data : null;
+  const hint = input
+    ? input.hint
+    : Reflect.get(globalThis, INITIAL_DAEMON_CONNECTION_HINT_GLOBAL_KEY);
+  if (!InitialDaemonConnectionHintSchema.safeParse(hint).success) {
+    return null;
+  }
+  let location = input?.location ?? null;
+  if (!input && typeof window !== "undefined") {
+    location = window.location;
+  }
+  if (!location) {
+    return null;
+  }
+  try {
+    const url = new URL(location.href);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return null;
+    }
+    const useTls = url.protocol === "https:";
+    const port = url.port || (useTls ? "443" : "80");
+    return { listen: `${url.hostname}:${port}`, useTls };
+  } catch {
+    return null;
+  }
 }
 
 function readConfiguredLocalDaemonOverride(): string | null {
@@ -1514,6 +1545,9 @@ export class HostRuntimeStore {
   private nextCancellationRequestId = 0;
   private timelineReplicaByServer = new Map<string, TimelineReplica>();
   private configuredOverrideBootstrapInFlight: Promise<void> | null = null;
+  private initialDaemonConnection: InitialDaemonConnectionState = null;
+  private initialDaemonConnectionInFlight: Promise<void> | null = null;
+  private initialDaemonServerId: string | null = null;
   private bootPromise: Promise<void> | null = null;
   private registryLoad: Promise<void> | null = null;
   private readonly hostConfirmations = new HostConfirmations();
@@ -1561,6 +1595,10 @@ export class HostRuntimeStore {
     return this.hostRegistryStatus;
   }
 
+  getInitialDaemonConnection(): InitialDaemonConnectionState {
+    return this.initialDaemonConnection;
+  }
+
   subscribeHostList(listener: () => void): () => void {
     this.hostListListeners.add(listener);
     return () => {
@@ -1605,10 +1643,8 @@ export class HostRuntimeStore {
       ? this.deps.readInitialConnectionHint()
       : readInitialDaemonConnectionHint();
     if (initialHint) {
-      const bootstrapped = await this.bootstrapInitialConnectionHint(initialHint);
-      if (bootstrapped) {
-        return;
-      }
+      await this.bootstrapInitialConnectionHint(initialHint);
+      return;
     }
 
     if (override) {
@@ -1755,34 +1791,89 @@ export class HostRuntimeStore {
     }
   }
 
-  private async bootstrapInitialConnectionHint(
-    hint: InitialDaemonConnectionHint,
-  ): Promise<boolean> {
-    const connection = connectionFromListen(hint.listen);
-    if (!connection) {
-      return false;
+  private async bootstrapInitialConnectionHint(hint: InitialDaemonConnectionHint): Promise<void> {
+    const savedHost = this.hosts.find((host) =>
+      host.connections.some(
+        (connection) =>
+          connection.type === "directTcp" &&
+          connection.endpoint === hint.listen &&
+          (connection.useTls ?? false) === (hint.useTls ?? false),
+      ),
+    );
+    this.setInitialDaemonConnection({ hint, status: "connecting" });
+    if (savedHost) {
+      this.initialDaemonServerId = savedHost.serverId;
+      this.syncInitialDaemonConnection(savedHost.serverId);
+      return;
     }
-    const connectionWithHint: HostConnection =
-      connection.type === "directTcp"
-        ? { ...connection, useTls: hint.useTls ?? connection.useTls ?? false }
-        : connection;
-    if (registryHasConnection(this.hosts, connectionWithHint)) {
-      return true;
-    }
+    await this.connectInitialDaemon();
+  }
 
+  async connectInitialDaemon(password?: string): Promise<void> {
+    if (this.initialDaemonConnectionInFlight) {
+      return this.initialDaemonConnectionInFlight;
+    }
+    const state = this.initialDaemonConnection;
+    if (!state) {
+      return;
+    }
+    this.setInitialDaemonConnection({ hint: state.hint, status: "connecting" });
+    const attempt = this.runInitialDaemonConnection(state.hint, password).finally(() => {
+      this.initialDaemonConnectionInFlight = null;
+    });
+    this.initialDaemonConnectionInFlight = attempt;
+    return attempt;
+  }
+
+  private async runInitialDaemonConnection(
+    hint: InitialDaemonConnectionHint,
+    password?: string,
+  ): Promise<void> {
     try {
-      await this.probeAndUpsertConnection({
-        connection: connectionWithHint,
-        timeoutMs: DEFAULT_LOCALHOST_BOOTSTRAP_TIMEOUT_MS,
-      });
-      return true;
-    } catch (error) {
-      console.warn("[HostRuntime] initial connection hint probe failed", {
-        listen: hint.listen,
+      const { serverId } = await this.probeAndUpsertDirectConnection({
+        endpoint: hint.listen,
         useTls: hint.useTls,
-        error,
+        password,
       });
-      return false;
+      this.initialDaemonServerId = serverId;
+      this.setInitialDaemonConnection({ hint, status: "connected" });
+    } catch (error) {
+      const message = toErrorMessage(error);
+      const authFailureReason = getConnectionAuthFailureReason(error);
+      const needsPassword = authFailureReason !== null;
+      this.setInitialDaemonConnection({
+        hint,
+        status: needsPassword ? "password-required" : "error",
+        error: authFailureReason === "password_required" ? null : message,
+      });
+    }
+  }
+
+  private setInitialDaemonConnection(state: InitialDaemonConnectionState): void {
+    this.initialDaemonConnection = state;
+    this.emitHostList();
+  }
+
+  private syncInitialDaemonConnection(serverId: string): void {
+    const state = this.initialDaemonConnection;
+    if (
+      !state ||
+      state.status !== "connecting" ||
+      serverId !== this.initialDaemonServerId ||
+      this.initialDaemonConnectionInFlight
+    ) {
+      return;
+    }
+    const snapshot = this.getSnapshot(serverId);
+    if (snapshot?.connectionStatus === "online") {
+      this.setInitialDaemonConnection({ hint: state.hint, status: "connected" });
+    } else if (snapshot?.lastError) {
+      const needsPassword = snapshot.authFailureReason != null;
+      this.setInitialDaemonConnection({
+        hint: state.hint,
+        status: needsPassword ? "password-required" : "error",
+        error: snapshot.authFailureReason === "password_required" ? null : snapshot.lastError,
+      });
     }
   }
 
@@ -2695,6 +2786,7 @@ export class HostRuntimeStore {
   }
 
   private emit(serverId: string): void {
+    this.syncInitialDaemonConnection(serverId);
     this.version += 1;
     const listeners = this.serverListeners.get(serverId);
     if (!listeners) {
@@ -2837,6 +2929,15 @@ export function useHostRegistryStatus(): HostRegistryStatus {
     (onStoreChange) => store.subscribeHostList(onStoreChange),
     () => store.getHostRegistryStatus(),
     () => store.getHostRegistryStatus(),
+  );
+}
+
+export function useInitialDaemonConnection(): InitialDaemonConnectionState {
+  const store = getHostRuntimeStore();
+  return useSyncExternalStore(
+    (onStoreChange) => store.subscribeHostList(onStoreChange),
+    () => store.getInitialDaemonConnection(),
+    () => store.getInitialDaemonConnection(),
   );
 }
 
