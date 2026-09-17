@@ -5,6 +5,8 @@ import type { AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { i18n as testI18n } from "@/i18n/i18next";
 import type { PendingPermission } from "@/types/shared";
+import { DictationProvider } from "@/contexts/dictation-context";
+import { createMicrophoneCoordinator } from "@/voice/microphone";
 import { QuestionFormCard } from "./question-form-card";
 
 // Load translations so controls expose their real accessible names.
@@ -52,13 +54,17 @@ function mountCard(question: Record<string, unknown>) {
   const container = document.createElement("div");
   document.body.appendChild(container);
   const root = createRoot(container);
+  const microphone = createMicrophoneCoordinator();
   act(() =>
     root.render(
-      <QuestionFormCard
-        permission={buildPermission(question)}
-        onRespond={onRespond}
-        isResponding={false}
-      />,
+      <DictationProvider microphone={microphone}>
+        <QuestionFormCard
+          serverId="server-1"
+          permission={buildPermission(question)}
+          onRespond={onRespond}
+          isResponding={false}
+        />
+      </DictationProvider>,
     ),
   );
   mounted.push({ root, container });

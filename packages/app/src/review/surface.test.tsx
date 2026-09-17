@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import "@/test/window-local-storage";
 import { i18n as testI18n } from "@/i18n/i18next";
-import { act, fireEvent, render, renderHook, cleanup } from "@testing-library/react";
+import { act, fireEvent, render as renderUi, renderHook, cleanup } from "@testing-library/react";
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { inlineUnistylesStyle } from "@/styles/unistyles-inline-style";
@@ -20,35 +20,23 @@ import {
   type InlineReviewActions,
 } from "./index";
 
+import { DictationProvider } from "@/contexts/dictation-context";
+import { createMicrophoneCoordinator } from "@/voice/microphone";
+
+function render(ui: React.ReactNode) {
+  const microphone = createMicrophoneCoordinator();
+  return renderUi(ui, {
+    wrapper: ({ children }) => (
+      <DictationProvider microphone={microphone}>{children}</DictationProvider>
+    ),
+  });
+}
+
 void testI18n;
 
-const { theme, pressablePropsByLabel } = vi.hoisted(() => {
-  Object.assign(globalThis, { __DEV__: false });
-  return {
-    theme: {
-      spacing: { 1: 4, 2: 8, 3: 12 },
-      borderWidth: { 1: 1 },
-      borderRadius: { base: 4, md: 6, lg: 8, xl: 12, full: 999 },
-      opacity: { 50: 0.5 },
-      fontSize: { xs: 11, sm: 13 },
-      fontWeight: { normal: "400", medium: "500" },
-      lineHeight: { diff: 18 },
-      colors: {
-        accent: "#0a84ff",
-        accentForeground: "#fff",
-        border: "#555",
-        destructive: "#ff453a",
-        foreground: "#fff",
-        foregroundMuted: "#aaa",
-        surface1: "#111",
-        surface2: "#222",
-        surface3: "#333",
-        palette: { white: "#fff" },
-      },
-    },
-    pressablePropsByLabel: new Map<string, Record<string, unknown>>(),
-  };
-});
+const { pressablePropsByLabel } = vi.hoisted(() => ({
+  pressablePropsByLabel: new Map<string, Record<string, unknown>>(),
+}));
 
 vi.mock("react-native", async (importOriginal) => {
   const ReactModule = await import("react");
@@ -88,13 +76,16 @@ vi.mock("react-native", async (importOriginal) => {
   };
 });
 
-vi.mock("react-native-unistyles", () => ({
-  StyleSheet: {
-    create: (factory: unknown) => (typeof factory === "function" ? factory(theme) : factory),
-  },
-  withUnistyles: <T,>(component: T) => component,
-  useUnistyles: () => ({ theme, rt: { breakpoint: "md" } }),
-}));
+vi.mock("react-native-unistyles", async () => {
+  const { darkTheme } = await import("@/styles/theme");
+  return {
+    StyleSheet: {
+      create: (factory: unknown) => (typeof factory === "function" ? factory(darkTheme) : factory),
+    },
+    withUnistyles: <T,>(component: T) => component,
+    useUnistyles: () => ({ theme: darkTheme, rt: { breakpoint: "md" } }),
+  };
+});
 
 vi.mock("@/constants/platform", () => ({
   getIsElectron: () => false,
@@ -103,16 +94,12 @@ vi.mock("@/constants/platform", () => ({
   isWeb: true,
 }));
 
-vi.mock("lucide-react-native", () => {
-  const createIcon = (name: string) => (props: Record<string, unknown>) =>
-    React.createElement("span", { ...props, "data-icon": name });
+vi.mock("lucide-react-native", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("lucide-react-native")>();
   return {
-    Check: createIcon("Check"),
-    CircleDot: createIcon("CircleDot"),
-    Pencil: createIcon("Pencil"),
-    Plus: createIcon("Plus"),
-    Trash2: createIcon("Trash2"),
-    X: createIcon("X"),
+    ...actual,
+    Plus: (props: Record<string, unknown>) =>
+      React.createElement("span", { ...props, "data-icon": "Plus" }),
   };
 });
 
@@ -142,6 +129,7 @@ const COMMENT_LIST: ReviewDraftComment[] = [comment()];
 
 function buildReviewActions(overrides: Partial<InlineReviewActions> = {}): InlineReviewActions {
   return {
+    serverId: "host-1",
     commentsByTarget: new Map(),
     editor: null,
     onStartComment: vi.fn(),
@@ -181,7 +169,7 @@ describe("useInlineReviewController", () => {
     const firstKey = "review:key-1";
     const secondKey = "review:key-2";
     const { result, rerender } = renderHook(
-      ({ reviewDraftKey }) => useInlineReviewController({ reviewDraftKey }),
+      ({ reviewDraftKey }) => useInlineReviewController({ reviewDraftKey, serverId: "host-1" }),
       { initialProps: { reviewDraftKey: firstKey } },
     );
 
@@ -270,7 +258,7 @@ describe("git diff inline review helpers", () => {
 
     expect(rowState?.left).toBeNull();
     expect(rowState?.right?.comments).toEqual([rightComment]);
-    expect(rowState?.height).toBe(226);
+    expect(rowState?.height).toBe(258);
   });
 
   it("includes thread padding in the inline editor height", () => {
@@ -279,7 +267,7 @@ describe("git diff inline review helpers", () => {
       editor: { target: reviewTarget, commentId: null, body: "" },
     });
 
-    expect(getInlineReviewThreadState({ reviewTarget, reviewActions: actions })?.height).toBe(148);
+    expect(getInlineReviewThreadState({ reviewTarget, reviewActions: actions })?.height).toBe(180);
   });
 
   it("pins no-wrap review threads to the visible diff viewport", () => {
@@ -385,6 +373,7 @@ describe("InlineReviewEditor", () => {
     const onSave = vi.fn();
     const { getByTestId } = render(
       <InlineReviewEditor
+        serverId="host-1"
         initialBody=" initial "
         onCancel={onCancel}
         onSave={onSave}
@@ -405,6 +394,7 @@ describe("InlineReviewEditor", () => {
     const onSave = vi.fn();
     const { getByTestId } = render(
       <InlineReviewEditor
+        serverId="host-1"
         initialBody="ready"
         onCancel={onCancel}
         onSave={onSave}
@@ -429,6 +419,7 @@ describe("InlineReviewEditor", () => {
     });
     const { getByTestId, queryByText } = render(
       <InlineReviewEditor
+        serverId="host-1"
         initialBody="ready"
         onCancel={vi.fn()}
         onSave={vi.fn()}

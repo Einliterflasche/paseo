@@ -409,6 +409,14 @@ jobs:
           # early agent/Changes specs. Required check names remain unchanged.
           PWTEST_SHARD_WEIGHTS: "111:172:137:160"
 
+      - name: Build bundled browser UI
+        if: ${{ env.PLAYWRIGHT_SHARD == '1/4' }}
+        run: npm run build:daemon-web-ui
+
+      - name: Test dictation in bundled browser UI
+        if: ${{ env.PLAYWRIGHT_SHARD == '1/4' }}
+        run: npm run test:e2e:dictation --workspace=@getpaseo/app
+
       - name: Upload test artifacts
         uses: actions/upload-artifact@v4
         if: failure()

@@ -94,6 +94,15 @@ const webOverlayEntries: WebOverlayEntry[] = [];
 let webOverlayOrder = 0;
 let webOverlayListenersAttached = false;
 let webOverlayFocusCheckQueued = false;
+const webOverlayKeyInterceptors = new Set<WebOverlayKeyHandler>();
+
+/** App keyboard owners can consume a key before an overlay dismisses itself. */
+export function registerWebOverlayKeyInterceptor(handler: WebOverlayKeyHandler): () => void {
+  webOverlayKeyInterceptors.add(handler);
+  return () => {
+    webOverlayKeyInterceptors.delete(handler);
+  };
+}
 
 interface RemoveWebOverlayOptions {
   restoreFocus?: boolean;
@@ -164,6 +173,13 @@ export function dispatchTopWebOverlayKeyDown(event: KeyboardEvent): boolean {
   // IME candidate confirmation into an overlay shortcut before the browser has
   // committed the composed text.
   if (event.isComposing || event.key === "Process") return false;
+
+  for (const intercept of webOverlayKeyInterceptors) {
+    if (!intercept(event)) continue;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    return true;
+  }
 
   const top = getTopWebOverlay();
   const scope = top?.getScope();
@@ -239,6 +255,8 @@ interface WebOverlayRegistration {
   layer: number;
   onKeyDown: WebOverlayKeyHandler;
   restoreFocusRef?: React.RefObject<unknown>;
+  /** Retained overlays can hide without returning focus to their opener. */
+  restoreFocusOnDeactivate?: boolean;
 }
 
 /**
@@ -251,6 +269,7 @@ export function useWebOverlayRegistration({
   layer,
   onKeyDown,
   restoreFocusRef: preferredRestoreFocusRef,
+  restoreFocusOnDeactivate = true,
 }: WebOverlayRegistration) {
   const idRef = useRef(Symbol("web-overlay"));
   const scopeRef = useRef<HTMLElement | null>(null);
@@ -262,6 +281,8 @@ export function useWebOverlayRegistration({
   const registeredRef = useRef(false);
   const activeRef = useRef(active);
   const wasActiveRef = useRef(false);
+  const restoreOnDeactivateRef = useRef(restoreFocusOnDeactivate);
+  restoreOnDeactivateRef.current = restoreFocusOnDeactivate;
 
   activeRef.current = active;
   layerRef.current = layer;
@@ -286,7 +307,9 @@ export function useWebOverlayRegistration({
     if (!shouldRegister) {
       const shouldRestoreFocus = !activeRef.current;
       if (registeredRef.current || shouldRestoreFocus) {
-        removeEntryRef.current?.({ restoreFocus: shouldRestoreFocus });
+        removeEntryRef.current?.({
+          restoreFocus: shouldRestoreFocus && restoreOnDeactivateRef.current,
+        });
       }
       registeredRef.current = false;
       if (shouldRestoreFocus) {
@@ -332,7 +355,9 @@ export function useWebOverlayRegistration({
     syncRegistration();
     return () => {
       const removeEntry = removeEntryRef.current ?? detachedRemoveEntryRef.current;
-      removeEntry?.();
+      removeEntry?.({
+        restoreFocus: activeRef.current || restoreOnDeactivateRef.current,
+      });
       removeEntryRef.current = null;
       detachedRemoveEntryRef.current = null;
       registeredRef.current = false;

@@ -9,6 +9,8 @@ import {
 } from "react";
 import { activateKeepAwakeAsync, deactivateKeepAwake } from "expo-keep-awake";
 import { useSessionStore } from "@/stores/session-store";
+import { DictationProvider } from "@/contexts/dictation-context";
+import { createMicrophoneCoordinator, type MicrophoneCoordinator } from "@/voice/microphone";
 import { createAudioEngine } from "@/voice/audio-engine";
 import type { AudioEngine } from "@/voice/audio-engine-types";
 import {
@@ -113,6 +115,9 @@ interface VoiceProviderProps {
 }
 
 export function VoiceProvider({ children }: VoiceProviderProps) {
+  const microphoneRef = useRef<MicrophoneCoordinator | null>(null);
+  microphoneRef.current ??= createMicrophoneCoordinator();
+  const microphone = microphoneRef.current;
   const engineRef = useRef<AudioEngine | null>(null);
   const runtimeRef = useRef<VoiceRuntime | null>(null);
 
@@ -137,6 +142,7 @@ export function VoiceProvider({ children }: VoiceProviderProps) {
 
     runtime = createVoiceRuntime({
       engine,
+      microphone,
       getServerInfo: (serverId) =>
         useSessionStore.getState().getSession(serverId)?.serverInfo ?? null,
       activateKeepAwake: async (tag) => {
@@ -164,7 +170,9 @@ export function VoiceProvider({ children }: VoiceProviderProps) {
 
   return (
     <VoiceAudioEngineContext.Provider value={engine}>
-      <VoiceRuntimeContext.Provider value={runtime}>{children}</VoiceRuntimeContext.Provider>
+      <VoiceRuntimeContext.Provider value={runtime}>
+        <DictationProvider microphone={microphone}>{children}</DictationProvider>
+      </VoiceRuntimeContext.Provider>
     </VoiceAudioEngineContext.Provider>
   );
 }

@@ -1,3 +1,5 @@
+import { handleDictationSessionKeyDown } from "@/dictation/keyboard-events";
+import { DictationTextInput } from "@/dictation/text-input";
 import {
   useCallback,
   useEffect,
@@ -51,7 +53,12 @@ import {
 import type { AttachmentMetadata, BrowserElementAttachment } from "@/attachments/types";
 import { persistAttachmentFromDataUrl } from "@/attachments/service";
 import { WORKSPACE_SECONDARY_HEADER_HEIGHT } from "@/constants/layout";
-import { getOverlayRoot } from "@/lib/overlay-root";
+import {
+  getOverlayRoot,
+  OverlayLayerProvider,
+  useOverlayLayer,
+  useWebOverlayRegistration,
+} from "@/lib/overlay-root";
 import {
   getDesktopHost,
   isElectronRuntime,
@@ -1546,6 +1553,7 @@ export function BrowserPane({
         })}
         {pendingSelection ? (
           <BrowserElementAnnotationCard
+            serverId={serverId}
             anchor={webviewClipRef.current}
             selection={pendingSelection}
             onSubmit={submitAnnotation}
@@ -1558,11 +1566,13 @@ export function BrowserPane({
 }
 
 function BrowserElementAnnotationCard({
+  serverId,
   anchor,
   selection,
   onSubmit,
   onCancel,
 }: {
+  serverId: string;
   anchor: HTMLElement | null;
   selection: BrowserElementSelection;
   onSubmit: (annotation: BrowserElementAnnotation) => void;
@@ -1570,6 +1580,22 @@ function BrowserElementAnnotationCard({
 }) {
   const { t } = useTranslation();
   const bounds = useElementBounds(anchor);
+  const isPresented = useRetainedPanelActive();
+  const isVisible = isPresented && bounds !== null;
+  const inputRef = useRef<EditingTextInputHandle | null>(null);
+  useEffect(() => {
+    if (isVisible) inputRef.current?.focus();
+  }, [isVisible]);
+  const overlayLayer = useOverlayLayer("floating");
+  const overlayStyle = useMemo(
+    () => [
+      styles.annotationOverlay,
+      bounds,
+      { zIndex: overlayLayer },
+      !isVisible && styles.annotationHidden,
+    ],
+    [bounds, isVisible, overlayLayer],
+  );
   const [comment, setComment] = useState("");
   const commentRef = useRef(comment);
   commentRef.current = comment;
@@ -1578,72 +1604,81 @@ function BrowserElementAnnotationCard({
     onSubmit({ comment: commentRef.current });
   }, [onSubmit]);
 
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
+  const handleKeyDown = useCallback(
+    (event: KeyboardEvent) => {
+      if (handleDictationSessionKeyDown(event)) return true;
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
         onCancel();
-        return;
+        return true;
       }
       if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
         event.preventDefault();
         event.stopPropagation();
         handleSubmit();
+        return true;
       }
-    };
-    window.addEventListener("keydown", handleKeyDown, true);
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown, true);
-    };
-  }, [handleSubmit, onCancel]);
+      return false;
+    },
+    [handleSubmit, onCancel],
+  );
+  const setOverlayScope = useWebOverlayRegistration({
+    active: isVisible,
+    restoreFocusOnDeactivate: false,
+    layer: overlayLayer,
+    onKeyDown: handleKeyDown,
+  });
 
   const elementText = truncateText(selection.text.trim().replace(/\s+/g, " "), 60);
   const elementLabel = elementText ? `${selection.tag} · ${elementText}` : selection.tag;
 
-  if (!bounds) {
-    return null;
-  }
-
   return createPortal(
-    <View style={[styles.annotationOverlay, bounds]} pointerEvents="box-none">
-      <View style={styles.annotationCard}>
-        <View style={styles.annotationHeader}>
-          <Text numberOfLines={1} style={styles.annotationTitle}>
-            {t("workspace.browser.annotate.title")}
+    <OverlayLayerProvider layer={overlayLayer}>
+      <View style={overlayStyle} pointerEvents="box-none">
+        <View
+          ref={setOverlayScope}
+          style={styles.annotationCard}
+          testID="browser-element-annotation"
+        >
+          <View style={styles.annotationHeader}>
+            <Text numberOfLines={1} style={styles.annotationTitle}>
+              {t("workspace.browser.annotate.title")}
+            </Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={t("workspace.browser.annotate.cancel")}
+              onPress={onCancel}
+              style={styles.annotationCloseButton}
+            >
+              <ThemedCloseIcon size={16} uniProps={iconForegroundMutedMapping} />
+            </Pressable>
+          </View>
+          <Text numberOfLines={1} style={styles.annotationElement}>
+            {elementLabel}
           </Text>
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel={t("workspace.browser.annotate.cancel")}
-            onPress={onCancel}
-            style={styles.annotationCloseButton}
-          >
-            <ThemedCloseIcon size={16} uniProps={iconForegroundMutedMapping} />
-          </Pressable>
-        </View>
-        <Text numberOfLines={1} style={styles.annotationElement}>
-          {elementLabel}
-        </Text>
-        <ThemedAnnotationInput
-          accessibilityLabel={t("workspace.browser.annotate.placeholder")}
-          autoFocus
-          multiline
-          onChangeText={setComment}
-          placeholder={t("workspace.browser.annotate.placeholder")}
-          style={styles.annotationInput}
-          uniProps={annotationInputMapping}
-          initialValue={comment}
-        />
-        <View style={styles.annotationActions}>
-          <Button variant="ghost" size="sm" onPress={onCancel}>
-            {t("workspace.browser.annotate.cancel")}
-          </Button>
-          <Button variant="default" size="sm" onPress={handleSubmit}>
-            {t("workspace.browser.annotate.submit")}
-          </Button>
+          <ThemedAnnotationInput
+            ref={inputRef}
+            serverId={serverId}
+            accessibilityLabel={t("workspace.browser.annotate.placeholder")}
+            multiline
+            onChangeText={setComment}
+            placeholder={t("workspace.browser.annotate.placeholder")}
+            style={styles.annotationInput}
+            uniProps={annotationInputMapping}
+            initialValue={comment}
+          />
+          <View style={styles.annotationActions}>
+            <Button variant="ghost" size="sm" onPress={onCancel}>
+              {t("workspace.browser.annotate.cancel")}
+            </Button>
+            <Button variant="default" size="sm" onPress={handleSubmit}>
+              {t("workspace.browser.annotate.submit")}
+            </Button>
+          </View>
         </View>
       </View>
-    </View>,
+    </OverlayLayerProvider>,
     getOverlayRoot(),
   );
 }
@@ -1674,7 +1709,7 @@ function useElementBounds(element: HTMLElement | null): ViewStyle | null {
 }
 
 const ThemedCloseIcon = withUnistyles(X);
-const ThemedAnnotationInput = withUnistyles(TextInput);
+const ThemedAnnotationInput = withUnistyles(DictationTextInput);
 const iconForegroundMutedMapping = (theme: { colors: { foregroundMuted: string } }) => ({
   color: theme.colors.foregroundMuted,
 });
@@ -1777,9 +1812,11 @@ const styles = StyleSheet.create((theme) => ({
     fontSize: theme.fontSize.sm,
     color: theme.colors.popoverForeground,
   },
+  annotationHidden: {
+    display: "none",
+  },
   annotationOverlay: {
     position: "absolute",
-    zIndex: 1,
     padding: theme.spacing[3],
     alignItems: "center",
     justifyContent: "flex-end",

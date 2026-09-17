@@ -1,3 +1,4 @@
+import { DictationTextInput } from "@/dictation/text-input";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import { useState, useCallback, useMemo, useRef, type RefObject } from "react";
 import { View, Text, Pressable, type PressableStateCallbackType } from "react-native";
@@ -8,7 +9,6 @@ import { useTranslation } from "react-i18next";
 import type { PendingPermission } from "@/types/shared";
 import type { AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { isWeb } from "@/constants/platform";
-import { EditingTextInput as TextInput } from "@/components/ui/text-input";
 import type { EditingTextInputHandle } from "@/components/ui/text-input/types";
 import {
   areQuestionsAnswered,
@@ -23,6 +23,7 @@ import {
 } from "./question-form-card-core";
 
 interface QuestionFormCardProps {
+  serverId: string;
   permission: PendingPermission;
   onRespond: (response: AgentPermissionResponse) => void;
   isResponding: boolean;
@@ -243,7 +244,9 @@ function QuestionNav({
     >
       {questions.map((question, qIndex) => (
         <QuestionNavButton
-          key={question.header}
+          // Question positions are stable within a permission; headers may repeat.
+          // eslint-disable-next-line react/no-array-index-key
+          key={qIndex}
           index={qIndex}
           total={questions.length}
           header={question.header}
@@ -258,6 +261,8 @@ function QuestionNav({
 }
 
 interface QuestionOtherInputProps {
+  resetKey: string;
+  serverId: string;
   qIndex: number;
   inputRef: RefObject<EditingTextInputHandle | null>;
   accessibilityLabel: string;
@@ -269,6 +274,8 @@ interface QuestionOtherInputProps {
 }
 
 function QuestionOtherInput({
+  resetKey,
+  serverId,
   qIndex,
   inputRef,
   accessibilityLabel,
@@ -305,8 +312,10 @@ function QuestionOtherInput({
     ],
   );
   return (
-    <TextInput
+    <DictationTextInput
       ref={inputRef}
+      resetKey={resetKey}
+      serverId={serverId}
       // @ts-expect-error - outlineStyle is web-only
       style={otherInputStyle}
       accessibilityLabel={accessibilityLabel}
@@ -321,7 +330,12 @@ function QuestionOtherInput({
   );
 }
 
-export function QuestionFormCard({ permission, onRespond, isResponding }: QuestionFormCardProps) {
+export function QuestionFormCard({
+  serverId,
+  permission,
+  onRespond,
+  isResponding,
+}: QuestionFormCardProps) {
   const { theme } = useUnistyles();
   const { t } = useTranslation();
   const isMobile = useIsCompactFormFactor();
@@ -550,7 +564,10 @@ export function QuestionFormCard({ permission, onRespond, isResponding }: Questi
       </View>
 
       {activeQuestion ? (
-        <View key={activeQuestion.question} style={styles.questionBlock}>
+        <View
+          key={`${permission.agentId}:${permission.request.id}:${resolvedActiveQuestionIndex}`}
+          style={styles.questionBlock}
+        >
           {activeQuestion.options.length > 0 ? (
             <View style={styles.optionsWrap} {...optionsGroupAccessibility}>
               {activeQuestion.options.map((opt, optIndex) => (
@@ -569,6 +586,8 @@ export function QuestionFormCard({ permission, onRespond, isResponding }: Questi
           ) : null}
           {showTextInput ? (
             <QuestionOtherInput
+              resetKey={Array.from(selected).join(",")}
+              serverId={serverId}
               qIndex={resolvedActiveQuestionIndex}
               inputRef={otherInputRef}
               accessibilityLabel={activeQuestion.question}

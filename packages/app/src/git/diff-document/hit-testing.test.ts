@@ -312,6 +312,7 @@ function reviewActionsForFirstAddition(): NonNullable<
     content: "review me",
   };
   return {
+    serverId: "host-1",
     commentsByTarget: new Map(),
     editor: { target, commentId: null, body: "" },
     onStartComment() {},

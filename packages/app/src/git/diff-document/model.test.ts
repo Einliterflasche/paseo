@@ -370,6 +370,7 @@ describe("diff document model", () => {
     const model = buildDiffDocumentModel(
       input({
         reviewActions: {
+          serverId: "host-1",
           commentsByTarget: new Map(),
           editor: {
             target: {
@@ -402,7 +403,7 @@ describe("diff document model", () => {
         row.cells[0]?.reviewTarget?.side === "old" || row.cells[1]?.reviewTarget?.side === "old"
       );
     });
-    expect(reviewRow?.kind === "line" ? reviewRow.reviewHeight : 0).toBe(148);
+    expect(reviewRow?.kind === "line" ? reviewRow.reviewHeight : 0).toBe(180);
   });
 
   it("reflows review geometry without remeasuring unchanged text", () => {
@@ -435,9 +436,9 @@ describe("diff document model", () => {
     const editorRow = rowForReviewTarget(withEditor, reviewCell.reviewTarget.key);
 
     expect(measurementCount).toBe(initialMeasurementCount);
-    expect(editorRow.reviewHeight).toBe(148);
+    expect(editorRow.reviewHeight).toBe(180);
     expect(editorRow.cells).toBe(baseReviewRow.cells);
-    expect(withEditor.files[1]!.top).toBe(baseSecondFileTop + 148);
+    expect(withEditor.files[1]!.top).toBe(baseSecondFileTop + 180);
 
     const withoutEditor = buildDiffDocumentModel(
       input({
@@ -787,6 +788,7 @@ function reviewActionsWithEditor(
   target: NonNullable<ReturnType<typeof addedCell>["reviewTarget"]> | null,
 ): NonNullable<BuildDiffDocumentModelInput["reviewActions"]> {
   return {
+    serverId: "host-1",
     commentsByTarget: new Map(),
     editor: target ? { target, body: "", commentId: null } : null,
     onStartComment() {},

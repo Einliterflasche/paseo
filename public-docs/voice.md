@@ -10,6 +10,28 @@ category: Configuration
 
 Paseo has first-class voice support for dictation and voice mode conversations with your coding environment.
 
+## Dictation
+
+Use the microphone beside a text field to dictate into it. Dictation is available
+in chat, review comments, answers to agent questions, schedule prompts, profile
+notes, project prompt overrides, host system prompts, and desktop browser
+annotations. Outside chat, stopping dictation inserts the text; save or submit the
+form separately. Selected text is replaced by the transcript.
+
+On a desktop keyboard, Ctrl+D starts or stops dictation for the focused field.
+Cmd+D also works on macOS. With no text field or dialog focused, the shortcut
+starts dictation in the active chat. Names, search boxes, terminals, and other
+editors keep their own keyboard behavior. These defaults respect customized
+shortcuts.
+
+One recording can run at a time. Changing focus does not move an existing
+recording to another field. Switching workspace tabs keeps the recording attached
+to its original field. Ctrl+D stops a hidden chat recording and inserts its text
+without sending the message; Enter and Escape leave hidden recordings alone.
+Cancel before starting elsewhere; closing its editor or switching its host
+cancels delivery. If transcription fails, return to the original field to retry
+or discard it. Dictation and live voice share the microphone.
+
 ## Philosophy
 
 Voice is local-first. You can run speech fully on-device, or choose OpenAI for speech features. For voice reasoning/orchestration, Paseo reuses agent providers already installed and authenticated on your machine.

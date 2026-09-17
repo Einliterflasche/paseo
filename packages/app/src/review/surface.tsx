@@ -12,11 +12,9 @@ import {
   type ViewStyle,
 } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
+import { DictationTextInput } from "@/dictation/text-input";
 import { Button } from "@/components/ui/button";
-import {
-  EditingTextInput as TextInput,
-  type EditingTextInputHandle,
-} from "@/components/ui/text-input";
+import { type EditingTextInputHandle } from "@/components/ui/text-input";
 import { isWeb } from "@/constants/platform";
 import { inlineUnistylesStyle } from "@/styles/unistyles-inline-style";
 import type { Theme } from "@/styles/theme";
@@ -98,7 +96,10 @@ export function groupInlineReviewCommentsByTarget(
   return grouped;
 }
 
-export function useInlineReviewController(input: { reviewDraftKey: string }): InlineReviewActions {
+export function useInlineReviewController(input: {
+  reviewDraftKey: string;
+  serverId: string;
+}): InlineReviewActions {
   const reviewComments = useReviewDraftComments(input.reviewDraftKey);
   const commentsByTarget = useMemo(
     () => groupInlineReviewCommentsByTarget(reviewComments),
@@ -167,6 +168,7 @@ export function useInlineReviewController(input: { reviewDraftKey: string }): In
 
   return useMemo<InlineReviewActions>(
     () => ({
+      serverId: input.serverId,
       commentsByTarget,
       editor,
       onStartComment: handleStartComment,
@@ -176,6 +178,7 @@ export function useInlineReviewController(input: { reviewDraftKey: string }): In
       onDeleteComment: handleDeleteComment,
     }),
     [
+      input.serverId,
       commentsByTarget,
       editor,
       handleCancelEditor,
@@ -321,6 +324,7 @@ export function InlineReviewThread({
   const editorElement = editor ? (
     <InlineReviewEditor
       key={editingCommentId ?? "new"}
+      serverId={reviewActions.serverId}
       initialBody={editor.body}
       onCancel={reviewActions.onCancelEditor}
       onSave={reviewActions.onSaveEditor}
@@ -428,11 +432,13 @@ export function getInlineReviewThreadViewportStyle({
 }
 
 export function InlineReviewEditor({
+  serverId,
   initialBody,
   onCancel,
   onSave,
   testID,
 }: {
+  serverId: string;
   initialBody: string;
   onCancel: () => void;
   onSave: (body: string) => void;
@@ -498,7 +504,9 @@ export function InlineReviewEditor({
 
   return (
     <View style={styles.editorBlock} testID={testID}>
-      <TextInput
+      <DictationTextInput
+        serverId={serverId}
+        containerStyle={styles.editorInputContainer}
         ref={inputRef}
         accessibilityLabel={t("review.comment.label")}
         testID={testID ? `${testID}-input` : undefined}
@@ -635,6 +643,10 @@ const styles = StyleSheet.create((theme) => ({
     paddingHorizontal: theme.spacing[3],
     paddingVertical: theme.spacing[3],
     gap: theme.spacing[3],
+  },
+  editorInputContainer: {
+    flex: 1,
+    minHeight: 0,
   },
   editorInput: {
     flex: 1,

@@ -1,3 +1,4 @@
+import { DictationTextInput } from "@/dictation/text-input";
 import equal from "fast-deep-equal";
 import {
   useCallback,
@@ -450,6 +451,7 @@ function OpenScheduleFormSheet({
         controlSize={controlSize}
         cadenceError={cadenceError}
         mutationServerId={mutationServerId}
+        isSubmitting={isSubmitting}
       />
     </AdaptiveModalSheet>
   );
@@ -463,6 +465,7 @@ interface ScheduleFormFieldsProps {
   controlSize: FieldControlSize;
   cadenceError: string | null;
   mutationServerId: string;
+  isSubmitting: boolean;
 }
 
 function ScheduleFormFields({
@@ -473,6 +476,7 @@ function ScheduleFormFields({
   controlSize,
   cadenceError,
   mutationServerId,
+  isSubmitting,
 }: ScheduleFormFieldsProps): ReactElement {
   if (state.targetKind === "agent") {
     return (
@@ -505,7 +509,10 @@ function ScheduleFormFields({
       </Field>
 
       <Field label="Prompt">
-        <FormTextInput
+        <DictationTextInput
+          appearance="form"
+          serverId={mutationServerId || null}
+          editable={!isSubmitting}
           size={controlSize}
           testID="schedule-prompt-input"
           accessibilityLabel="Prompt"

@@ -1,4 +1,14 @@
-import { memo, useCallback, useEffect, useMemo, useRef } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import { createPanelRetention, type PanelRetention } from "@/panels/panel-retention";
+import { PanelRetentionContext } from "@/panels/panel-retention-context";
 import { RetainedPanel } from "@/components/retained-panel";
 import { useModifiedPanelTabIds } from "@/panels/panel-instance-attributes";
 import {
@@ -26,6 +36,7 @@ interface WorkspacePanelHostProps {
 }
 
 interface MountedTabProps {
+  retention: PanelRetention;
   tab: WorkspaceTabDescriptor;
   paneId: string;
   visible: boolean;
@@ -36,6 +47,7 @@ interface MountedTabProps {
 }
 
 const MountedTab = memo(function MountedTab({
+  retention,
   tab,
   paneId,
   visible,
@@ -48,17 +60,20 @@ const MountedTab = memo(function MountedTab({
     () => buildPaneContentModel({ paneId, tab }),
     [buildPaneContentModel, paneId, tab],
   );
+  const retentionContext = useMemo(() => ({ retention, tabId: tab.tabId }), [retention, tab.tabId]);
   const handleFocusPane = useCallback(() => onFocusPane?.(paneId), [onFocusPane, paneId]);
   return (
     <RenderProfile id={`DesktopMountedTab:${tab.kind}:${tab.tabId}`}>
-      <RetainedPanel active={visible}>
-        <WorkspacePaneContent
-          content={content}
-          isWorkspaceFocused={isWorkspaceFocused}
-          isPaneFocused={interactive}
-          onFocusPane={onFocusPane ? handleFocusPane : undefined}
-        />
-      </RetainedPanel>
+      <PanelRetentionContext.Provider value={retentionContext}>
+        <RetainedPanel active={visible}>
+          <WorkspacePaneContent
+            content={content}
+            isWorkspaceFocused={isWorkspaceFocused}
+            isPaneFocused={interactive}
+            onFocusPane={onFocusPane ? handleFocusPane : undefined}
+          />
+        </RetainedPanel>
+      </PanelRetentionContext.Provider>
     </RenderProfile>
   );
 });
@@ -88,7 +103,7 @@ function useStableTabs(tabs: WorkspaceTabDescriptor[]) {
   return stableTabs;
 }
 
-/** Mounts panel implementations behind the shared host contract and retains modified tabs. */
+/** Mounts panel implementations behind the shared host contract and retains modified tabs and panels with in-flight work. */
 export function WorkspacePanelHost({
   paneId,
   tabs,
@@ -101,11 +116,21 @@ export function WorkspacePanelHost({
   buildPaneContentModel,
 }: WorkspacePanelHostProps) {
   const tabIds = useMemo(() => tabs.map((tab) => tab.tabId), [tabs]);
-  const retainedTabIds = useModifiedPanelTabIds({
+  const modifiedTabIds = useModifiedPanelTabIds({
     serverId: normalizedServerId,
     workspaceId: normalizedWorkspaceId,
     tabIds,
   });
+  const [retention] = useState(createPanelRetention);
+  const leasedTabIds = useSyncExternalStore(
+    retention.subscribe,
+    retention.getSnapshot,
+    retention.getSnapshot,
+  );
+  const retainedTabIds = useMemo(
+    () => new Set([...modifiedTabIds, ...leasedTabIds]),
+    [modifiedTabIds, leasedTabIds],
+  );
   const stableTabs = useStableTabs(tabs);
   const { mountedTabIds } = useMountedTabSet({
     activeTabId,
@@ -125,6 +150,7 @@ export function WorkspacePanelHost({
     return (
       <MountedTab
         key={tabId}
+        retention={retention}
         tab={tab}
         paneId={paneId}
         visible={visible}

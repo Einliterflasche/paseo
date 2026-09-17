@@ -3,7 +3,7 @@ import { buildReviewableDiffTargetKey } from "@/utils/diff-layout";
 import type { ReviewDraftComment } from "./store";
 
 export const INLINE_REVIEW_COMMENT_HEIGHT = 72;
-export const INLINE_REVIEW_EDITOR_HEIGHT = 132;
+export const INLINE_REVIEW_EDITOR_HEIGHT = 164;
 export const INLINE_REVIEW_GAP = 6;
 export const INLINE_REVIEW_VERTICAL_PADDING = 8;
 
@@ -14,6 +14,7 @@ export interface InlineReviewEditorState {
 }
 
 export interface InlineReviewActions {
+  serverId: string;
   commentsByTarget: ReadonlyMap<string, ReviewDraftComment[]>;
   editor: InlineReviewEditorState | null;
   onStartComment: (target: ReviewableDiffTarget) => void;

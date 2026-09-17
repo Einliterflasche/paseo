@@ -1058,6 +1058,8 @@ function AppendSystemPromptCard({ serverId }: { serverId: string }) {
           desktopMaxWidth={560}
         >
           <SettingsTextAreaCard
+            dictationServerId={serverId}
+            editable={!isSaving}
             testID="host-page-append-system-prompt-input"
             accessibilityLabel={t("settings.host.orchestration.systemPrompt.accessibilityLabel")}
             value={draft}

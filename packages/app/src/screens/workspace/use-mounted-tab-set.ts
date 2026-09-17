@@ -26,7 +26,7 @@ function createInitialMountedTabLru(input: UseMountedTabSetInput): string[] {
   return [input.activeTabId];
 }
 
-function deriveMountedTabLru(input: DeriveMountedTabLruInput): string[] {
+export function deriveMountedTabLru(input: DeriveMountedTabLruInput): string[] {
   const { activeTabId, availableTabIds, cap, previousLru, retainedTabIds } = input;
   const maxSize = Math.max(1, cap);
 
@@ -41,7 +41,7 @@ function deriveMountedTabLru(input: DeriveMountedTabLruInput): string[] {
 
   for (const tabId of previousLru) {
     if (next.length >= maxSize) break;
-    if (tabId !== activeTabId && availableTabIds.has(tabId)) {
+    if (!next.includes(tabId) && availableTabIds.has(tabId)) {
       next.push(tabId);
     }
   }

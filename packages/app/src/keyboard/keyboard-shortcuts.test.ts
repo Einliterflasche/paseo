@@ -130,6 +130,50 @@ interface HelpSectionCase {
 }
 
 describe("keyboard-shortcuts", () => {
+  it("supports Ctrl+D on Mac and keeps Cmd+D as its existing shortcut", () => {
+    for (const modifiers of [{ ctrlKey: true }, { metaKey: true }]) {
+      expect(
+        resolveShortcut({
+          event: { key: "d", code: "KeyD", ...modifiers },
+          context: { isMac: true, focusScope: "editable" },
+        }).match?.payload,
+      ).toEqual({ kind: "dictation-toggle" });
+    }
+  });
+
+  it("removes the Mac Ctrl+D alias when dictation is rebound or unassigned", () => {
+    for (const override of ["Cmd+Alt+D", UNASSIGNED_COMBO]) {
+      const bindings = buildEffectiveBindings({
+        "message-input-dictation-toggle-cmd-d-mac": override,
+      });
+      expect(
+        resolveShortcut({
+          event: { key: "d", code: "KeyD", ctrlKey: true },
+          context: { isMac: true, focusScope: "editable" },
+          bindings,
+        }).match,
+      ).toBeNull();
+    }
+  });
+
+  it("does not toggle dictation on repeat or consume terminal Ctrl+D", () => {
+    for (const isMac of [true, false]) {
+      expect(
+        resolveShortcut({
+          event: { key: "d", code: "KeyD", ctrlKey: true, repeat: true },
+          context: { isMac, focusScope: "editable" },
+        }).match,
+      ).toBeNull();
+      for (const focusScope of ["terminal", "browser"] as const) {
+        expect(
+          resolveShortcut({
+            event: { key: "d", code: "KeyD", ctrlKey: true },
+            context: { isMac, focusScope },
+          }).match,
+        ).toBeNull();
+      }
+    }
+  });
   const matchingCases: MatchingShortcutCase[] = [
     {
       name: "matches Cmd+O to open project",

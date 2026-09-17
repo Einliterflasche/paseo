@@ -339,4 +339,50 @@ describe("DictationStreamSender", () => {
     });
     expect(client.finishes).toEqual([{ dictationId: "d1", finalSeq: 479 }]);
   });
+  it("coalesces initial stream requests and cancels an unfinished stream on disposal", async () => {
+    const client = new FakeDaemonClient();
+    const sender = new DictationStreamSender({
+      client,
+      format: "pcm",
+      createDictationId: () => "recording",
+    });
+    await Promise.all([sender.ensureStream(), sender.ensureStream()]);
+    expect(client.starts).toEqual([{ dictationId: "recording", format: "pcm" }]);
+    sender.dispose();
+    expect(client.cancels).toEqual(["recording"]);
+  });
+
+  it("does not cancel a stream that already returned its final transcript", async () => {
+    const client = new FakeDaemonClient();
+    const sender = new DictationStreamSender({
+      client,
+      format: "pcm",
+      createDictationId: () => "recording",
+    });
+    sender.enqueueSegment("audio");
+    await sender.finish(0);
+    sender.dispose();
+    expect(client.finishes).toEqual([{ dictationId: "recording", finalSeq: 0 }]);
+    expect(client.cancels).toEqual([]);
+  });
+
+  it("cancels an invalidated stream after the same client reconnects", async () => {
+    const client = new FakeDaemonClient();
+    const ids = ["before", "after"];
+    const sender = new DictationStreamSender({
+      client,
+      format: "pcm",
+      createDictationId: () => ids.shift() ?? "unexpected",
+    });
+    await sender.ensureStream();
+    client.throwOnNextChunk = true;
+    client.disconnectOnChunkError = true;
+    sender.enqueueSegment("audio");
+    expect(client.cancels).toEqual([]);
+    client.isConnected = true;
+    await sender.restartStream("reconnect");
+    expect(client.cancels).toEqual(["before"]);
+    await sender.finish(0);
+    expect(client.finishes).toEqual([{ dictationId: "after", finalSeq: 0 }]);
+  });
 });
