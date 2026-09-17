@@ -1,7 +1,7 @@
 import { test as base, expect, type Locator, type Page } from "@playwright/test";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { MutableDaemonConfig, MutableDaemonConfigPatch } from "@getpaseo/protocol/messages";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { startDictationDaemon, type DictationDaemon } from "../support/helpers/dictation-daemon";
 import { installDictationMicrophone } from "../support/helpers/dictation-browser";
 import { connectSeedClient, type SeedDaemonClient } from "../support/helpers/seed-client";
@@ -14,11 +14,11 @@ import {
 } from "../../src/utils/host-routes";
 
 interface ScratchWorkspace {
-  client: SeedDaemonClient & {
-    scheduleList(): Promise<{ schedules: unknown[] }>;
-    getDaemonConfig(): Promise<{ config: MutableDaemonConfig }>;
-    patchDaemonConfig(patch: MutableDaemonConfigPatch): Promise<{ config: MutableDaemonConfig }>;
-  };
+  client: SeedDaemonClient &
+    Pick<
+      DaemonClient,
+      "scheduleList" | "getDaemonConfig" | "patchDaemonConfig" | "readProjectConfig"
+    >;
   id: string;
   projectId: string;
   directory: string;
@@ -129,11 +129,129 @@ async function selectDictationTestModel(page: Page, compact = false): Promise<vo
 
 async function expectDictationControlsInViewport(page: Page, inputId: string, recording: boolean) {
   const controls = [`${inputId}-dictation-toggle`];
-  if (recording) controls.push(`${inputId}-dictation-cancel`);
+  if (recording) controls.push(`${inputId}-dictation-cancel`, `${inputId}-dictation-submit`);
+  const field = page.getByTestId(`${inputId}-dictation-field`);
   for (const id of controls) {
-    await expect(page.getByTestId(id)).toBeVisible();
-    await expect(page.getByTestId(id)).toBeInViewport({ ratio: 1 });
+    const control = page.getByTestId(id);
+    await expect(control).toBeVisible();
+    await expect(control).toBeInViewport({ ratio: 1 });
   }
+  // A compact sheet can still be moving. Measure its field and descendants in
+  // one browser frame so a translation cannot look like control overflow.
+  const geometry = await field.evaluate(
+    (element, { controlIds, overlayId }) => {
+      const fieldRect = element.getBoundingClientRect();
+      const insets = (id: string) => {
+        const node = element.querySelector(`[data-testid="${id}"]`);
+        if (!node) throw new Error(`Missing field control ${id}`);
+        const rect = node.getBoundingClientRect();
+        return {
+          left: rect.left - fieldRect.left,
+          top: rect.top - fieldRect.top,
+          right: fieldRect.right - rect.right,
+          bottom: fieldRect.bottom - rect.bottom,
+        };
+      };
+      return {
+        controls: controlIds.map((id) => ({ id, ...insets(id) })),
+        overlay: overlayId ? insets(overlayId) : null,
+      };
+    },
+    { controlIds: controls, overlayId: recording ? `${inputId}-dictation-overlay` : null },
+  );
+  for (const { id, left, top, right, bottom } of geometry.controls) {
+    expect(left, `${id} left inset`).toBeGreaterThanOrEqual(0);
+    expect(top, `${id} top inset`).toBeGreaterThanOrEqual(0);
+    expect(right, `${id} right inset`).toBeGreaterThanOrEqual(0);
+    expect(bottom, `${id} bottom inset`).toBeGreaterThanOrEqual(0);
+  }
+  if (recording) {
+    expect(geometry.overlay).toEqual({ left: 0, top: 0, right: 0, bottom: 0 });
+  }
+}
+
+interface Bounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+async function visibleBounds(locator: Locator): Promise<Bounds> {
+  await expect(locator).toBeVisible();
+  let previous: Bounds | null = null;
+  let stableSamples = 0;
+  await expect
+    .poll(
+      async () => {
+        const bounds = await locator.boundingBox();
+        const unchanged =
+          bounds &&
+          previous &&
+          Object.entries(bounds).every(([key, value]) => previous![key as keyof Bounds] === value);
+        stableSamples = unchanged ? stableSamples + 1 : 0;
+        previous = bounds;
+        return stableSamples;
+      },
+      { intervals: [100] },
+    )
+    .toBeGreaterThanOrEqual(2);
+  if (!previous) throw new Error(`Missing visible bounds for ${locator}`);
+  return previous;
+}
+
+async function expectBounds(locator: Locator, expected: Bounds): Promise<void> {
+  await expect
+    .poll(async () => {
+      const actual = await locator.boundingBox();
+      if (!actual) return null;
+      return Object.entries(expected).every(
+        ([key, value]) => Math.abs(actual[key as keyof Bounds] - value) < 0.5,
+      );
+    })
+    .toBe(true);
+}
+
+async function meterHeights(meter: Locator): Promise<number[]> {
+  return meter.evaluate((element) =>
+    [0, 2, 4].map((index) => element.children[index]!.getBoundingClientRect().height),
+  );
+}
+
+async function expectMeterRespondsToSound(page: Page, inputId: string): Promise<void> {
+  const meter = page.getByTestId(`${inputId}-dictation-meter`);
+  await expect(meter).toBeVisible();
+  // The existing chat meter alternates three bars with two spacing views.
+  await expect(meter.locator(":scope > div")).toHaveCount(5);
+  await page.evaluate(() => window.dictationTestMicrophone.setLevel(0));
+  await expect.poll(async () => Math.max(...(await meterHeights(meter)))).toBeLessThan(16);
+  const silentHeights = await meterHeights(meter);
+  await page.evaluate(() => window.dictationTestMicrophone.setLevel(1));
+  await expect
+    .poll(async () =>
+      (await meterHeights(meter)).every((height, index) => height > silentHeights[index]! + 8),
+    )
+    .toBe(true);
+}
+
+async function recordingAppearance(overlay: Locator, buttons: Locator[]) {
+  const background = await overlay.evaluate((element) => getComputedStyle(element).backgroundColor);
+  const controls = [];
+  for (const button of buttons) {
+    await expect(button.locator("svg")).toHaveCount(1);
+    controls.push(
+      await button.evaluate((element) => {
+        const icon = element.querySelector("svg")!;
+        return {
+          background: getComputedStyle(element).backgroundColor,
+          iconColor: getComputedStyle(icon).color,
+          iconStroke: icon.getAttribute("stroke"),
+          iconPaths: Array.from(icon.querySelectorAll("path"), (node) => node.getAttribute("d")),
+        };
+      }),
+    );
+  }
+  return { background, controls };
 }
 
 async function openReview(page: Page, changesAlreadyOpen = false): Promise<Locator> {
@@ -273,6 +391,161 @@ test("dictating a question answer leaves Next and Submit as explicit actions", a
   expect(JSON.stringify(speech.permissionResponses[0])).toContain("Second answer");
 });
 
+test("question dictation arrows advance and submit the completed answers exactly once", async ({
+  page,
+  host,
+  workspace,
+  speech,
+}) => {
+  const card = await openQuestions(
+    page,
+    host,
+    workspace,
+    "Emit synthetic questions: two free-write questions.",
+  );
+  const firstId = "question-form-answer-1";
+  const first = card.getByTestId(firstId);
+  await first.fill("First answer");
+  await first.press("End");
+  const firstBounds = await visibleBounds(card.getByTestId(`${firstId}-dictation-field`));
+  await card.getByTestId(`${firstId}-dictation-toggle`).click();
+  await speech.waitForAudio(0);
+  await expectDictationControlsInViewport(page, firstId, true);
+  await expectBounds(card.getByTestId(`${firstId}-dictation-field`), firstBounds);
+  await card.getByTestId(`${firstId}-dictation-submit`).click();
+  await speech.waitForFinish(0);
+  await expectBounds(card.getByTestId(`${firstId}-dictation-overlay`), firstBounds);
+  speech.complete("spoken first addition", 0);
+  const secondId = "question-form-answer-2";
+  const second = card.getByTestId(secondId);
+  await expect(second).toBeEditable();
+  expect(speech.permissionResponses).toEqual([]);
+  await second.fill("Second answer");
+  await second.press("End");
+  await card.getByTestId(`${secondId}-dictation-toggle`).click();
+  await speech.waitForAudio(1);
+  await card.getByTestId(`${secondId}-dictation-submit`).click();
+  await speech.waitForFinish(1);
+  speech.complete("spoken second addition", 1);
+  speech.complete("spoken second addition", 1);
+  await expect(card).toHaveCount(0);
+  await expect.poll(() => speech.permissionResponses.length).toBe(1);
+  expect(speech.permissionResponses[0]).toMatchObject({
+    behavior: "allow",
+    updatedInput: {
+      answers: {
+        repoUrl: "First answer spoken first addition",
+        commitMessage: "Second answer spoken second addition",
+      },
+    },
+  });
+  expect(await microphoneRequests(page)).toBe(2);
+  await expectMicrophoneReleased(page);
+});
+
+test("Tab skips the hidden question input and Enter activates the focused dictation arrow", async ({
+  page,
+  host,
+  workspace,
+  speech,
+}) => {
+  const card = await openQuestions(
+    page,
+    host,
+    workspace,
+    "Emit synthetic questions: two free-write questions.",
+  );
+  const firstId = "question-form-answer-1";
+  const first = card.getByTestId(firstId);
+  await first.fill("Keyboard first answer");
+  await first.press("End");
+  await card.getByTestId(`${firstId}-dictation-toggle`).click();
+  await speech.waitForAudio(0);
+  const cancel = card.getByTestId(`${firstId}-dictation-cancel`);
+  const pencil = card.getByTestId(`${firstId}-dictation-toggle`);
+  const next = card.getByTestId(`${firstId}-dictation-submit`);
+  await cancel.focus();
+  // Walk backward past the input's DOM position, then forward through every
+  // recording control. Reading tabIndex alone would miss a hidden focus trap.
+  await page.keyboard.press("Shift+Tab");
+  await expect(first).not.toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(cancel).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(pencil).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(next).toBeFocused();
+  await page.keyboard.press("Enter");
+  await speech.waitForFinish(0);
+  speech.complete("spoken first addition", 0);
+  const secondId = "question-form-answer-2";
+  const second = card.getByTestId(secondId);
+  await expect(second).toBeEditable();
+  expect(speech.permissionResponses).toEqual([]);
+  await second.fill("Keyboard second answer");
+  await second.press("End");
+  await card.getByTestId(`${secondId}-dictation-toggle`).click();
+  await speech.waitForAudio(1);
+  await card.getByTestId(`${secondId}-dictation-submit`).focus();
+  await page.keyboard.press("Enter");
+  await speech.waitForFinish(1);
+  speech.complete("spoken second addition", 1);
+  speech.complete("spoken second addition", 1);
+  await expect(card).toHaveCount(0);
+  await expect.poll(() => speech.permissionResponses.length).toBe(1);
+  expect(speech.permissionResponses[0]).toMatchObject({
+    behavior: "allow",
+    updatedInput: {
+      answers: {
+        repoUrl: "Keyboard first answer spoken first addition",
+        commitMessage: "Keyboard second answer spoken second addition",
+      },
+    },
+  });
+  expect(await microphoneRequests(page)).toBe(2);
+  await expectMicrophoneReleased(page);
+});
+
+for (const shortcut of ["Control+Enter", "Meta+Enter"]) {
+  test(`${shortcut} on a focused dictation arrow inserts without advancing or submitting the question`, async ({
+    page,
+    host,
+    workspace,
+    speech,
+  }) => {
+    const card = await openQuestions(
+      page,
+      host,
+      workspace,
+      "Emit synthetic questions: two free-write questions.",
+    );
+    const initialRequests = [...speech.agentRequests];
+    const inputId = "question-form-answer-1";
+    const input = card.getByTestId(inputId);
+    const second = card.getByTestId("question-form-answer-2");
+    await input.fill("Keep this question answer");
+    await input.press("End");
+    await card.getByTestId(`${inputId}-dictation-toggle`).click();
+    await speech.waitForAudio(0);
+    await card.getByTestId(`${inputId}-dictation-submit`).focus();
+    await page.keyboard.press(shortcut);
+    await speech.waitForFinish(0);
+    await expect(input).toHaveValue("Keep this question answer");
+    await expect(second).toHaveCount(0);
+    expect(speech.permissionResponses).toEqual([]);
+    speech.complete("spoken continuation", 0);
+    speech.complete("spoken continuation", 0);
+    await expect(input).toBeEditable();
+    await expect(input).toHaveValue("Keep this question answer spoken continuation");
+    await expect(second).toHaveCount(0);
+    await expect(card.getByTestId("question-form-primary-action")).toHaveText("Next");
+    expect(speech.permissionResponses).toEqual([]);
+    expect(speech.agentRequests).toEqual(initialRequests);
+    expect(await microphoneRequests(page)).toBe(1);
+    await expectMicrophoneReleased(page);
+  });
+}
+
 test("option reset and identical question labels never transfer a pending transcript", async ({
   page,
   host,
@@ -328,6 +601,9 @@ test("review Ctrl+D replaces the selected text without saving the comment", asyn
 }, testInfo) => {
   const review = await openReview(page);
   await review.fill("Keep replace suffix");
+  const field = page.getByTestId("inline-review-editor-input-dictation-field");
+  const idleBounds = await visibleBounds(field);
+  await expectDictationControlsInViewport(page, "inline-review-editor-input", false);
   await review.press("Home");
   for (let index = 0; index < 5; index += 1) await review.press("ArrowRight");
   for (let index = 0; index < 7; index += 1) await review.press("Shift+ArrowRight");
@@ -335,13 +611,18 @@ test("review Ctrl+D replaces the selected text without saving the comment", asyn
   await speech.waitForAudio(0);
   await expect(review).not.toBeEditable();
   await expectDictationControlsInViewport(page, "inline-review-editor-input", true);
+  await expectBounds(field, idleBounds);
+  await expectMeterRespondsToSound(page, "inline-review-editor-input");
   await page.screenshot({ path: testInfo.outputPath("review-dictation-desktop-recording.png") });
   await page.getByTestId("inline-review-editor-input-dictation-toggle").click();
   await speech.waitForFinish(0);
+  await expectBounds(field, idleBounds);
+  await expectBounds(page.getByTestId("inline-review-editor-input-dictation-overlay"), idleBounds);
   speech.complete("spoken comment");
   await expect(review).toHaveValue("Keep spoken comment suffix");
   await expect(page.getByTestId("inline-review-editor-save")).toBeVisible();
   await expect(review).toBeEditable();
+  await expectBounds(field, idleBounds);
   await expectDictationControlsInViewport(page, "inline-review-editor-input", false);
   await expect(page.getByTestId("inline-review-editor-save")).toBeInViewport({ ratio: 1 });
   await page.screenshot({ path: testInfo.outputPath("review-dictation-desktop-inserted.png") });
@@ -361,18 +642,141 @@ test("compact review microphone controls remain visible while recording and afte
   const review = await openReview(page, true);
   await review.fill("Compact review draft");
   await review.press("End");
+  const field = page.getByTestId("inline-review-editor-input-dictation-field");
+  const idleBounds = await visibleBounds(field);
+  await expectDictationControlsInViewport(page, "inline-review-editor-input", false);
   await page.getByTestId("inline-review-editor-input-dictation-toggle").click();
   await speech.waitForAudio(0);
   await expectDictationControlsInViewport(page, "inline-review-editor-input", true);
+  await expectBounds(field, idleBounds);
   await page.screenshot({ path: testInfo.outputPath("review-dictation-compact-recording.png") });
   await page.getByTestId("inline-review-editor-input-dictation-toggle").click();
   await speech.waitForFinish(0);
+  await expectBounds(page.getByTestId("inline-review-editor-input-dictation-overlay"), idleBounds);
   speech.complete("compact spoken comment");
   await expect(review).toHaveValue("Compact review draft compact spoken comment");
   await expectDictationControlsInViewport(page, "inline-review-editor-input", false);
+  await expectBounds(field, idleBounds);
   await expect(page.getByTestId("inline-review-editor-save")).toBeInViewport({ ratio: 1 });
   await page.screenshot({ path: testInfo.outputPath("review-dictation-compact-inserted.png") });
   expect(speech.agentRequests).toEqual([]);
+});
+
+test("the review dictation arrow saves the complete comment exactly once", async ({
+  page,
+  speech,
+}) => {
+  const review = await openReview(page);
+  await review.fill("Keep replace suffix");
+  await review.evaluate((element) => (element as HTMLTextAreaElement).setSelectionRange(5, 12));
+  await page.getByTestId("inline-review-editor-input-dictation-toggle").click();
+  await speech.waitForAudio(0);
+  await page.getByTestId("inline-review-editor-input-dictation-submit").click();
+  await speech.waitForFinish(0);
+  await expect(page.getByTestId("inline-review-editor")).toBeVisible();
+  speech.complete("spoken and saved", 0);
+  speech.complete("spoken and saved", 0);
+  await expect(review).toHaveCount(0);
+  await expect(page.getByText("Keep spoken and saved suffix", { exact: true })).toHaveCount(1);
+  await expect(page.locator('[data-testid^="review-comment-edit-"]')).toHaveCount(1);
+  expect(speech.agentRequests).toEqual([]);
+  await expectMicrophoneReleased(page);
+});
+
+test("new fields retain the original chat recording colors and control icons", async ({
+  page,
+  speech,
+}) => {
+  await createAgentTabFromMenu(page);
+  await selectDictationTestModel(page);
+  const composer = page
+    .getByTestId("message-input-root")
+    .filter({ visible: true })
+    .locator("textarea");
+  await composer.fill("Original chat draft");
+  await composer.press("Control+d");
+  await speech.waitForAudio(0);
+  const insert = page.getByRole("button", { name: "Insert transcription", exact: true });
+  const cancel = page.getByRole("button", { name: "Cancel dictation", exact: true });
+  const send = page.getByRole("button", { name: "Insert transcription and send", exact: true });
+  const original = await recordingAppearance(insert.locator("../.."), [cancel, insert, send]);
+  expect(original.background).not.toBe("rgba(0, 0, 0, 0)");
+  await cancel.click();
+  await expectMicrophoneReleased(page);
+  await expect.poll(() => speech.openSessions().length).toBe(0);
+  const review = await openReview(page);
+  await review.fill("Review draft");
+  await review.press("Control+d");
+  await speech.waitForAudio(1);
+  const prefix = "inline-review-editor-input-dictation";
+  const fieldAppearance = await recordingAppearance(page.getByTestId(`${prefix}-overlay`), [
+    page.getByTestId(`${prefix}-cancel`),
+    page.getByTestId(`${prefix}-toggle`),
+    page.getByTestId(`${prefix}-submit`),
+  ]);
+  expect(fieldAppearance).toEqual(original);
+  await page.getByTestId(`${prefix}-cancel`).click();
+  await expect(review).toHaveValue("Review draft");
+  expect(speech.agentRequests).toEqual([]);
+  await expectMicrophoneReleased(page);
+});
+
+test("Cancel during an arrow upload discards submission intent before the next pencil insertion", async ({
+  page,
+  speech,
+}) => {
+  const review = await openReview(page);
+  await review.fill("Keep this draft");
+  await review.press("End");
+  await page.getByTestId("inline-review-editor-input-dictation-toggle").click();
+  await speech.waitForAudio(0);
+  await page.getByTestId("inline-review-editor-input-dictation-submit").click();
+  await speech.waitForFinish(0);
+  await page.getByTestId("inline-review-editor-input-dictation-cancel").click();
+  await expect(review).toBeEditable();
+  await expect.poll(() => speech.openSessions().length).toBe(0);
+  speech.complete("canceled words", 0);
+  await expect(review).toHaveValue("Keep this draft");
+  await page.getByTestId("inline-review-editor-input-dictation-toggle").click();
+  await speech.waitForAudio(1);
+  await page.getByTestId("inline-review-editor-input-dictation-toggle").click();
+  await speech.waitForFinish(1);
+  speech.complete("insert these words", 1);
+  await expect(review).toHaveValue("Keep this draft insert these words");
+  await expect(page.getByTestId("inline-review-editor-save")).toBeVisible();
+  await expect(page.locator('[data-testid^="review-comment-edit-"]')).toHaveCount(0);
+  expect(speech.agentRequests).toEqual([]);
+  expect(await microphoneRequests(page)).toBe(2);
+  await expectMicrophoneReleased(page);
+});
+
+test("an empty arrow transcription does not submit or affect the next pencil insertion", async ({
+  page,
+  speech,
+}) => {
+  const review = await openReview(page);
+  await review.fill("Keep the original review");
+  await review.press("End");
+  await page.getByTestId("inline-review-editor-input-dictation-toggle").click();
+  await speech.waitForAudio(0);
+  await page.getByTestId("inline-review-editor-input-dictation-submit").click();
+  await speech.waitForFinish(0);
+  speech.complete("", 0);
+  await expect(review).toBeEditable();
+  await expect(review).toHaveValue("Keep the original review");
+  await expect(page.getByTestId("inline-review-editor-save")).toBeVisible();
+  await expect(page.locator('[data-testid^="review-comment-edit-"]')).toHaveCount(0);
+  await page.getByTestId("inline-review-editor-input-dictation-toggle").click();
+  await speech.waitForAudio(1);
+  await page.getByTestId("inline-review-editor-input-dictation-toggle").click();
+  await speech.waitForFinish(1);
+  speech.complete("inserted after silence", 1);
+  await expect(review).toHaveValue("Keep the original review inserted after silence");
+  await expect(page.getByTestId("inline-review-editor-save")).toBeVisible();
+  await expect(page.locator('[data-testid^="review-comment-edit-"]')).toHaveCount(0);
+  expect(speech.agentRequests).toEqual([]);
+  expect(await microphoneRequests(page)).toBe(2);
+  await expectMicrophoneReleased(page);
 });
 
 test("schedule microphone inserts only into Prompt and never creates a schedule", async ({
@@ -384,16 +788,22 @@ test("schedule microphone inserts only into Prompt and never creates a schedule"
   const prompt = await openSchedule(page, host);
   await prompt.fill("Existing prompt");
   await prompt.press("End");
+  const field = page.getByTestId("schedule-prompt-input-dictation-field");
+  const idleBounds = await visibleBounds(field);
+  await expectDictationControlsInViewport(page, "schedule-prompt-input", false);
   await page.getByTestId("schedule-prompt-input-dictation-toggle").click();
   await speech.waitForAudio(0);
   await expectDictationControlsInViewport(page, "schedule-prompt-input", true);
+  await expectBounds(field, idleBounds);
   await page.screenshot({ path: testInfo.outputPath("schedule-dictation-desktop-recording.png") });
   await page.getByTestId("schedule-prompt-input-dictation-toggle").click();
   await speech.waitForFinish(0);
+  await expectBounds(page.getByTestId("schedule-prompt-input-dictation-overlay"), idleBounds);
   speech.complete("spoken continuation");
   await expect(prompt).toHaveValue("Existing prompt spoken continuation");
   await expect(page.getByTestId("schedule-form-sheet")).toBeVisible();
   await expectDictationControlsInViewport(page, "schedule-prompt-input", false);
+  await expectBounds(field, idleBounds);
   await page.screenshot({ path: testInfo.outputPath("schedule-dictation-desktop-inserted.png") });
   expect((await workspace.client.scheduleList()).schedules).toEqual([]);
   expect(speech.agentRequests).toEqual([]);
@@ -487,17 +897,23 @@ test("a schedule opened at compact width retains its microphone runtime", async 
   const prompt = await openSchedule(page, host);
   await prompt.fill("Compact schedule");
   await prompt.press("End");
+  const field = page.getByTestId("schedule-prompt-input-dictation-field");
+  const idleBounds = await visibleBounds(field);
+  await expectDictationControlsInViewport(page, "schedule-prompt-input", false);
   const microphone = page.getByTestId("schedule-prompt-input-dictation-toggle");
   await microphone.click();
   await speech.waitForAudio(0);
   await expectDictationControlsInViewport(page, "schedule-prompt-input", true);
+  await expectBounds(field, idleBounds);
   await page.screenshot({ path: testInfo.outputPath("schedule-compact-open-recording.png") });
   await microphone.click();
   await speech.waitForFinish(0);
+  await expectBounds(page.getByTestId("schedule-prompt-input-dictation-overlay"), idleBounds);
   speech.complete("spoken on compact");
   await expect(prompt).toHaveValue("Compact schedule spoken on compact");
   await expect(page.getByTestId("schedule-form-sheet")).toBeVisible();
   await expectDictationControlsInViewport(page, "schedule-prompt-input", false);
+  await expectBounds(field, idleBounds);
   await page.screenshot({ path: testInfo.outputPath("schedule-compact-open-inserted.png") });
   expect((await workspace.client.scheduleList()).schedules).toEqual([]);
 });
@@ -523,13 +939,18 @@ for (const surface of ["profile", "host-prompt"] as const) {
     const input = page.getByTestId(inputId);
     await input.fill("Retained draft");
     await input.press("End");
+    const field = page.getByTestId(`${inputId}-dictation-field`);
+    const idleBounds = await visibleBounds(field);
+    await expectDictationControlsInViewport(page, inputId, false);
     const microphone = page.getByTestId(`${inputId}-dictation-toggle`);
     await microphone.click();
     await speech.waitForAudio(0);
     await expectDictationControlsInViewport(page, inputId, true);
+    await expectBounds(field, idleBounds);
     await page.screenshot({ path: testInfo.outputPath(`${surface}-compact-recording.png`) });
     await microphone.click();
     await speech.waitForFinish(0);
+    await expectBounds(page.getByTestId(`${inputId}-dictation-overlay`), idleBounds);
     speech.complete("spoken notes");
     await expect(input).toHaveValue("Retained draft spoken notes");
     await expect(
@@ -538,7 +959,61 @@ for (const surface of ["profile", "host-prompt"] as const) {
       ),
     ).toBeVisible();
     await expectDictationControlsInViewport(page, inputId, false);
+    await expectBounds(field, idleBounds);
     await page.screenshot({ path: testInfo.outputPath(`${surface}-compact-inserted.png`) });
+    expect(speech.agentRequests).toEqual([]);
+  });
+}
+
+for (const surface of ["schedule", "host-prompt"] as const) {
+  test(`Escape from ${surface} recording and arrow upload preserves the modal draft`, async ({
+    page,
+    host,
+    workspace,
+    speech,
+  }) => {
+    const persisted = (await workspace.client.getDaemonConfig()).config;
+    if (surface === "schedule") {
+      await openSchedule(page, host);
+    } else {
+      await page.goto(`${host.origin}${buildSettingsHostSectionRoute(host.serverId, "agents")}`);
+      await page.getByTestId("host-page-append-system-prompt-edit").click();
+    }
+    const inputId =
+      surface === "schedule" ? "schedule-prompt-input" : "host-page-append-system-prompt-input";
+    const modalId =
+      surface === "schedule" ? "schedule-form-sheet" : "host-page-append-system-prompt-sheet";
+    const input = page.getByTestId(inputId);
+    await input.fill("Keep this unsubmitted modal draft");
+    await page.getByTestId(`${inputId}-dictation-toggle`).click();
+    await speech.waitForAudio(0);
+    // Do not focus an input or control between the mouse click and Escape.
+    await page.keyboard.press("Escape");
+    await expectMicrophoneReleased(page);
+    await expect.poll(() => speech.openSessions().length).toBe(0);
+    await expect(page.getByTestId(modalId)).toBeVisible();
+    await expect(input).toBeEditable();
+    await expect(input).toHaveValue("Keep this unsubmitted modal draft");
+    await expect(page.getByTestId(`${inputId}-dictation-overlay`)).not.toBeVisible();
+    speech.complete("canceled words must not save", 0);
+    await expect(input).toHaveValue("Keep this unsubmitted modal draft");
+    await page.getByTestId(`${inputId}-dictation-toggle`).click();
+    await speech.waitForAudio(1);
+    await page.getByTestId(`${inputId}-dictation-submit`).click();
+    await speech.waitForFinish(1);
+    // The arrow has now been replaced by a spinner. Escape must still find
+    // this field without a focus repair from the test or a click on Cancel.
+    await page.keyboard.press("Escape");
+    await expect.poll(() => speech.openSessions().length).toBe(0);
+    speech.complete("late upload must not submit", 1);
+    await expect(page.getByTestId(modalId)).toBeVisible();
+    await expect(input).toBeEditable();
+    await expect(input).toHaveValue("Keep this unsubmitted modal draft");
+    await expect(page.getByTestId(`${inputId}-dictation-overlay`)).not.toBeVisible();
+    await expectMicrophoneReleased(page);
+    expect(await microphoneRequests(page)).toBe(2);
+    expect((await workspace.client.getDaemonConfig()).config).toEqual(persisted);
+    expect((await workspace.client.scheduleList()).schedules).toEqual([]);
     expect(speech.agentRequests).toEqual([]);
   });
 }
@@ -565,6 +1040,42 @@ test("canceling pending microphone permission releases a late stream without cha
   await expect(prompt).toHaveValue("Permission draft");
   expect(speech.requests).toEqual([]);
   await expect(page.getByTestId("schedule-form-sheet")).toBeVisible();
+});
+
+test("denied microphone permission keeps the draft and Retry starts a fresh insert-only recording", async ({
+  page,
+  speech,
+}) => {
+  const review = await openReview(page);
+  await review.fill("Permission denied draft");
+  await review.press("End");
+  await page.evaluate(() => {
+    window.dictationTestMicrophone.holdPermission = true;
+    window.dictationTestMicrophone.rejectNextPermission = true;
+  });
+  await page.getByTestId("inline-review-editor-input-dictation-toggle").click();
+  await expect.poll(() => microphoneRequests(page)).toBe(1);
+  // Choosing the arrow before the permission dialog resolves must not leave a
+  // submit intent attached to the next, separately acquired recording.
+  await page.getByTestId("inline-review-editor-input-dictation-submit").click();
+  await page.evaluate(() => window.dictationTestMicrophone.releasePermission());
+  await expect(page.getByTestId("inline-review-editor-input-dictation-error")).toContainText(
+    "Microphone access denied",
+  );
+  await expect(review).toHaveValue("Permission denied draft");
+  await expectMicrophoneReleased(page);
+  expect(speech.requests).toEqual([]);
+  await page.getByTestId("inline-review-editor-input-dictation-retry").click();
+  await speech.waitForAudio(0);
+  await page.getByTestId("inline-review-editor-input-dictation-toggle").click();
+  await speech.waitForFinish(0);
+  speech.complete("retried successfully", 0);
+  await expect(review).toHaveValue("Permission denied draft retried successfully");
+  await expect(page.getByTestId("inline-review-editor-save")).toBeVisible();
+  await expect(page.locator('[data-testid^="review-comment-edit-"]')).toHaveCount(0);
+  expect(await microphoneRequests(page)).toBe(2);
+  expect(speech.agentRequests).toEqual([]);
+  await expectMicrophoneReleased(page);
 });
 
 test("closing a dictating review editor ignores its late transcription", async ({
@@ -650,7 +1161,7 @@ test("a failed transcription survives three newer tabs and retries in its origin
   await expectOtherDraftsUnchanged(page, otherDrafts);
 });
 
-test("Reset restores persisted host text and discards a pending transcription without saving", async ({
+test("Reset restores persisted host text and discards a pending arrow submission without saving", async ({
   page,
   host,
   workspace,
@@ -666,7 +1177,7 @@ test("Reset restores persisted host text and discards a pending transcription wi
   await input.press("End");
   await input.press("Control+d");
   await speech.waitForAudio(0);
-  await page.keyboard.press("Control+d");
+  await page.getByTestId("host-page-append-system-prompt-input-dictation-submit").click();
   await speech.waitForFinish(0);
   await page.getByTestId("host-page-append-system-prompt-reset").click();
   await expect(input).toHaveValue("Persisted host instructions");
@@ -679,6 +1190,49 @@ test("Reset restores persisted host text and discards a pending transcription wi
   // real RPC before any Save action has been issued.
   expect((await workspace.client.getDaemonConfig()).config).toEqual(persisted);
   await expect(page.getByTestId("host-page-append-system-prompt-sheet")).toBeVisible();
+});
+
+test("a failed host-prompt arrow submission retries and saves the exact completed draft", async ({
+  page,
+  host,
+  workspace,
+  speech,
+}) => {
+  await workspace.client.patchDaemonConfig({ appendSystemPrompt: "Original saved instructions" });
+  const persisted = (await workspace.client.getDaemonConfig()).config;
+  await page.goto(`${host.origin}${buildSettingsHostSectionRoute(host.serverId, "agents")}`);
+  await page.getByTestId("host-page-append-system-prompt-edit").click();
+  const inputId = "host-page-append-system-prompt-input";
+  const input = page.getByTestId(inputId);
+  await input.fill("Replacement instructions");
+  await input.press("End");
+  await page.getByTestId(`${inputId}-dictation-toggle`).click();
+  await speech.waitForAudio(0);
+  await page.getByTestId(`${inputId}-dictation-submit`).click();
+  await speech.waitForFinish(0);
+  speech.fail("Speech is temporarily unavailable", 0);
+  await expect(page.getByTestId(`${inputId}-dictation-error`)).toContainText(
+    "Speech is temporarily unavailable",
+  );
+  await expect(input).toHaveValue("Replacement instructions");
+  expect((await workspace.client.getDaemonConfig()).config).toEqual(persisted);
+  await page.getByTestId(`${inputId}-dictation-retry`).click();
+  await speech.waitForFinish(1);
+  speech.complete("spoken new instructions", 1);
+  speech.complete("spoken new instructions", 1);
+  await expect(page.getByTestId("host-page-append-system-prompt-sheet")).not.toBeVisible();
+  const expected = {
+    ...persisted,
+    appendSystemPrompt: "Replacement instructions spoken new instructions",
+  };
+  await expect
+    .poll(async () => (await workspace.client.getDaemonConfig()).config)
+    .toEqual(expected);
+  await page.getByTestId("host-page-append-system-prompt-edit").click();
+  await expect(input).toHaveValue(expected.appendSystemPrompt);
+  expect(await microphoneRequests(page)).toBe(1);
+  expect(speech.agentRequests).toEqual([]);
+  await expectMicrophoneReleased(page);
 });
 
 test("retrying a failed transcription retains the draft and inserts exactly once", async ({
@@ -896,4 +1450,211 @@ test("terminal Ctrl+D does not start dictation", async ({ page, workspace, speec
     .toBe(true);
   expect(await microphoneRequests(page)).toBe(0);
   expect(speech.requests).toEqual([]);
+});
+
+test("Pencil insertion returns focus so the next Ctrl+D stays in the review field", async ({
+  page,
+  speech,
+}) => {
+  const review = await openReview(page);
+  await review.fill("Review draft");
+  await review.press("End");
+  await page.getByTestId("inline-review-editor-input-dictation-toggle").click();
+  await speech.waitForAudio(0);
+  await page.getByTestId("inline-review-editor-input-dictation-toggle").click();
+  await speech.waitForFinish(0);
+  speech.complete("first continuation", 0);
+  await expect(review).toHaveValue("Review draft first continuation");
+  await expect(review).toBeFocused();
+  // No click or locator.press here: the second shortcut must use the focus
+  // left by transcript delivery rather than implicitly refocusing the field.
+  await page.keyboard.press("Control+d");
+  await speech.waitForAudio(1);
+  await expect(page.getByTestId("inline-review-editor-input-dictation-overlay")).toBeVisible();
+  await page.getByTestId("inline-review-editor-input-dictation-toggle").click();
+  await speech.waitForFinish(1);
+  speech.complete("second continuation", 1);
+  await expect(review).toHaveValue("Review draft first continuation second continuation");
+  await expect(review).toBeFocused();
+  await expect(page.getByTestId("inline-review-editor-save")).toBeVisible();
+  expect(speech.agentRequests).toEqual([]);
+  expect(await microphoneRequests(page)).toBe(2);
+  await expectMicrophoneReleased(page);
+});
+
+test("the metadata dictation arrow saves its exact prompt and another unsaved field", async ({
+  page,
+  host,
+  workspace,
+  speech,
+}) => {
+  const { first, second } = await openMetadata(page, host, workspace);
+  await first.fill("Branch instructions");
+  await second.fill("Keep these unsaved commit instructions");
+  await first.focus();
+  await first.press("End");
+  const before = await workspace.client.readProjectConfig(workspace.directory);
+  if (!before.ok) throw new Error(`Unable to read project config: ${before.error.code}`);
+  await page.getByTestId("metadata-prompt-branch-name-input-dictation-toggle").click();
+  await speech.waitForAudio(0);
+  await page.getByTestId("metadata-prompt-branch-name-input-dictation-submit").click();
+  await speech.waitForFinish(0);
+  speech.complete("spoken branch guidance", 0);
+  speech.complete("spoken branch guidance", 0);
+  await expect(first).toHaveValue("Branch instructions spoken branch guidance");
+  await expect(second).toHaveValue("Keep these unsaved commit instructions");
+  const expected = {
+    ...before.config,
+    metadataGeneration: {
+      ...before.config?.metadataGeneration,
+      branchName: { instructions: "Branch instructions spoken branch guidance" },
+      commitMessage: { instructions: "Keep these unsaved commit instructions" },
+    },
+  };
+  await expect
+    .poll(async () => {
+      const result = await workspace.client.readProjectConfig(workspace.directory);
+      return result.ok ? result.config : result.error;
+    })
+    .toEqual(expected);
+  // Leave through hydrated Settings and reopen to prove the drafts were
+  // persisted, rather than merely left in the still-mounted inputs.
+  await page.getByTestId("project-settings-back-link").click();
+  await page
+    .getByRole("button", { name: `Edit ${path.basename(workspace.directory)}`, exact: true })
+    .click();
+  await expect(first).toHaveValue("Branch instructions spoken branch guidance");
+  await expect(second).toHaveValue("Keep these unsaved commit instructions");
+  expect(speech.agentRequests).toEqual([]);
+  await expectMicrophoneReleased(page);
+});
+
+test("the profile dictation arrow honors the required name and saves the complete notes", async ({
+  page,
+  host,
+  workspace,
+  speech,
+}) => {
+  const previous = (await workspace.client.getDaemonConfig()).config;
+  await page.goto(`${host.origin}${buildSettingsHostSectionRoute(host.serverId, "agents")}`);
+  await page
+    .getByTestId("agent-profiles-card")
+    .getByRole("button", { name: "New profile", exact: true })
+    .click();
+  await page.getByTestId("agent-profile-provider-trigger").click();
+  await page
+    .getByTestId("combobox-desktop-container")
+    .getByRole("button", { name: "Mock Load Test", exact: true })
+    .click();
+  const notes = page.getByTestId("agent-profile-notes-input");
+  await notes.fill("Use for careful reviews");
+  await notes.press("End");
+  await page.getByTestId("agent-profile-notes-input-dictation-toggle").click();
+  await speech.waitForAudio(0);
+  await page.getByTestId("agent-profile-notes-input-dictation-submit").click();
+  await speech.waitForFinish(0);
+  speech.complete("with test evidence", 0);
+  await expect(notes).toHaveValue("Use for careful reviews with test evidence");
+  await expect(page.getByTestId("agent-profile-save-button")).toBeDisabled();
+  expect((await workspace.client.getDaemonConfig()).config).toEqual(previous);
+  await page.getByTestId("agent-profile-name-input").fill("Dictated review profile");
+  await notes.focus();
+  await notes.press("End");
+  await page.getByTestId("agent-profile-notes-input-dictation-toggle").click();
+  await speech.waitForAudio(1);
+  await page.getByTestId("agent-profile-notes-input-dictation-submit").click();
+  await speech.waitForFinish(1);
+  speech.complete("and clear findings", 1);
+  speech.complete("and clear findings", 1);
+  await expect(page.getByTestId("agent-profile-edit-modal")).not.toBeVisible();
+  const finalNotes = "Use for careful reviews with test evidence and clear findings";
+  await expect
+    .poll(async () => {
+      const config = (await workspace.client.getDaemonConfig()).config;
+      return config.agentProfiles?.filter((profile) => profile.name === "Dictated review profile");
+    })
+    .toEqual([
+      expect.objectContaining({
+        name: "Dictated review profile",
+        provider: "mock",
+        notes: finalNotes,
+      }),
+    ]);
+  const saved = (await workspace.client.getDaemonConfig()).config;
+  const created = saved.agentProfiles!.find(
+    (profile) => profile.name === "Dictated review profile",
+  )!;
+  expect(saved).toEqual({
+    ...previous,
+    agentProfiles: [...(previous.agentProfiles ?? []), created],
+  });
+  const row = page.getByTestId(`agent-profile-row-${created.id}`);
+  await expect(row.getByText(finalNotes, { exact: true })).toBeVisible();
+  await row.getByRole("button", { name: "Edit profile", exact: true }).click();
+  await expect(notes).toHaveValue(finalNotes);
+  await expect(page.getByTestId("agent-profile-name-input")).toHaveValue("Dictated review profile");
+  expect(speech.agentRequests).toEqual([]);
+  await expectMicrophoneReleased(page);
+});
+
+test("the schedule dictation arrow validates its target before creating a future schedule", async ({
+  page,
+  host,
+  workspace,
+  speech,
+}) => {
+  const prompt = await openSchedule(page, host);
+  await page.getByTestId("schedule-name-input").fill("Dictated future schedule");
+  await prompt.fill("Inspect this project");
+  await prompt.press("End");
+  await page.getByTestId("schedule-prompt-input-dictation-toggle").click();
+  await speech.waitForAudio(0);
+  await page.getByTestId("schedule-prompt-input-dictation-submit").click();
+  await speech.waitForFinish(0);
+  speech.complete("and summarize the status", 0);
+  await expect(prompt).toHaveValue("Inspect this project and summarize the status");
+  await expect(page.getByTestId("schedule-form-submit")).toBeDisabled();
+  expect((await workspace.client.scheduleList()).schedules).toEqual([]);
+  await page.getByTestId("schedule-project-trigger").click();
+  await page
+    .getByTestId(/^schedule-project-option-/)
+    .filter({ hasText: path.basename(workspace.directory) })
+    .click();
+  await page.getByTestId("schedule-model-trigger").click();
+  await page.getByTestId("model-search-all-input").fill("Five minute stream");
+  await page.getByTestId("model-row-mock-five-minute-stream").click();
+  await expect(page.getByTestId("model-search-all-input")).not.toBeVisible();
+  // An annual trigger always resolves to its next future occurrence. Creating
+  // this schedule exercises persistence without dispatching a coding agent.
+  await page.getByTestId("cadence-cron-expression").fill("0 0 1 1 *");
+  await expect(page.getByTestId("schedule-form-submit")).toBeEnabled();
+  await prompt.focus();
+  await prompt.press("End");
+  await page.getByTestId("schedule-prompt-input-dictation-toggle").click();
+  await speech.waitForAudio(1);
+  await page.getByTestId("schedule-prompt-input-dictation-submit").click();
+  await speech.waitForFinish(1);
+  const beforeSave = Date.now();
+  speech.complete("with clear next steps", 1);
+  speech.complete("with clear next steps", 1);
+  await expect(page.getByTestId("schedule-form-sheet")).not.toBeVisible();
+  const { schedules } = await workspace.client.scheduleList();
+  expect(schedules).toHaveLength(1);
+  const schedule = schedules[0]!;
+  expect(schedule).toMatchObject({
+    name: "Dictated future schedule",
+    prompt: "Inspect this project and summarize the status with clear next steps",
+    cadence: { type: "cron", expression: "0 0 1 1 *" },
+    target: {
+      type: "new-agent",
+      config: { provider: "mock", model: "five-minute-stream", cwd: workspace.directory },
+    },
+    lastRunAt: null,
+  });
+  expect(new Date(schedule.nextRunAt!).getTime()).toBeGreaterThan(beforeSave);
+  await page.getByTestId(`schedule-row-${schedule.id}`).click();
+  await expect(prompt).toHaveValue(schedule.prompt);
+  await expect(page.getByTestId("schedule-name-input")).toHaveValue(schedule.name!);
+  expect(speech.agentRequests).toEqual([]);
+  await expectMicrophoneReleased(page);
 });

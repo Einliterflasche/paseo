@@ -461,7 +461,14 @@ export function InlineReviewEditor({
   const handleBlur = useCallback(() => {
     setIsFocused(false);
   }, []);
-  const handleSave = useCallback(() => onSave(trimmedBody), [onSave, trimmedBody]);
+  const saveBody = useCallback(
+    (text: string) => {
+      const trimmed = text.trim();
+      if (trimmed.length > 0) onSave(trimmed);
+    },
+    [onSave],
+  );
+  const handleSave = useCallback(() => saveBody(body), [body, saveBody]);
 
   useEffect(() => {
     const element = getWebTextInputElement(inputRef.current);
@@ -515,6 +522,8 @@ export function InlineReviewEditor({
         multiline
         initialValue={body}
         onChangeText={setBody}
+        onDictationSubmit={saveBody}
+        dictationSubmitLabel={t("review.comment.save")}
         onFocus={handleFocus}
         onBlur={handleBlur}
         style={inputStyle}

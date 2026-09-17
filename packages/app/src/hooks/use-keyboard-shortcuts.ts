@@ -183,6 +183,7 @@ export function useKeyboardShortcuts({
         const store = useKeyboardShortcutsStore.getState();
         const result = dispatchDictationKeyboardAction({
           action: dictationAction,
+          modified: event?.ctrlKey || event?.metaKey,
           focusScope: event
             ? resolveKeyboardFocusScope({
                 target: event.target,

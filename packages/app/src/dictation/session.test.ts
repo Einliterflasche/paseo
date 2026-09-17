@@ -299,6 +299,40 @@ describe("shared dictation session", () => {
     await session.cancel(field.owner);
   });
 
+  it("keeps a microphone denial visible when stopped during permission", async () => {
+    const { session, target, audio, microphone, client } = fixture();
+    const field = target("field");
+    const permission = deferred<void>();
+    audio.start = () => permission.promise;
+    const starting = session.start(field.owner);
+    const confirming = session.confirm(field.owner);
+    permission.reject(new Error("permission denied"));
+    await Promise.all([starting, confirming]);
+
+    expect(session.getSnapshot()).toMatchObject({
+      owner: field.owner,
+      status: "idle",
+      error: "permission denied",
+      busy: false,
+    });
+    expect(field.errors).toEqual(["permission denied"]);
+    expect(field.transcripts).toEqual([]);
+    expect(audio.stops).toBe(1);
+    expect(microphone.getSnapshot()).toBe(null);
+    expect(client.streams).toEqual([]);
+    expect(client.finishes).toBe(0);
+
+    audio.start = async () => {
+      audio.capturing = true;
+    };
+    await session.start(field.owner);
+    session.handlePcmSegment("new recording");
+    await session.confirm(field.owner);
+    expect(field.transcripts).toEqual(["spoken words"]);
+    expect(session.getSnapshot()).toEqual(IDLE_DICTATION);
+    expect(microphone.getSnapshot()).toBe(null);
+  });
+
   it("replays buffered audio in order when the same host reconnects", async () => {
     const { session, target, client } = fixture();
     const field = target("field");

@@ -42,6 +42,27 @@ describe("dictation keyboard targets", () => {
     expect(actions).toEqual(["toggle"]);
   });
 
+  it("leaves Enter to a focused field button while retaining Escape and Ctrl+D ownership", () => {
+    const actions = register({ isActive: () => true, isControlFocused: () => true });
+    expect(dispatchDictationSessionKey({ key: "Enter" }, context)).toBe(false);
+    expect(actions).toEqual([]);
+    expect(dispatchDictationKeyboardAction({ ...context, action: "confirm" })).toBe("unhandled");
+    expect(actions).toEqual([]);
+    expect(dispatchDictationSessionKey({ key: "Escape" }, context)).toBe(true);
+    expect(dispatchDictationKeyboardAction(context)).toBe("handled");
+    expect(actions).toEqual(["cancel", "toggle"]);
+  });
+
+  it("intercepts modified Enter on a field button before an enclosing form can submit", () => {
+    const actions = register({ isActive: () => true, isControlFocused: () => true });
+    expect(dispatchDictationSessionKey({ key: "Enter", ctrlKey: true }, context)).toBe(true);
+    expect(dispatchDictationSessionKey({ key: "Enter", metaKey: true }, context)).toBe(true);
+    expect(dispatchDictationKeyboardAction({ ...context, action: "confirm", modified: true })).toBe(
+      "handled",
+    );
+    expect(actions).toEqual(["confirm", "confirm", "confirm"]);
+  });
+
   it("keeps Ctrl+D on the recording owner but leaves another field's Enter and Escape alone", () => {
     const active = register({ isActive: () => true, isFocused: () => false });
     const focused = register({ id: "other" });

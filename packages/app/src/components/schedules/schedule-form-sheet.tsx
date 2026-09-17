@@ -291,111 +291,122 @@ function OpenScheduleFormSheet({
     return agent.title?.trim() || "Untitled agent";
   }, [agents, schedule, serverId, state.selectedServerId]);
 
-  const persistPreferences = useCallback(async () => {
-    const provider = state.selectedProvider;
-    if (!provider) {
-      return;
-    }
-    await updatePreferences((current) =>
-      updateSelectionPreferences({
-        preferences: current,
-        provider,
-        model: state.selectedModel,
-        mode: state.selectedMode,
-        thinkingOptionId: state.selectedThinkingOptionId,
-        isolation: state.isolation,
-      }),
-    );
-  }, [
-    state.isolation,
-    state.selectedMode,
-    state.selectedModel,
-    state.selectedProvider,
-    state.selectedThinkingOptionId,
-    updatePreferences,
-  ]);
+  const persistPreferences = useCallback(
+    async (submittedState: ScheduleFormState) => {
+      const provider = submittedState.selectedProvider;
+      if (!provider) {
+        return;
+      }
+      await updatePreferences((current) =>
+        updateSelectionPreferences({
+          preferences: current,
+          provider,
+          model: submittedState.selectedModel,
+          mode: submittedState.selectedMode,
+          thinkingOptionId: submittedState.selectedThinkingOptionId,
+          isolation: submittedState.isolation,
+        }),
+      );
+    },
+    [updatePreferences],
+  );
 
-  const submitAgentTarget = useCallback(async (): Promise<boolean> => {
-    if (!schedule || !state.submitCadence) {
-      return false;
-    }
-    await updateSchedule({
-      id: schedule.id,
-      cadence: state.submitCadence,
-    });
-    return true;
-  }, [schedule, state.submitCadence, updateSchedule]);
-
-  const submitNewAgent = useCallback(async (): Promise<boolean> => {
-    const provider = state.selectedProvider;
-    const cwd = state.workingDir.trim();
-    if (!provider || !cwd) {
-      return false;
-    }
-
-    await persistPreferences();
-    const maxRuns = parseMaxRuns(state.maxRuns);
-    if (mode === "edit" && schedule) {
+  const submitAgentTarget = useCallback(
+    async (submittedState: ScheduleFormState): Promise<boolean> => {
+      if (!schedule || !submittedState.submitCadence) {
+        return false;
+      }
       await updateSchedule({
         id: schedule.id,
-        name: state.name.trim() || null,
-        prompt: state.prompt.trim(),
-        ...(state.submitCadence ? { cadence: state.submitCadence } : {}),
-        newAgentConfig: {
-          provider,
-          model: state.selectedModel || null,
-          modeId: state.selectedMode || null,
-          thinkingOptionId: state.selectedThinkingOptionId || null,
-          cwd,
-          ...(state.submitArchiveOnFinish !== undefined
-            ? { archiveOnFinish: state.submitArchiveOnFinish }
-            : {}),
-          ...(state.submitIsolation !== undefined ? { isolation: state.submitIsolation } : {}),
-        },
-        maxRuns,
+        cadence: submittedState.submitCadence,
       });
       return true;
-    }
+    },
+    [schedule, updateSchedule],
+  );
 
-    await createSchedule({
-      prompt: state.prompt.trim(),
-      name: state.name.trim() || undefined,
-      cadence: requireCronCadence(state.submitCadence),
-      target: {
-        type: "new-agent",
-        config: {
-          provider,
-          cwd,
-          model: state.selectedModel || undefined,
-          modeId: state.selectedMode || undefined,
-          thinkingOptionId: state.selectedThinkingOptionId || undefined,
-          ...(state.submitArchiveOnFinish !== undefined
-            ? { archiveOnFinish: state.submitArchiveOnFinish }
-            : {}),
-          ...(state.submitIsolation !== undefined ? { isolation: state.submitIsolation } : {}),
-          title: state.name.trim() || undefined,
+  const submitNewAgent = useCallback(
+    async (submittedState: ScheduleFormState): Promise<boolean> => {
+      const provider = submittedState.selectedProvider;
+      const cwd = submittedState.workingDir.trim();
+      if (!provider || !cwd) {
+        return false;
+      }
+
+      await persistPreferences(submittedState);
+      const maxRuns = parseMaxRuns(submittedState.maxRuns);
+      if (mode === "edit" && schedule) {
+        await updateSchedule({
+          id: schedule.id,
+          name: submittedState.name.trim() || null,
+          prompt: submittedState.prompt.trim(),
+          ...(submittedState.submitCadence ? { cadence: submittedState.submitCadence } : {}),
+          newAgentConfig: {
+            provider,
+            model: submittedState.selectedModel || null,
+            modeId: submittedState.selectedMode || null,
+            thinkingOptionId: submittedState.selectedThinkingOptionId || null,
+            cwd,
+            ...(submittedState.submitArchiveOnFinish !== undefined
+              ? { archiveOnFinish: submittedState.submitArchiveOnFinish }
+              : {}),
+            ...(submittedState.submitIsolation !== undefined
+              ? { isolation: submittedState.submitIsolation }
+              : {}),
+          },
+          maxRuns,
+        });
+        return true;
+      }
+
+      await createSchedule({
+        prompt: submittedState.prompt.trim(),
+        name: submittedState.name.trim() || undefined,
+        cadence: requireCronCadence(submittedState.submitCadence),
+        target: {
+          type: "new-agent",
+          config: {
+            provider,
+            cwd,
+            model: submittedState.selectedModel || undefined,
+            modeId: submittedState.selectedMode || undefined,
+            thinkingOptionId: submittedState.selectedThinkingOptionId || undefined,
+            ...(submittedState.submitArchiveOnFinish !== undefined
+              ? { archiveOnFinish: submittedState.submitArchiveOnFinish }
+              : {}),
+            ...(submittedState.submitIsolation !== undefined
+              ? { isolation: submittedState.submitIsolation }
+              : {}),
+            title: submittedState.name.trim() || undefined,
+          },
         },
-      },
-      ...(maxRuns != null ? { maxRuns } : {}),
-    });
-    return true;
-  }, [createSchedule, mode, persistPreferences, schedule, state, updateSchedule]);
+        ...(maxRuns != null ? { maxRuns } : {}),
+      });
+      return true;
+    },
+    [createSchedule, mode, persistPreferences, schedule, updateSchedule],
+  );
 
   const handleSubmit = useCallback(async () => {
-    if (!canSubmit) {
+    const current = model.getState();
+    const invalidCron =
+      current.cadence.type === "cron" && validateCron(current.cadence.expression) !== null;
+    if (!current.canSubmit || invalidCron || isSubmitting) {
       return;
     }
     model.setSubmitError(null);
     try {
       const submitted =
-        state.targetKind === "agent" ? await submitAgentTarget() : await submitNewAgent();
+        current.targetKind === "agent"
+          ? await submitAgentTarget(current)
+          : await submitNewAgent(current);
       if (submitted) {
         onClose();
       }
     } catch (error) {
       model.setSubmitError(toErrorMessage(error));
     }
-  }, [canSubmit, model, onClose, state.targetKind, submitAgentTarget, submitNewAgent]);
+  }, [isSubmitting, model, onClose, submitAgentTarget, submitNewAgent]);
 
   const handleSubmitPress = useCallback(() => {
     void handleSubmit();
@@ -452,6 +463,7 @@ function OpenScheduleFormSheet({
         cadenceError={cadenceError}
         mutationServerId={mutationServerId}
         isSubmitting={isSubmitting}
+        onSubmit={handleSubmitPress}
       />
     </AdaptiveModalSheet>
   );
@@ -466,6 +478,7 @@ interface ScheduleFormFieldsProps {
   cadenceError: string | null;
   mutationServerId: string;
   isSubmitting: boolean;
+  onSubmit: () => void;
 }
 
 function ScheduleFormFields({
@@ -477,6 +490,7 @@ function ScheduleFormFields({
   cadenceError,
   mutationServerId,
   isSubmitting,
+  onSubmit,
 }: ScheduleFormFieldsProps): ReactElement {
   if (state.targetKind === "agent") {
     return (
@@ -518,6 +532,8 @@ function ScheduleFormFields({
           accessibilityLabel="Prompt"
           initialValue={state.prompt}
           onChangeText={model.setPrompt}
+          onDictationSubmit={onSubmit}
+          dictationSubmitLabel={state.mode === "edit" ? "Save changes" : "Create schedule"}
           placeholder="What should the agent do each run?"
           style={styles.multilineInput}
           multiline

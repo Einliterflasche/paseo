@@ -1118,18 +1118,24 @@ function AppendSystemPromptCard({ serverId }: { serverId: string }) {
     setIsEditing(false);
   }, [isSaving, persistedPrompt]);
 
-  const handleSave = useCallback(() => {
-    setIsSaving(true);
-    void patchConfig({ appendSystemPrompt: draft })
-      .then(() => {
-        setIsEditing(false);
-        return;
-      })
-      .catch((error) => {
-        console.error("[HostPage] Failed to save append system prompt", error);
-      })
-      .finally(() => setIsSaving(false));
-  }, [draft, patchConfig]);
+  const savePrompt = useCallback(
+    (text: string) => {
+      if (isSaving || text === persistedPrompt) return;
+      setIsSaving(true);
+      void patchConfig({ appendSystemPrompt: text })
+        .then(() => {
+          setIsEditing(false);
+          return;
+        })
+        .catch((error) => {
+          console.error("[HostPage] Failed to save append system prompt", error);
+        })
+        .finally(() => setIsSaving(false));
+    },
+    [isSaving, patchConfig, persistedPrompt],
+  );
+
+  const handleSave = useCallback(() => savePrompt(draft), [draft, savePrompt]);
 
   const handleReset = useCallback(() => {
     setDraft(persistedPrompt);
@@ -1175,6 +1181,8 @@ function AppendSystemPromptCard({ serverId }: { serverId: string }) {
             accessibilityLabel={t("settings.host.orchestration.systemPrompt.accessibilityLabel")}
             value={draft}
             onChangeText={setDraft}
+            onDictationSubmit={savePrompt}
+            dictationSubmitLabel={t("settings.host.orchestration.systemPrompt.save")}
             placeholder={t("settings.host.orchestration.systemPrompt.placeholder")}
           />
           <View style={styles.appendPromptActions}>

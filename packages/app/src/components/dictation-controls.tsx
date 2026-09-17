@@ -1,7 +1,7 @@
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import { useMemo } from "react";
-import { View, Text, Pressable } from "react-native";
-import { StyleSheet, useUnistyles } from "react-native-unistyles";
+import { View, Text, Pressable, type StyleProp, type ViewStyle } from "react-native";
+import { StyleSheet, useUnistyles, withUnistyles } from "react-native-unistyles";
 import { X, ArrowUp, RefreshCcw, Check, Mic, Pencil } from "lucide-react-native";
 import { useTranslation } from "react-i18next";
 import { VolumeMeter } from "./volume-meter";
@@ -134,10 +134,21 @@ export function DictationControls({
   );
 }
 
-/**
- * Full-width overlay variant for the agent input footer.
- * Uses blue background with white icons.
- */
+interface DictationOverlayProps extends Omit<
+  DictationControlsProps,
+  "onStart" | "disabled" | "transcript" | "onAcceptAndSend"
+> {
+  errorText?: string;
+  onAcceptAndSend?: () => void;
+  submitLabel?: string;
+  allowCancelWhileProcessing?: boolean;
+  retryDisabled?: boolean;
+  compact?: boolean;
+  style?: StyleProp<ViewStyle>;
+  testID?: string;
+}
+
+/** Shared recording surface for the chat composer and dictatable text fields. */
 export function DictationOverlay({
   volume,
   duration,
@@ -150,119 +161,231 @@ export function DictationOverlay({
   onAcceptAndSend,
   onRetry,
   onDiscard,
-}: Omit<DictationControlsProps, "onStart" | "disabled" | "transcript"> & { errorText?: string }) {
-  const { theme } = useUnistyles();
+  submitLabel,
+  allowCancelWhileProcessing = false,
+  retryDisabled = false,
+  compact = false,
+  style,
+  testID,
+}: DictationOverlayProps) {
   const { t } = useTranslation();
   const isFailed = status === "failed";
   const showActiveState = isRecording || isProcessing || isFailed;
-  const actionsDisabled = isProcessing;
+  const cancelDisabled = isProcessing && !allowCancelWhileProcessing && !isFailed;
   const handleCancel = isFailed && onDiscard ? onDiscard : onCancel;
+  const iconSize = compact ? compactOverlayIcon : overlayIcon;
 
-  const containerStyle = useMemo(
-    () => [overlayStyles.container, { backgroundColor: theme.colors.accent }],
-    [theme.colors.accent],
-  );
-  const overlayCancelButtonStyle = useMemo(
-    () => [
-      overlayStyles.cancelButton,
-      actionsDisabled && !isFailed && overlayStyles.buttonDisabled,
-    ],
-    [actionsDisabled, isFailed],
-  );
-  const overlayTimerTextStyle = useMemo(
-    () => [overlayStyles.timerText, { color: theme.colors.accentForeground }],
-    [theme.colors.accentForeground],
-  );
-  const overlayTranscriptTextStyle = useMemo(
-    () => [overlayStyles.transcriptText, { color: theme.colors.accentForeground, opacity: 0.95 }],
-    [theme.colors.accentForeground],
-  );
-  const overlayRetryButtonStyle = useMemo(
-    () => [overlayStyles.actionButton, { backgroundColor: theme.colors.accentForeground }],
-    [theme.colors.accentForeground],
-  );
-  const overlayConfirmButtonStyle = overlayRetryButtonStyle;
-
-  if (!showActiveState) {
-    return null;
-  }
+  if (!showActiveState) return null;
 
   return (
-    <View style={containerStyle}>
+    <View
+      style={[overlayStyles.container, compact && overlayStyles.compactContainer, style]}
+      testID={overlayTestID(testID, "overlay")}
+    >
       <Pressable
         onPress={handleCancel}
-        disabled={actionsDisabled && !isFailed}
+        disabled={cancelDisabled}
         accessibilityRole="button"
         accessibilityLabel={t("message.dictation.cancel")}
-        style={overlayCancelButtonStyle}
+        testID={overlayTestID(testID, "cancel")}
+        style={[
+          overlayStyles.cancelButton,
+          compact && overlayStyles.compactButton,
+          cancelDisabled && overlayStyles.buttonDisabled,
+        ]}
       >
-        <X size={theme.iconSize.lg} color={theme.colors.accentForeground} strokeWidth={2.5} />
+        <OverlayX uniProps={iconSize} strokeWidth={2.5} />
       </Pressable>
 
-      <View style={overlayStyles.centerContainer}>
-        <View style={overlayStyles.meterRow}>
-          <VolumeMeter
+      <DictationOverlayCenter
+        volume={volume}
+        duration={duration}
+        compact={compact}
+        isFailed={isFailed}
+        errorText={errorText}
+        testID={testID}
+      />
+
+      <DictationOverlayActions
+        isProcessing={isProcessing}
+        isFailed={isFailed}
+        retryDisabled={retryDisabled}
+        compact={compact}
+        testID={testID}
+        onRetry={onRetry}
+        onAccept={onAccept}
+        onAcceptAndSend={onAcceptAndSend}
+        submitLabel={submitLabel}
+      />
+    </View>
+  );
+}
+
+function DictationOverlayCenter({
+  volume,
+  duration,
+  compact,
+  isFailed,
+  errorText,
+  testID,
+}: Pick<DictationOverlayProps, "volume" | "duration" | "compact" | "errorText" | "testID"> & {
+  isFailed: boolean;
+}) {
+  const { t } = useTranslation();
+  return (
+    <View style={overlayStyles.centerContainer}>
+      {!(compact && isFailed) ? (
+        <View style={[overlayStyles.meterRow, compact && overlayStyles.compactMeterRow]}>
+          <OverlayVolumeMeter
             volume={volume}
             isMuted={false}
             isSpeaking={false}
             orientation="horizontal"
-            color={theme.colors.accentForeground}
+            variant={compact ? "compact" : "default"}
+            uniProps={overlayForeground}
+            testID={overlayTestID(testID, "meter")}
           />
-          <Text style={overlayTimerTextStyle}>{formatDuration(duration)}</Text>
-        </View>
-        {isFailed ? (
-          <Text numberOfLines={2} style={overlayTranscriptTextStyle}>
-            {errorText
-              ? t("message.dictation.failed", { error: errorText })
-              : t("message.dictation.failedRetry")}
-          </Text>
-        ) : null}
-      </View>
-
-      <View style={overlayStyles.actionButtonsContainer}>
-        {actionsDisabled ? (
-          <View style={overlayStyles.loadingContainer}>
-            <LoadingSpinner size="small" color={theme.colors.accentForeground} />
-          </View>
-        ) : null}
-        {!actionsDisabled && isFailed ? (
-          <Pressable
-            onPress={onRetry}
-            accessibilityRole="button"
-            accessibilityLabel={t("message.dictation.retry")}
-            style={overlayRetryButtonStyle}
+          <Text
+            style={[overlayStyles.timerText, compact && overlayStyles.compactTimerText]}
+            testID={overlayTestID(testID, "status")}
           >
-            <RefreshCcw size={theme.iconSize.lg} color={theme.colors.accent} strokeWidth={2.5} />
-          </Pressable>
-        ) : null}
-        {!actionsDisabled && !isFailed ? (
-          <>
+            {formatDuration(duration)}
+          </Text>
+        </View>
+      ) : null}
+      {isFailed ? (
+        <Text
+          numberOfLines={2}
+          style={overlayStyles.transcriptText}
+          accessibilityRole="alert"
+          testID={overlayTestID(testID, "error")}
+        >
+          {errorText
+            ? t("message.dictation.failed", { error: errorText })
+            : t("message.dictation.failedRetry")}
+        </Text>
+      ) : null}
+    </View>
+  );
+}
+
+function DictationOverlayActions({
+  isProcessing,
+  isFailed,
+  retryDisabled,
+  compact,
+  testID,
+  onRetry,
+  onAccept,
+  onAcceptAndSend,
+  submitLabel,
+}: Pick<
+  DictationOverlayProps,
+  | "isProcessing"
+  | "retryDisabled"
+  | "compact"
+  | "testID"
+  | "onRetry"
+  | "onAccept"
+  | "onAcceptAndSend"
+  | "submitLabel"
+> & { isFailed: boolean }) {
+  const { t } = useTranslation();
+  const iconSize = compact ? compactOverlayIcon : overlayIcon;
+  const confirmIconSize = compact ? compactConfirmIcon : confirmIcon;
+  return (
+    <View style={overlayStyles.actionButtonsContainer}>
+      {isProcessing ? (
+        <View style={[overlayStyles.loadingContainer, compact && overlayStyles.compactButton]}>
+          <OverlaySpinner size="small" uniProps={overlayForeground} />
+        </View>
+      ) : null}
+      {!isProcessing && isFailed ? (
+        <Pressable
+          onPress={onRetry}
+          disabled={retryDisabled}
+          accessibilityRole="button"
+          accessibilityLabel={t("message.dictation.retry")}
+          testID={overlayTestID(testID, "retry")}
+          style={[
+            overlayStyles.actionButton,
+            overlayStyles.confirmButton,
+            compact && overlayStyles.compactButton,
+            retryDisabled && overlayStyles.buttonDisabled,
+          ]}
+        >
+          <OverlayRetry uniProps={confirmIconSize} strokeWidth={2.5} />
+        </Pressable>
+      ) : null}
+      {!isProcessing && !isFailed ? (
+        <>
+          {onAcceptAndSend ? (
             <Pressable
               onPress={onAccept}
               accessibilityRole="button"
               accessibilityLabel={t("message.dictation.insert")}
-              style={[overlayStyles.actionButton, OVERLAY_ACCEPT_BUTTON_BG]}
+              testID={overlayTestID(testID, "toggle")}
+              style={[
+                overlayStyles.actionButton,
+                OVERLAY_ACCEPT_BUTTON_BG,
+                compact && overlayStyles.compactButton,
+              ]}
             >
-              <Pencil
-                size={theme.iconSize.lg}
-                color={theme.colors.accentForeground}
-                strokeWidth={2.5}
-              />
+              <OverlayPencil uniProps={iconSize} strokeWidth={2.5} />
             </Pressable>
-            <Pressable
-              onPress={onAcceptAndSend}
-              accessibilityRole="button"
-              accessibilityLabel={t("message.dictation.insertAndSend")}
-              style={overlayConfirmButtonStyle}
-            >
-              <ArrowUp size={theme.iconSize.lg} color={theme.colors.accent} strokeWidth={2.5} />
-            </Pressable>
-          </>
-        ) : null}
-      </View>
+          ) : null}
+          <Pressable
+            onPress={onAcceptAndSend ?? onAccept}
+            accessibilityRole="button"
+            accessibilityLabel={
+              onAcceptAndSend
+                ? (submitLabel ?? t("message.dictation.insertAndSend"))
+                : t("message.dictation.insert")
+            }
+            testID={overlayTestID(testID, onAcceptAndSend ? "submit" : "toggle")}
+            style={[
+              overlayStyles.actionButton,
+              overlayStyles.confirmButton,
+              compact && overlayStyles.compactButton,
+            ]}
+          >
+            <OverlayArrow uniProps={confirmIconSize} strokeWidth={2.5} />
+          </Pressable>
+        </>
+      ) : null}
     </View>
   );
 }
+
+function overlayTestID(prefix: string | undefined, suffix: string) {
+  return prefix ? `${prefix}-${suffix}` : undefined;
+}
+
+const OverlayX = withUnistyles(X);
+const OverlayPencil = withUnistyles(Pencil);
+const OverlayArrow = withUnistyles(ArrowUp);
+const OverlayRetry = withUnistyles(RefreshCcw);
+const OverlayVolumeMeter = withUnistyles(VolumeMeter);
+const OverlaySpinner = withUnistyles(LoadingSpinner);
+const overlayForeground = (theme: import("@/styles/theme").Theme) => ({
+  color: theme.colors.accentForeground,
+});
+const overlayIcon = (theme: import("@/styles/theme").Theme) => ({
+  color: theme.colors.accentForeground,
+  size: theme.iconSize.lg,
+});
+const compactOverlayIcon = (theme: import("@/styles/theme").Theme) => ({
+  color: theme.colors.accentForeground,
+  size: theme.iconSize.md,
+});
+const confirmIcon = (theme: import("@/styles/theme").Theme) => ({
+  color: theme.colors.accent,
+  size: theme.iconSize.lg,
+});
+const compactConfirmIcon = (theme: import("@/styles/theme").Theme) => ({
+  color: theme.colors.accent,
+  size: theme.iconSize.md,
+});
 
 const BUTTON_SIZE = 32;
 
@@ -336,6 +459,7 @@ const OVERLAY_VERTICAL_PADDING = (FOOTER_HEIGHT - OVERLAY_BUTTON_SIZE) / 2;
 
 const overlayStyles = StyleSheet.create((theme) => ({
   container: {
+    backgroundColor: theme.colors.accent,
     flexDirection: "row",
     alignItems: "center",
     width: "100%",
@@ -367,16 +491,18 @@ const overlayStyles = StyleSheet.create((theme) => ({
     gap: theme.spacing[4],
   },
   timerText: {
+    color: theme.colors.accentForeground,
     fontSize: theme.fontSize.lg,
     fontWeight: theme.fontWeight.semibold,
     fontVariant: ["tabular-nums"],
   },
   transcriptText: {
+    color: theme.colors.accentForeground,
     fontSize: theme.fontSize.base,
     fontWeight: theme.fontWeight.normal,
     textAlign: "center",
     paddingHorizontal: theme.spacing[2],
-    opacity: 0.9,
+    opacity: 0.95,
   },
   actionButtonsContainer: {
     flexDirection: "row",
@@ -390,6 +516,14 @@ const overlayStyles = StyleSheet.create((theme) => ({
     alignItems: "center",
     justifyContent: "center",
   },
+  compactContainer: {
+    paddingHorizontal: theme.spacing[2],
+    paddingVertical: 0,
+  },
+  compactButton: { width: BUTTON_SIZE, height: BUTTON_SIZE },
+  compactMeterRow: { gap: theme.spacing[2] },
+  compactTimerText: { fontSize: theme.fontSize.base },
+  confirmButton: { backgroundColor: theme.colors.accentForeground },
   buttonDisabled: {
     opacity: 0.5,
   },

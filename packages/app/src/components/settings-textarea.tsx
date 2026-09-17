@@ -18,6 +18,8 @@ interface SettingsTextAreaProps {
   style?: StyleProp<TextStyle>;
   editable?: boolean;
   dictationServerId?: string | null;
+  onDictationSubmit?: (text: string) => void;
+  dictationSubmitLabel?: string;
 }
 
 export function SettingsTextArea({
@@ -29,6 +31,8 @@ export function SettingsTextArea({
   style,
   editable,
   dictationServerId,
+  onDictationSubmit,
+  dictationSubmitLabel,
 }: SettingsTextAreaProps) {
   const inputStyle = useMemo(() => [styles.input, style], [style]);
   const dictationInput = useRef<EditingTextInputHandle | null>(null);
@@ -47,6 +51,8 @@ export function SettingsTextArea({
         multiline
         initialValue={value}
         onChangeText={onChangeText}
+        onDictationSubmit={onDictationSubmit}
+        dictationSubmitLabel={dictationSubmitLabel}
         placeholder={placeholder}
         placeholderTextColor={styles.placeholder.color}
         style={inputStyle}
