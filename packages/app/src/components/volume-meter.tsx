@@ -12,6 +12,7 @@ import { StyleSheet, useUnistyles } from "react-native-unistyles";
 
 interface VolumeMeterProps {
   volume: number;
+  testID?: string;
   isMuted?: boolean;
   isSpeaking?: boolean;
   orientation?: "vertical" | "horizontal";
@@ -21,6 +22,7 @@ interface VolumeMeterProps {
 
 export function VolumeMeter({
   volume,
+  testID,
   isMuted = false,
   isSpeaking = false,
   orientation = "vertical",
@@ -185,7 +187,7 @@ export function VolumeMeter({
   );
 
   return (
-    <View style={containerStyle}>
+    <View style={containerStyle} testID={testID}>
       <ReanimatedAnimated.View style={line1CombinedStyle} />
       <View style={spacerStyle} />
       <ReanimatedAnimated.View style={line2CombinedStyle} />

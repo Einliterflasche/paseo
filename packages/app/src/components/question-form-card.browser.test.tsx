@@ -12,6 +12,13 @@ import { QuestionFormCard } from "./question-form-card";
 // Load translations so controls expose their real accessible names.
 void testI18n;
 
+vi.mock("@/runtime/host-runtime", () => ({
+  getHostRuntimeStore: () => ({
+    subscribe: () => () => {},
+    getSnapshot: () => null,
+  }),
+}));
+
 // App sources compile against the classic JSX runtime, which expects React on the global.
 beforeEach(() => vi.stubGlobal("React", React));
 

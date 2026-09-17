@@ -206,7 +206,7 @@ function guardedSession(
             question: "Same question",
             header: "repoUrl",
             options: [{ label: "First choice" }],
-            multiSelect: true,
+            multiSelect: false,
             allowOther: true,
           },
           {

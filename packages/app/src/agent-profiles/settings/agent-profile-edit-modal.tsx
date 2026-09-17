@@ -359,6 +359,8 @@ function OpenAgentProfileEditModal({
             serverId={serverId}
             initialValue={profile?.notes ?? ""}
             onChangeText={model.setNotes}
+            onDictationSubmit={handleSavePress}
+            dictationSubmitLabel={t("settings.host.agentProfiles.save")}
             placeholder={t("settings.host.agentProfiles.notesPlaceholder")}
             multiline
             numberOfLines={4}

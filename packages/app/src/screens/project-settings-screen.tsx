@@ -532,11 +532,17 @@ function ProjectConfigForm({
     },
   });
 
-  const handleSave = useCallback(() => {
-    if (writeError?.code === "stale_project_config") return;
-    const config = applyDraftToConfig({ draft, base: baseConfig });
-    saveMutation.mutate({ config, expectedRevision: revision });
-  }, [draft, baseConfig, revision, writeError, saveMutation]);
+  const saveDraft = useCallback(
+    (nextDraft: ProjectConfigDraft) => {
+      if (saveMutation.isPending || writeError?.code === "stale_project_config") return;
+      if (nextDraft.scripts.some((script) => validateScript(script, t).hasErrors)) return;
+      const config = applyDraftToConfig({ draft: nextDraft, base: baseConfig });
+      saveMutation.mutate({ config, expectedRevision: revision });
+    },
+    [baseConfig, revision, writeError, saveMutation, t],
+  );
+
+  const handleSave = useCallback(() => saveDraft(draft), [draft, saveDraft]);
 
   const handleReload = useCallback(() => {
     setWriteError(null);
@@ -563,6 +569,13 @@ function ProjectConfigForm({
         metadataPrompts: { ...d.metadataPrompts, [key]: text },
       })),
     [updateDraft],
+  );
+
+  const handleMetadataDictationSubmit = useCallback(
+    (key: MetadataPromptKey, text: string) => {
+      saveDraft({ ...draft, metadataPrompts: { ...draft.metadataPrompts, [key]: text } });
+    },
+    [draft, saveDraft],
   );
 
   const handleRemoveScript = useCallback(
@@ -774,6 +787,7 @@ function ProjectConfigForm({
             promptKey={key}
             value={draft.metadataPrompts[key]}
             onChange={handleMetadataPromptChange}
+            onDictationSubmit={handleMetadataDictationSubmit}
             flush={index === METADATA_PROMPT_KEYS.length - 1}
           />
         ))}
@@ -888,6 +902,7 @@ interface MetadataPromptSectionProps {
   promptKey: MetadataPromptKey;
   value: string;
   onChange: (key: MetadataPromptKey, text: string) => void;
+  onDictationSubmit: (key: MetadataPromptKey, text: string) => void;
   flush?: boolean;
 }
 
@@ -897,6 +912,7 @@ function MetadataPromptSection({
   promptKey,
   value,
   onChange,
+  onDictationSubmit,
   flush,
 }: MetadataPromptSectionProps) {
   const { t } = useTranslation();
@@ -905,6 +921,10 @@ function MetadataPromptSection({
   const handleChange = useCallback(
     (text: string) => onChange(promptKey, text),
     [onChange, promptKey],
+  );
+  const handleDictationSubmit = useCallback(
+    (text: string) => onDictationSubmit(promptKey, text),
+    [onDictationSubmit, promptKey],
   );
   return (
     <SettingsSection title={title} testID={meta.sectionTestID} flush={flush}>
@@ -915,6 +935,8 @@ function MetadataPromptSection({
         accessibilityLabel={title}
         value={value}
         onChangeText={handleChange}
+        onDictationSubmit={handleDictationSubmit}
+        dictationSubmitLabel={t("settings.project.actions.save")}
         placeholder={t(meta.placeholderKey)}
       />
     </SettingsSection>

@@ -20,6 +20,8 @@ import {
   shouldSubmitEmptyOnDismiss,
   type QuestionFormQuestion,
   type QuestionOption,
+  type QuestionSelections,
+  type QuestionOtherTexts,
 } from "./question-form-card-core";
 
 interface QuestionFormCardProps {
@@ -27,6 +29,11 @@ interface QuestionFormCardProps {
   permission: PendingPermission;
   onRespond: (response: AgentPermissionResponse) => void;
   isResponding: boolean;
+}
+
+interface QuestionAnswers {
+  selections: QuestionSelections;
+  otherTexts: QuestionOtherTexts;
 }
 
 const IS_WEB = isWeb;
@@ -271,6 +278,8 @@ interface QuestionOtherInputProps {
   isResponding: boolean;
   onChange: (qIndex: number, text: string) => void;
   onSubmit: () => void;
+  onDictationSubmit: (qIndex: number, text: string) => void;
+  dictationSubmitLabel: string;
 }
 
 function QuestionOtherInput({
@@ -284,6 +293,8 @@ function QuestionOtherInput({
   isResponding,
   onChange,
   onSubmit,
+  onDictationSubmit,
+  dictationSubmitLabel,
 }: QuestionOtherInputProps) {
   const { theme } = useUnistyles();
   const handleChange = useCallback(
@@ -291,6 +302,10 @@ function QuestionOtherInput({
       onChange(qIndex, text);
     },
     [onChange, qIndex],
+  );
+  const handleDictationSubmit = useCallback(
+    (text: string) => onDictationSubmit(qIndex, text),
+    [onDictationSubmit, qIndex],
   );
   const otherInputStyle = useMemo(
     () =>
@@ -316,6 +331,7 @@ function QuestionOtherInput({
       ref={inputRef}
       resetKey={resetKey}
       serverId={serverId}
+      testID={`question-form-answer-${qIndex + 1}`}
       // @ts-expect-error - outlineStyle is web-only
       style={otherInputStyle}
       accessibilityLabel={accessibilityLabel}
@@ -323,6 +339,8 @@ function QuestionOtherInput({
       placeholderTextColor={theme.colors.foregroundMuted}
       initialValue={value}
       onChangeText={handleChange}
+      onDictationSubmit={handleDictationSubmit}
+      dictationSubmitLabel={dictationSubmitLabel}
       onSubmitEditing={onSubmit}
       editable={!isResponding}
       blurOnSubmit={false}
@@ -413,25 +431,21 @@ export function QuestionFormCard({
     : false;
   const isLastQuestion = questions ? resolvedActiveQuestionIndex === questions.length - 1 : true;
 
-  const handleSubmit = useCallback(() => {
-    if (!questions || !allAnswered || isResponding) return;
-    setRespondingAction("submit");
-    onRespond({
-      behavior: "allow",
-      updatedInput: {
-        ...permission.request.input,
-        answers: buildQuestionFormAnswers(questions, selections, otherTexts),
-      },
-    });
-  }, [
-    questions,
-    allAnswered,
-    isResponding,
-    selections,
-    otherTexts,
-    onRespond,
-    permission.request.input,
-  ]);
+  const submitAnswers = useCallback(
+    (answers: QuestionAnswers) => {
+      if (!questions || isResponding) return;
+      if (!areQuestionsAnswered(questions, answers.selections, answers.otherTexts)) return;
+      setRespondingAction("submit");
+      onRespond({
+        behavior: "allow",
+        updatedInput: {
+          ...permission.request.input,
+          answers: buildQuestionFormAnswers(questions, answers.selections, answers.otherTexts),
+        },
+      });
+    },
+    [questions, isResponding, onRespond, permission.request.input],
+  );
 
   const handleDeny = useCallback(() => {
     if (!questions) return;
@@ -462,14 +476,51 @@ export function QuestionFormCard({
     [questions, selections, otherTexts],
   );
 
+  const applyPrimaryAction = useCallback(
+    (answers: QuestionAnswers) => {
+      if (!activeQuestion || isResponding) return;
+      if (!isLastQuestion) {
+        if (
+          !isQuestionAnswered(
+            activeQuestion,
+            resolvedActiveQuestionIndex,
+            answers.selections,
+            answers.otherTexts,
+          )
+        )
+          return;
+        setActiveQuestionIndex((index) => Math.min(index + 1, (questions?.length ?? 1) - 1));
+        return;
+      }
+      submitAnswers(answers);
+    },
+    [
+      activeQuestion,
+      resolvedActiveQuestionIndex,
+      submitAnswers,
+      isLastQuestion,
+      isResponding,
+      questions?.length,
+    ],
+  );
+
   const handlePrimaryAction = useCallback(() => {
-    if (!isLastQuestion) {
-      if (!activeQuestionAnswered || isResponding) return;
-      setActiveQuestionIndex((index) => Math.min(index + 1, (questions?.length ?? 1) - 1));
-      return;
-    }
-    handleSubmit();
-  }, [activeQuestionAnswered, handleSubmit, isLastQuestion, isResponding, questions?.length]);
+    applyPrimaryAction({ selections, otherTexts });
+  }, [applyPrimaryAction, selections, otherTexts]);
+
+  const handleDictationSubmit = useCallback(
+    (qIndex: number, text: string) => {
+      if (qIndex !== resolvedActiveQuestionIndex) return;
+      applyPrimaryAction({
+        selections:
+          text.length > 0 && !questions?.[qIndex]?.multiSelect
+            ? { ...selections, [qIndex]: new Set<number>() }
+            : selections,
+        otherTexts: { ...otherTexts, [qIndex]: text },
+      });
+    },
+    [applyPrimaryAction, resolvedActiveQuestionIndex, selections, otherTexts, questions],
+  );
 
   const dismissButtonStyle = useCallback(
     ({ pressed, hovered }: PressableStateCallbackType & { hovered?: boolean }) => [
@@ -600,6 +651,8 @@ export function QuestionFormCard({
               isResponding={isResponding}
               onChange={setOtherText}
               onSubmit={handlePrimaryAction}
+              onDictationSubmit={handleDictationSubmit}
+              dictationSubmitLabel={primaryActionLabel}
             />
           ) : null}
         </View>

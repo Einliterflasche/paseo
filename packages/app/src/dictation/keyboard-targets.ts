@@ -3,6 +3,8 @@ import type { KeyboardFocusScope } from "@/keyboard/actions";
 export interface DictationKeyboardTarget {
   id: string;
   isFocused: () => boolean;
+  /** Let a focused field button handle its own Enter activation. */
+  isControlFocused?: () => boolean;
   isVisible: () => boolean;
   /** Owns a recording, pending transcription, or recoverable failed session. */
   isActive: () => boolean;
@@ -12,6 +14,11 @@ export interface DictationKeyboardTarget {
 }
 
 const targets = new Map<string, DictationKeyboardTarget>();
+const independentKeyboardScopes = new Set<KeyboardFocusScope>([
+  "terminal",
+  "command-center",
+  "browser",
+]);
 
 interface DictationKeyboardContext {
   focusScope: KeyboardFocusScope;
@@ -25,6 +32,8 @@ export function dispatchDictationSessionKey(
     repeat?: boolean;
     shiftKey?: boolean;
     altKey?: boolean;
+    ctrlKey?: boolean;
+    metaKey?: boolean;
     isComposing?: boolean;
     keyCode?: number;
   },
@@ -36,7 +45,12 @@ export function dispatchDictationSessionKey(
   else if (event.key === "Enter" && !event.shiftKey && !event.altKey) action = "confirm";
   return (
     action !== null &&
-    dispatchDictationKeyboardAction({ ...context, action, repeat: event.repeat }) === "handled"
+    dispatchDictationKeyboardAction({
+      ...context,
+      action,
+      repeat: event.repeat,
+      modified: event.ctrlKey || event.metaKey,
+    }) === "handled"
   );
 }
 
@@ -47,18 +61,23 @@ export function registerDictationKeyboardTarget(target: DictationKeyboardTarget)
   };
 }
 
+interface DictationKeyboardActionInput extends DictationKeyboardContext {
+  action: "toggle" | "cancel" | "confirm";
+  repeat?: boolean;
+  modified?: boolean;
+}
+
+function isFocusedControlActivation(
+  input: DictationKeyboardActionInput,
+  target: DictationKeyboardTarget,
+): boolean {
+  return input.action === "confirm" && !input.modified && target.isControlFocused?.() === true;
+}
+
 export function dispatchDictationKeyboardAction(
-  input: DictationKeyboardContext & {
-    action: "toggle" | "cancel" | "confirm";
-    repeat?: boolean;
-  },
+  input: DictationKeyboardActionInput,
 ): "handled" | "composer" | "unhandled" {
-  if (
-    input.commandCenterOpen ||
-    input.focusScope === "terminal" ||
-    input.focusScope === "command-center" ||
-    input.focusScope === "browser"
-  ) {
+  if (input.commandCenterOpen || independentKeyboardScopes.has(input.focusScope)) {
     return "unhandled";
   }
   const entries = Array.from(targets.values());
@@ -74,6 +93,7 @@ export function dispatchDictationKeyboardAction(
     ) {
       return "unhandled";
     }
+    if (isFocusedControlActivation(input, target)) return "unhandled";
     if (!input.repeat) target[input.action]();
     return "handled";
   }

@@ -279,6 +279,9 @@ export function createDictationSession({ audio, microphone }: DictationSessionDe
       publish({ ...snapshot, isProcessing: true, error: null });
       try {
         await stopCapture(session);
+        // Teardown tolerates a denied start so it can release the microphone.
+        // Confirmation must preserve that failure instead of completing empty.
+        await session.start;
         if (!isCurrent(session) || session.attempt !== attempt) return;
         publish({ ...snapshot, status: "uploading", isRecording: false });
         if (targets.get(owner)?.canConfirm?.() === false) {

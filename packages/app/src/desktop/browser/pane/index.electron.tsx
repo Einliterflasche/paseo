@@ -1600,9 +1600,10 @@ function BrowserElementAnnotationCard({
   const commentRef = useRef(comment);
   commentRef.current = comment;
 
+  const submitComment = useCallback((text: string) => onSubmit({ comment: text }), [onSubmit]);
   const handleSubmit = useCallback(() => {
-    onSubmit({ comment: commentRef.current });
-  }, [onSubmit]);
+    submitComment(commentRef.current);
+  }, [submitComment]);
 
   const handleKeyDown = useCallback(
     (event: KeyboardEvent) => {
@@ -1663,6 +1664,8 @@ function BrowserElementAnnotationCard({
             accessibilityLabel={t("workspace.browser.annotate.placeholder")}
             multiline
             onChangeText={setComment}
+            onDictationSubmit={submitComment}
+            dictationSubmitLabel={t("workspace.browser.annotate.submit")}
             placeholder={t("workspace.browser.annotate.placeholder")}
             style={styles.annotationInput}
             uniProps={annotationInputMapping}
