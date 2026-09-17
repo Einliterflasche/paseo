@@ -1561,6 +1561,12 @@ export const fr: TranslationResources = {
     },
   },
   onboarding: {
+    thisServer: {
+      title: "Se connecter à ce serveur",
+      otherHost: "Se connecter à un autre hôte",
+      incorrectPassword: "Mot de passe incorrect",
+      connectionError: "Connexion impossible : {{detail}}",
+    },
     title: "Bienvenue surPaseo",
     subtitle: "Connectez votre ordinateur pour commencer",
     actions: {

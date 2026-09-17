@@ -470,7 +470,10 @@ Or persist it in `config.json`:
 
 When enabled, opening the daemon HTTP origin (for example `http://localhost:6767/`) serves the web app. The same HTTP server continues to serve `/api/*`, `/mcp/*`, `/public/*`, the WebSocket upgrade, and service-proxy routes. Static files load without daemon bearer auth; API and WebSocket calls still enforce auth.
 
-The served app auto-bootstraps a connection to the same origin, so opening `http://localhost:6767/` directly usually skips the Add Host step.
+The served app uses the daemon-injected page marker to enable same-origin login.
+The browser URL owns the connection address, port, and TLS choice; do not infer
+these from the daemon's internal listen address behind a proxy. See the
+[connection flow](../public-docs/web-ui.md#how-the-connection-works).
 
 Build the artifact for packaging or measurement with:
 

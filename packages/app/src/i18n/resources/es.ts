@@ -1557,6 +1557,12 @@ export const es: TranslationResources = {
     },
   },
   onboarding: {
+    thisServer: {
+      title: "Conectar a este servidor",
+      otherHost: "Conectar a otro host",
+      incorrectPassword: "Contraseña incorrecta",
+      connectionError: "No se pudo conectar: {{detail}}",
+    },
     title: "Bienvenido aPaseo",
     subtitle: "Conecte su computadora para comenzar",
     actions: {

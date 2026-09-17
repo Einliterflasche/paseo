@@ -1496,6 +1496,12 @@ export const zhCN: TranslationResources = {
     },
   },
   onboarding: {
+    thisServer: {
+      title: "连接此服务器",
+      otherHost: "连接其他主机",
+      incorrectPassword: "密码错误",
+      connectionError: "无法连接：{{detail}}",
+    },
     title: "欢迎使用 Paseo",
     subtitle: "连接你的电脑即可开始",
     actions: {

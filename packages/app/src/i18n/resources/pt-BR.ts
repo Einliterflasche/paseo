@@ -1543,6 +1543,12 @@ export const ptBR: TranslationResources = {
     },
   },
   onboarding: {
+    thisServer: {
+      title: "Conectar a este servidor",
+      otherHost: "Conectar a outro host",
+      incorrectPassword: "Senha incorreta",
+      connectionError: "Não foi possível conectar: {{detail}}",
+    },
     title: "Bem-vindo ao Paseo",
     subtitle: "Conecte seu computador para começar",
     actions: {

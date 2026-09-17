@@ -1523,6 +1523,12 @@ export const ko: TranslationResources = {
     },
   },
   onboarding: {
+    thisServer: {
+      title: "이 서버에 연결",
+      otherHost: "다른 호스트에 연결",
+      incorrectPassword: "비밀번호가 올바르지 않습니다",
+      connectionError: "연결할 수 없습니다: {{detail}}",
+    },
     title: "Paseo에 오신 것을 환영합니다",
     subtitle: "시작하려면 컴퓨터를 연결하세요",
     actions: {

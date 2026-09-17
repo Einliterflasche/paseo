@@ -93,12 +93,7 @@ function isIncorrectPasswordFailure(input: {
     return false;
   }
   const details = [input.reason, input.lastError].filter(Boolean).join("\n").toLowerCase();
-  return (
-    details.includes("401") ||
-    details.includes("4001") ||
-    details.includes("unauthorized") ||
-    details.includes("code 1006")
-  );
+  return details.includes("401") || details.includes("4001") || details.includes("unauthorized");
 }
 
 export class DaemonConnectionTestError extends Error {

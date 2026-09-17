@@ -170,6 +170,7 @@ describe("resolveStartupRoute", () => {
     route: { kind: "index" as const, pathname: "/" },
     startupBlocker: { kind: "none" as const },
     hostRegistryStatus: "ready" as const,
+    initialDaemonConnection: null,
     hosts: [],
     anyOnlineHostServerId: null,
     workspaceSelection: null,
@@ -294,6 +295,37 @@ describe("resolveStartupRoute", () => {
         hasGivenUpWaitingForHost: true,
       }),
     ).toEqual({ kind: "redirect", href: "/welcome" });
+  });
+
+  it.each(["connecting", "password-required", "error"] as const)(
+    "shows same-origin login immediately while %s without waiting for the startup timer",
+    (status) => {
+      expect(
+        resolveStartupRoute({
+          ...baseIndexInput,
+          initialDaemonConnection: {
+            hint: { listen: "browser-host:8443", useTls: true },
+            status,
+            error: null,
+          },
+        }),
+      ).toEqual({ kind: "redirect", href: "/welcome" });
+    },
+  );
+
+  it("preserves remembered workspace routing when same-origin login is unavailable", () => {
+    expect(
+      resolveStartupRoute({
+        ...baseIndexInput,
+        hosts: [{ serverId: "server-1" }],
+        workspaceSelection: { serverId: "server-1", workspaceId: "workspace-a" },
+        initialDaemonConnection: {
+          hint: { listen: "browser-host:8443", useTls: true },
+          status: "error",
+          error: "Connection timed out",
+        },
+      }),
+    ).toEqual({ kind: "redirect", href: "/h/server-1" });
   });
 
   it("keeps host routes mounted while the host registry is loading", () => {

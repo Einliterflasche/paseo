@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
-import { Pressable, Text, View, ScrollView } from "react-native";
+import { Text, View, ScrollView } from "react-native";
 import { useRouter } from "expo-router";
-import { StyleSheet, useUnistyles } from "react-native-unistyles";
+import { StyleSheet } from "react-native-unistyles";
 import {
   QrCode,
   Link2,
@@ -13,7 +13,13 @@ import {
 } from "lucide-react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { HostProfile } from "@/types/host-connection";
-import { getHostRuntimeStore, isHostRuntimeConnected, useHosts } from "@/runtime/host-runtime";
+import {
+  getHostRuntimeStore,
+  isHostRuntimeConnected,
+  useHosts,
+  useInitialDaemonConnection,
+} from "@/runtime/host-runtime";
+import { SameOriginLogin } from "./same-origin-login";
 import { AddHostModal } from "./add-host-modal";
 import { AddRemoteSshHostModal } from "./add-remote-ssh-host-modal";
 import { PairLinkModal } from "./pair-link-modal";
@@ -44,12 +50,12 @@ const styles = StyleSheet.create((theme) => ({
   scrollView: {
     flex: 1,
   },
-  container: {
+  container: (bottomInset: number) => ({
     flexGrow: 1,
     padding: theme.spacing[6],
-    paddingBottom: 0,
+    paddingBottom: theme.spacing[6] + bottomInset,
     alignItems: "center",
-  },
+  }),
   content: {
     width: "100%",
     flexGrow: 1,
@@ -76,40 +82,6 @@ const styles = StyleSheet.create((theme) => ({
     width: "100%",
     maxWidth: 420,
     gap: theme.spacing[3],
-  },
-  actionButton: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: theme.spacing[3],
-    paddingVertical: theme.spacing[4],
-    borderRadius: theme.borderRadius.xl,
-    backgroundColor: theme.colors.surface2,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-  },
-  actionButtonPrimary: {
-    backgroundColor: theme.colors.accent,
-    borderColor: theme.colors.accent,
-  },
-  actionText: {
-    color: theme.colors.foreground,
-    fontSize: theme.fontSize.base,
-    fontWeight: theme.fontWeight.medium,
-  },
-  actionTextPrimary: {
-    color: theme.colors.accentForeground,
-  },
-  setupLink: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 6,
-  },
-  setupLinkText: {
-    color: theme.colors.accent,
-    fontSize: theme.fontSize.base,
-    fontWeight: theme.fontWeight.medium,
   },
   versionLabel: {
     color: theme.colors.foregroundMuted,
@@ -167,7 +139,6 @@ export interface WelcomeScreenProps {
 }
 
 export function WelcomeScreen({ onHostAdded }: WelcomeScreenProps) {
-  const { theme } = useUnistyles();
   const { t } = useTranslation();
   const insets = useSafeAreaInsets();
   const router = useRouter();
@@ -177,6 +148,11 @@ export function WelcomeScreen({ onHostAdded }: WelcomeScreenProps) {
   const [isRemoteSshOpen, setIsRemoteSshOpen] = useState(false);
   const [isPasteLinkOpen, setIsPasteLinkOpen] = useState(false);
   const hosts = useHosts();
+  const initialConnection = useInitialDaemonConnection();
+  const [showOtherHosts, setShowOtherHosts] = useState(false);
+  const showThisServer = initialConnection !== null && !showOtherHosts;
+  const handleOtherHost = useCallback(() => setShowOtherHosts(true), []);
+  const handleThisServer = useCallback(() => setShowOtherHosts(false), []);
   const anyOnlineServerId = useAnyHostOnline(hosts.map((h) => h.serverId));
 
   useEffect(() => {
@@ -272,16 +248,11 @@ export function WelcomeScreen({ onHostAdded }: WelcomeScreenProps) {
     });
   }
 
-  const scrollContentContainerStyle = useMemo(
-    () => [styles.container, { paddingBottom: theme.spacing[6] + insets.bottom }],
-    [theme.spacing, insets.bottom],
-  );
-
   return (
     <View style={styles.root}>
       <ScrollView
         style={styles.scrollView}
-        contentContainerStyle={scrollContentContainerStyle}
+        contentContainerStyle={styles.container(insets.bottom)}
         showsVerticalScrollIndicator={false}
         testID="welcome-screen"
       >
@@ -289,19 +260,44 @@ export function WelcomeScreen({ onHostAdded }: WelcomeScreenProps) {
           <PaseoLogo size={96} />
           <View style={styles.copyBlock}>
             <Text style={styles.title}>{t("onboarding.title")}</Text>
-            <Text style={styles.subtitle}>{t("onboarding.subtitle")}</Text>
+            {!showThisServer ? (
+              <Text style={styles.subtitle}>{t("onboarding.subtitle")}</Text>
+            ) : null}
             {isNative ? (
-              <Pressable style={styles.setupLink} onPress={handleOpenPaseoSite}>
-                <Text style={styles.setupLinkText}>paseo.sh</Text>
-                <ExternalLink size={14} color={theme.colors.accent} />
-              </Pressable>
+              <Button
+                variant="ghost"
+                size="sm"
+                leftIcon={ExternalLink}
+                onPress={handleOpenPaseoSite}
+              >
+                paseo.sh
+              </Button>
             ) : null}
           </View>
 
           <View style={styles.actions}>
-            {actions.map((action) => (
-              <WelcomeActionButton key={action.key} action={action} />
-            ))}
+            {showThisServer ? (
+              <SameOriginLogin connection={initialConnection} onOtherHost={handleOtherHost} />
+            ) : (
+              <>
+                {initialConnection ? (
+                  <Button variant="default" onPress={handleThisServer} testID="welcome-this-server">
+                    {t("onboarding.thisServer.title")}
+                  </Button>
+                ) : null}
+                {actions.map((action) => (
+                  <Button
+                    key={action.key}
+                    variant={action.primary && !initialConnection ? "default" : "secondary"}
+                    leftIcon={action.icon}
+                    onPress={action.onPress}
+                    testID={action.testID}
+                  >
+                    {action.label}
+                  </Button>
+                ))}
+              </>
+            )}
           </View>
 
           <Button
@@ -336,31 +332,5 @@ export function WelcomeScreen({ onHostAdded }: WelcomeScreenProps) {
         />
       </ScrollView>
     </View>
-  );
-}
-
-interface WelcomeActionButtonProps {
-  action: WelcomeAction;
-}
-
-function WelcomeActionButton({ action }: WelcomeActionButtonProps) {
-  const { theme } = useUnistyles();
-  const Icon = action.icon;
-  const buttonStyle = useMemo(
-    () => [styles.actionButton, action.primary ? styles.actionButtonPrimary : null],
-    [action.primary],
-  );
-  const textStyle = useMemo(
-    () => [styles.actionText, action.primary ? styles.actionTextPrimary : null],
-    [action.primary],
-  );
-  return (
-    <Pressable style={buttonStyle} onPress={action.onPress} testID={action.testID}>
-      <Icon
-        size={18}
-        color={action.primary ? theme.colors.accentForeground : theme.colors.foreground}
-      />
-      <Text style={textStyle}>{action.label}</Text>
-    </Pressable>
   );
 }

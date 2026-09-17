@@ -1540,6 +1540,12 @@ export const ru: TranslationResources = {
     },
   },
   onboarding: {
+    thisServer: {
+      title: "Подключиться к этому серверу",
+      otherHost: "Подключиться к другому хосту",
+      incorrectPassword: "Неверный пароль",
+      connectionError: "Не удалось подключиться: {{detail}}",
+    },
     title: "Добро пожаловать в Paseo",
     subtitle: "Подключите компьютер, чтобы начать",
     actions: {

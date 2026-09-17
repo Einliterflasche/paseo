@@ -54,7 +54,18 @@ If your daemon doesn't recognize `--web-ui`, update it, the flag was added with 
 
 ## How the connection works
 
-The page is served from the same origin as the daemon's API and WebSocket. When you open it, the app automatically connects back to that same origin, so you usually skip the "Add Host" step entirely, open `http://localhost:6767/` and you're looking at your agents.
+Open the daemon's address and enter its password under **Connect to this server**.
+The app takes the hostname, port, and TLS setting from the browser URL. An HTTPS
+page uses a secure WebSocket, including when a proxy forwards to the daemon over
+plain HTTP. You do not need to copy the address or choose a connection method.
+
+Saved connections reconnect with their stored credentials. A daemon without a
+password connects automatically. If the password is incorrect or the connection
+fails, the page keeps the server address and lets you retry. **Connect to another
+host** opens the other connection methods.
+
+This flow is enabled by a marker in pages served by the daemon. A separately
+hosted web client keeps the normal host setup screen.
 
 The same HTTP server keeps serving the API (`/api/*`), MCP (`/mcp/*`), service-proxy routes, and the WebSocket upgrade. Only the static files are new. To point the served UI at a _different_ daemon, add that daemon as a host from the UI as usual.
 
@@ -108,7 +119,7 @@ A working proxy must:
 - **Not buffer responses.** Terminal output and other live streams are long-lived; buffering makes the UI look frozen.
 - **Use long read timeouts.** Those streams stay open for the life of a session.
 - **Allow large request bodies.** Prompts and file uploads can be big.
-- **Preserve the `Host` header and pass `X-Forwarded-Proto`.** The daemon uses these to tell the app which origin and scheme (`wss://` vs `ws://`) to connect back on. Drop them and auto-connect points at the wrong place.
+- **Preserve the `Host` header and pass `X-Forwarded-Proto`.** These keep the daemon's host and WebSocket origin checks consistent with the public URL.
 
 ### Nginx
 
@@ -162,7 +173,7 @@ That's the whole config. Caddy provisions a certificate automatically and preser
 
 ## HTTPS and TLS
 
-Terminate TLS at the proxy (or tunnel) and forward to the daemon over plain HTTP on localhost, that's what the configs above do. When the page is served over HTTPS and the proxy passes `X-Forwarded-Proto: https`, the app automatically connects back over `wss://`. You don't configure the scheme anywhere; it follows the edge.
+Terminate TLS at the proxy (or tunnel) and forward to the daemon over plain HTTP on localhost, as in the configs above. The bundled app derives its connection scheme from the browser URL: HTTPS uses `wss://`, and HTTP uses `ws://`.
 
 The daemon trusts forwarded headers from loopback proxies by default, which is what all the setups above do, the proxy or tunnel forwards to `127.0.0.1:6767`.
 
@@ -184,7 +195,8 @@ PASEO_TRUSTED_PROXIES=loopback,172.16.0.0/12 paseo daemon start --web-ui
 
 Only use `trustedProxies: true` when your final trusted proxy overwrites client-supplied `X-Forwarded-*` headers. Otherwise a client could spoof forwarded header values.
 
-If you serve the UI over HTTPS but the app tries to connect over `ws://` (and the browser blocks it as mixed content), your proxy isn't forwarding `X-Forwarded-Proto` or the daemon doesn't trust the proxy address. Fix whichever applies.
+For a manually added connection from an HTTPS page, enable SSL when entering the
+host. Browsers block insecure WebSocket connections from an HTTPS page.
 
 For the remote/relay path (driving a daemon through the Paseo relay rather than a reverse proxy), the relay has its own public-vs-internal TLS settings, see [Security](/docs/security).
 
@@ -224,7 +236,7 @@ For the full threat model, relay encryption, and DNS-rebinding details, see [Sec
 - **Blank page or 404 at `/`.** The web UI isn't enabled. Start the daemon with `--web-ui` and confirm with `paseo daemon status` that it's the daemon you're hitting.
 - **Page loads but never connects.** The proxy isn't forwarding the WebSocket upgrade, or it's stripping the `Host` header. Check the upgrade headers in your proxy config.
 - **Connects, then output freezes.** Response buffering is on, or read timeouts are too short. Disable buffering and raise the timeouts.
-- **"Mixed content" / connection blocked over HTTPS.** The app fell back to `ws://`. Either the proxy isn't sending `X-Forwarded-Proto: https`, or the daemon doesn't trust the proxy address. Forward the header and configure `daemon.trustedProxies` if the proxy is not loopback.
+- **"Mixed content" / connection blocked over HTTPS.** Check SSL on manually added connections. **Connect to this server** follows the browser URL's HTTPS setting automatically.
 - **`403 Invalid Host header`.** Your domain isn't in the allowlist. Add it with `--hostnames` or `daemon.hostnames`, see [DNS rebinding protection](/docs/security#dns-rebinding-protection).
 - **Large prompts or uploads fail.** Raise the proxy's max body size (`client_max_body_size` in Nginx).
 

@@ -1523,6 +1523,12 @@ export const en = {
     },
   },
   onboarding: {
+    thisServer: {
+      title: "Connect to this server",
+      otherHost: "Connect to another host",
+      incorrectPassword: "Incorrect password",
+      connectionError: "Unable to connect: {{detail}}",
+    },
     title: "Welcome to Paseo",
     subtitle: "Connect your computer to get started",
     actions: {

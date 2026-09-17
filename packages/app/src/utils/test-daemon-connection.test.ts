@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DaemonClientConfig } from "@getpaseo/client/internal/daemon-client";
-import type { DaemonConnectionDependencies, DaemonProbeClient } from "./test-daemon-connection";
+import {
+  connectToDaemon,
+  type DaemonConnectionDependencies,
+  type DaemonProbeClient,
+} from "./test-daemon-connection";
 
 class FakeDaemonClient implements DaemonProbeClient {
   readonly lastError: string | null;
@@ -71,12 +75,10 @@ describe("test-daemon-connection connectToDaemon", () => {
   let probe: FakeDaemonProbe;
 
   beforeEach(() => {
-    vi.stubGlobal("__DEV__", false);
     probe = new FakeDaemonProbe();
   });
 
   it("reuses the app clientId for direct connections", async () => {
-    const { connectToDaemon } = await import("./test-daemon-connection");
     const first = await connectToDaemon(
       {
         id: "direct:lan:6767",
@@ -106,7 +108,6 @@ describe("test-daemon-connection connectToDaemon", () => {
   });
 
   it("keeps direct TCP probes on the renderer WebSocket", async () => {
-    const { connectToDaemon } = await import("./test-daemon-connection");
     const deps = {
       ...probe.deps,
       createWebSocketTransportFactory: () => {
@@ -129,7 +130,6 @@ describe("test-daemon-connection connectToDaemon", () => {
   });
 
   it("encodes the local socket target into the client config", async () => {
-    const { connectToDaemon } = await import("./test-daemon-connection");
     const result = await connectToDaemon(
       {
         id: "socket:/tmp/paseo.sock",
@@ -145,7 +145,6 @@ describe("test-daemon-connection connectToDaemon", () => {
   });
 
   it("uses the desktop transport for Remote SSH connections", async () => {
-    const { connectToDaemon } = await import("./test-daemon-connection");
     const transportFactory = vi.fn();
     const result = await connectToDaemon(
       {
@@ -170,7 +169,6 @@ describe("test-daemon-connection connectToDaemon", () => {
   });
 
   it("passes direct TCP connection passwords into the client config", async () => {
-    const { connectToDaemon } = await import("./test-daemon-connection");
     const result = await connectToDaemon(
       {
         id: "direct:lan:6767",
@@ -187,7 +185,6 @@ describe("test-daemon-connection connectToDaemon", () => {
   });
 
   it("passes performance tracing into the connected client", async () => {
-    const { connectToDaemon } = await import("./test-daemon-connection");
     const trace = {
       isEnabled: () => true,
       beginSection: vi.fn(),
@@ -208,7 +205,6 @@ describe("test-daemon-connection connectToDaemon", () => {
   });
 
   it("uses relay TLS from the stored connection", async () => {
-    const { connectToDaemon } = await import("./test-daemon-connection");
     const tlsResult = await connectToDaemon(
       {
         id: "relay:wss:[::1]:443",
@@ -240,7 +236,6 @@ describe("test-daemon-connection connectToDaemon", () => {
   });
 
   it("surfaces auth rejection as an incorrect password", async () => {
-    const { connectToDaemon } = await import("./test-daemon-connection");
     probe.failNextConnection(
       new Error("Transport closed (code 4001)"),
       "Transport closed (code 4001)",
@@ -263,7 +258,6 @@ describe("test-daemon-connection connectToDaemon", () => {
   });
 
   it("keeps generic transport failures generic when a password was supplied", async () => {
-    const { connectToDaemon } = await import("./test-daemon-connection");
     probe.failNextConnection(new Error("Transport error"), "Transport error");
 
     await expect(
@@ -279,6 +273,27 @@ describe("test-daemon-connection connectToDaemon", () => {
       ),
     ).rejects.toMatchObject({
       message: "Transport error",
+    });
+  });
+
+  it("keeps abnormal WebSocket closure as a transport failure when a password was supplied", async () => {
+    probe.failNextConnection(new Error("Transport closed (code 1006)"), "Transport error");
+
+    await expect(
+      connectToDaemon(
+        {
+          id: "direct:lan:6767",
+          type: "directTcp",
+          endpoint: "lan:6767",
+          password: "shared-secret",
+        },
+        undefined,
+        probe.deps,
+      ),
+    ).rejects.toMatchObject({
+      message: "Transport closed (code 1006)",
+      reason: "Transport closed (code 1006)",
+      lastError: "Transport error",
     });
   });
 });
