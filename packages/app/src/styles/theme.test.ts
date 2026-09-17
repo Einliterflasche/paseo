@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { resolveSyntaxColors } from "@getpaseo/highlight";
 import {
   darkPureBlackTheme,
   darkTheme,
@@ -22,6 +23,15 @@ describe("Typography scale", () => {
       "4xl": 26,
     });
   });
+});
+
+describe("Initial code syntax", () => {
+  it.each(THEME_OPTIONS.filter((option) => option.name !== "auto"))(
+    "uses the matching Catppuccin palette on $name",
+    ({ theme }) => {
+      expect(theme.colors.syntax).toEqual(resolveSyntaxColors("catppuccin", theme.colorScheme));
+    },
+  );
 });
 
 describe("Theme catalog", () => {

@@ -1,5 +1,7 @@
 import { Platform } from "react-native";
-import { darkHighlightColors, lightHighlightColors } from "@getpaseo/highlight";
+import { resolveSyntaxColors, type SyntaxThemeId } from "@getpaseo/highlight";
+
+export const DEFAULT_SYNTAX_THEME = "catppuccin" satisfies SyntaxThemeId;
 
 export const baseColors = {
   // Base colors
@@ -681,7 +683,7 @@ export function buildDarkTheme(semanticColors: ReturnType<typeof buildDarkSemant
     colors: {
       ...semanticColors,
       palette: baseColors,
-      syntax: darkHighlightColors,
+      syntax: resolveSyntaxColors(DEFAULT_SYNTAX_THEME, "dark"),
     },
     shadow: darkShadow,
     ...commonTheme,
@@ -743,7 +745,7 @@ export function buildLightTheme(semanticColors: ReturnType<typeof buildLightSema
     colors: {
       ...semanticColors,
       palette: baseColors,
-      syntax: lightHighlightColors,
+      syntax: resolveSyntaxColors(DEFAULT_SYNTAX_THEME, "light"),
     },
     shadow: lightShadow,
     ...commonTheme,

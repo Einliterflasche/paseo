@@ -685,7 +685,7 @@ describe("appearance settings", () => {
     expect(result.uiBaseFontSize).toBe(DEFAULT_UI_BASE_FONT_SIZE);
     expect(result.contentFontSize).toBe(DEFAULT_UI_BASE_FONT_SIZE);
     expect(result.codeFontSize).toBe(DEFAULT_CODE_FONT_SIZE);
-    expect(result.syntaxTheme).toBe("one");
+    expect(result.syntaxTheme).toBe("catppuccin");
     expect(result.toolCallDetailLevel).toBe("detailed");
   });
 
@@ -916,6 +916,35 @@ describe("appearance settings", () => {
     expect((await loadAppSettingsFromStorage(deps)).uiFontFamily).toBe("");
   });
 
+  it("defaults code syntax to Catppuccin while preserving the app theme default", async () => {
+    const result = await loadAppSettingsFromStorage(makeDeps());
+
+    expect(result.syntaxTheme).toBe("catppuccin");
+    expect(result.theme).toBe("auto");
+  });
+
+  it("migrates persisted One once and preserves a later One selection", async () => {
+    const deps = makeDeps({
+      storage: createInMemoryKeyValueStorage({
+        [APP_SETTINGS_KEY]: JSON.stringify({ theme: "pureBlack", syntaxTheme: "one" }),
+      }),
+    });
+
+    expect(await loadAppSettingsFromStorage(deps)).toMatchObject({
+      theme: "pureBlack",
+      syntaxTheme: "catppuccin",
+    });
+    await saveAppSettings({
+      queryClient: new QueryClient(),
+      updates: { syntaxTheme: "one" },
+      deps,
+    });
+    expect(await loadAppSettingsFromStorage(deps)).toMatchObject({
+      theme: "pureBlack",
+      syntaxTheme: "one",
+    });
+  });
+
   it("accepts a known syntax theme id", async () => {
     const deps = makeDeps({
       storage: createInMemoryKeyValueStorage({
@@ -933,7 +962,7 @@ describe("appearance settings", () => {
       }),
     });
 
-    expect((await loadAppSettingsFromStorage(deps)).syntaxTheme).toBe("one");
+    expect((await loadAppSettingsFromStorage(deps)).syntaxTheme).toBe("catppuccin");
   });
 
   it("drops an unknown syntax theme id back to the default", async () => {
@@ -943,7 +972,7 @@ describe("appearance settings", () => {
       }),
     });
 
-    expect((await loadAppSettingsFromStorage(deps)).syntaxTheme).toBe("one");
+    expect((await loadAppSettingsFromStorage(deps)).syntaxTheme).toBe("catppuccin");
   });
 });
 

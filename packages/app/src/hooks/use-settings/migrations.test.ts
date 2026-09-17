@@ -38,6 +38,56 @@ function createFailingWriteStorage(failingKey: string): Storage {
 }
 
 describe("migrateAppSettings", () => {
+  it("migrates One syntax to Catppuccin without changing the app theme", async () => {
+    const storage = createInMemoryKeyValueStorage();
+    const settings: AppSettings = {
+      ...settingsWith("steer"),
+      theme: "pureBlack",
+      syntaxTheme: "one",
+    };
+
+    const result = await migrateAppSettings(settings, storage);
+
+    expect(result).toEqual({ ...settings, syntaxTheme: "catppuccin" });
+    expect(JSON.parse(storage.entries.get(APP_SETTINGS_KEY) ?? "null")).toEqual(result);
+    expect(appliedIds(storage)).toEqual(["steer-default", "catppuccin-syntax-default"]);
+  });
+
+  it("lets users select One again after the syntax migration", async () => {
+    const storage = createInMemoryKeyValueStorage();
+    const settings: AppSettings = { ...settingsWith("steer"), syntaxTheme: "one" };
+    await migrateAppSettings(settings, storage);
+
+    const result = await migrateAppSettings(settings, storage);
+
+    expect(result.syntaxTheme).toBe("one");
+  });
+
+  it("preserves another syntax selection when marking the migration applied", async () => {
+    const storage = createInMemoryKeyValueStorage();
+    const settings: AppSettings = { ...settingsWith("steer"), syntaxTheme: "dracula" };
+
+    const result = await migrateAppSettings(settings, storage);
+
+    expect(result).toEqual(settings);
+    expect(storage.entries.has(APP_SETTINGS_KEY)).toBe(false);
+    expect(appliedIds(storage)).toEqual(["steer-default", "catppuccin-syntax-default"]);
+    expect(
+      (await migrateAppSettings({ ...settings, syntaxTheme: "one" }, storage)).syntaxTheme,
+    ).toBe("one");
+  });
+
+  it("retries the syntax migration when its settings write fails", async () => {
+    const storage = createFailingWriteStorage(APP_SETTINGS_KEY);
+    const settings: AppSettings = { ...settingsWith("steer"), syntaxTheme: "one" };
+
+    await expect(migrateAppSettings(settings, storage)).rejects.toThrow();
+
+    expect(appliedIds(storage)).toEqual([]);
+    const recovered = createInMemoryKeyValueStorage(Object.fromEntries(storage.entries));
+    expect((await migrateAppSettings(settings, recovered)).syntaxTheme).toBe("catppuccin");
+  });
+
   it("flips a stored interrupt to steer and marks itself applied", async () => {
     const storage = createInMemoryKeyValueStorage();
 
@@ -45,7 +95,7 @@ describe("migrateAppSettings", () => {
 
     expect(result.sendBehavior).toBe("steer");
     expect(storedSendBehavior(storage)).toBe("steer");
-    expect(appliedIds(storage)).toEqual(["steer-default"]);
+    expect(appliedIds(storage)).toEqual(["steer-default", "catppuccin-syntax-default"]);
   });
 
   it("leaves interrupt alone once the migration has run", async () => {
@@ -64,7 +114,7 @@ describe("migrateAppSettings", () => {
 
     expect(result.sendBehavior).toBe("queue");
     expect(storage.entries.has(APP_SETTINGS_KEY)).toBe(false);
-    expect(appliedIds(storage)).toEqual(["steer-default"]);
+    expect(appliedIds(storage)).toEqual(["steer-default", "catppuccin-syntax-default"]);
   });
 
   it("marks itself applied on a fresh install without rewriting settings", async () => {
@@ -73,7 +123,7 @@ describe("migrateAppSettings", () => {
     await migrateAppSettings(settingsWith("steer"), storage);
 
     expect(storage.entries.has(APP_SETTINGS_KEY)).toBe(false);
-    expect(appliedIds(storage)).toEqual(["steer-default"]);
+    expect(appliedIds(storage)).toEqual(["steer-default", "catppuccin-syntax-default"]);
   });
 
   it("keeps unknown migration ids written by a newer client", async () => {
@@ -83,7 +133,11 @@ describe("migrateAppSettings", () => {
 
     await migrateAppSettings(settingsWith("interrupt"), storage);
 
-    expect(appliedIds(storage)).toEqual(["some-later-migration", "steer-default"]);
+    expect(appliedIds(storage)).toEqual([
+      "some-later-migration",
+      "steer-default",
+      "catppuccin-syntax-default",
+    ]);
   });
 
   it("migrates every mobile 15px content preference to 16px", async () => {
@@ -94,7 +148,11 @@ describe("migrateAppSettings", () => {
 
     expect(result.contentFontSize).toBe(16);
     expect(storedContentFontSize(storage)).toBe(16);
-    expect(appliedIds(storage)).toEqual(["steer-default", "mobile-content-16"]);
+    expect(appliedIds(storage)).toEqual([
+      "steer-default",
+      "mobile-content-16",
+      "catppuccin-syntax-default",
+    ]);
   });
 
   it("leaves a 15px web content preference unchanged", async () => {
@@ -105,7 +163,7 @@ describe("migrateAppSettings", () => {
 
     expect(result.contentFontSize).toBe(15);
     expect(storedContentFontSize(storage)).toBeUndefined();
-    expect(appliedIds(storage)).toEqual(["steer-default"]);
+    expect(appliedIds(storage)).toEqual(["steer-default", "catppuccin-syntax-default"]);
   });
 
   it("lets a mobile user choose 15px after the default migration ran", async () => {
@@ -144,6 +202,6 @@ describe("migrateAppSettings", () => {
     const result = await migrateAppSettings(settingsWith("steer"), recovered);
 
     expect(result.sendBehavior).toBe("steer");
-    expect(appliedIds(recovered)).toEqual(["steer-default"]);
+    expect(appliedIds(recovered)).toEqual(["steer-default", "catppuccin-syntax-default"]);
   });
 });

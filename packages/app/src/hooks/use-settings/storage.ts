@@ -15,6 +15,7 @@ import {
 } from "@/components/sidebar/display-preferences/row-items";
 import { isNative } from "@/constants/platform";
 import {
+  DEFAULT_SYNTAX_THEME,
   FONT_SIZE,
   PLUGIN_THEME_PREFERENCE,
   THEME_OPTIONS,
@@ -78,7 +79,7 @@ export interface AppSettings {
   uiBaseFontSize: number; // clamped px, platform default 14 or 15
   contentFontSize: number; // clamped px, platform default 15 or 16
   codeFontSize: number; // clamped px, default 12
-  syntaxTheme: SyntaxThemeId; // default "one"
+  syntaxTheme: SyntaxThemeId;
   workspaceTitleSource: WorkspaceTitleSource;
   sidebarWorkspaceTrailing: SidebarWorkspaceTrailing;
   sidebarRowItems: SidebarRowItems;
@@ -132,7 +133,7 @@ export const DEFAULT_CLIENT_SETTINGS: AppSettings = {
   uiBaseFontSize: DEFAULT_UI_BASE_FONT_SIZE,
   contentFontSize: DEFAULT_CONTENT_FONT_SIZE,
   codeFontSize: DEFAULT_CODE_FONT_SIZE,
-  syntaxTheme: "one",
+  syntaxTheme: DEFAULT_SYNTAX_THEME,
   workspaceTitleSource: "title",
   sidebarWorkspaceTrailing: "diff",
   sidebarRowItems: DEFAULT_SIDEBAR_ROW_ITEMS,
@@ -218,7 +219,7 @@ const StoredAppSettingsSchema = z
     codeFontSize: clampedNumber(MIN_CODE_FONT_SIZE, MAX_CODE_FONT_SIZE).catch(
       DEFAULT_CODE_FONT_SIZE,
     ),
-    syntaxTheme: z.string().refine(isSyntaxThemeId).catch("one"),
+    syntaxTheme: z.string().refine(isSyntaxThemeId).catch(DEFAULT_SYNTAX_THEME),
     workspaceTitleSource: z.enum(["title", "branch"]).catch("title"),
     sidebarWorkspaceTrailing: z.enum(["diff", "timestamp", "none"]).catch("diff"),
     sidebarRowItems: SidebarRowItemsSchema,
