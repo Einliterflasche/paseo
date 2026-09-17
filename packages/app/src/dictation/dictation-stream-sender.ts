@@ -61,6 +61,7 @@ export class DictationStreamSender {
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private drainWaiters: Array<() => void> = [];
   private clientCleanup: (() => void) | null = null;
+  private readonly pendingCancellations = new Set<string>();
 
   private startGeneration = 0;
   private startPromise: Promise<void> | null = null;
@@ -81,6 +82,9 @@ export class DictationStreamSender {
       this.clientCleanup = null;
     }
     this.resetStreamForReplay();
+    // Disconnected streams are cleaned up by their daemon session. IDs from one
+    // client must never be sent to a replacement host.
+    this.pendingCancellations.clear();
     this.client = client;
 
     if (!client) {
@@ -121,6 +125,8 @@ export class DictationStreamSender {
   }
 
   resetStreamForReplay(): void {
+    if (this.dictationId) this.pendingCancellations.add(this.dictationId);
+    this.flushCancellations();
     this.clearScheduledFlush();
     this.dictationId = null;
     this.sendSeq = 0;
@@ -183,13 +189,18 @@ export class DictationStreamSender {
     return sent;
   }
 
+  async ensureStream(): Promise<void> {
+    if (this.startPromise) return this.startPromise;
+    if (!this.dictationId) await this.restartStream("start");
+  }
+
   async restartStream(reason: string): Promise<void> {
     const client = this.client;
     if (!client?.isConnected) {
       return;
     }
 
-    this.startGeneration += 1;
+    this.resetStreamForReplay();
     const generation = this.startGeneration;
 
     const dictationId = this.createDictationId();
@@ -212,11 +223,7 @@ export class DictationStreamSender {
       .catch((error) => {
         // If starting failed, keep the segments for retry but clear the stream so finish can error cleanly.
         if (this.startGeneration === generation && this.dictationId === dictationId) {
-          this.dictationId = null;
-          this.sendSeq = 0;
-          this.acknowledgedSeq = -1;
-          this.streamReady = false;
-          this.resolveDrainWaiters();
+          this.resetStreamForReplay();
         }
         throw error;
       })
@@ -254,16 +261,30 @@ export class DictationStreamSender {
 
     this.flush();
     await this.waitForFlushDrain(finalSeq);
-    return client.finishDictationStream(dictationId, finalSeq);
+    const result = await client.finishDictationStream(dictationId, finalSeq);
+    if (this.dictationId === dictationId) {
+      this.dictationId = null;
+      this.resetStreamForReplay();
+    }
+    return result;
   }
 
   cancel(): void {
-    const client = this.client;
-    const dictationId = this.dictationId;
-    if (client?.isConnected && dictationId) {
-      client.cancelDictationStream(dictationId);
-    }
     this.resetStreamForReplay();
+  }
+
+  private flushCancellations(): void {
+    const client = this.client;
+    if (!client?.isConnected) return;
+    for (const dictationId of this.pendingCancellations) {
+      try {
+        client.cancelDictationStream(dictationId);
+        this.pendingCancellations.delete(dictationId);
+      } catch {
+        // Preserve the ID until reconnect when a send races transport closure.
+        return;
+      }
+    }
   }
 
   private hasPendingSegments(): boolean {

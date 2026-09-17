@@ -55,17 +55,16 @@ export function useDictationAudioSource(config: DictationAudioSourceConfig): Dic
     setVolume(0);
   }, []);
 
-  useEffect(() => {
-    return () => {
-      const engine = engineRef.current;
-      engineRef.current = null;
-      void engine?.destroy().catch(() => undefined);
-    };
+  const dispose = useCallback(async () => {
+    const engine = engineRef.current;
+    engineRef.current = null;
+    await engine?.destroy();
   }, []);
 
   return {
     start,
     stop,
+    dispose,
     volume,
   };
 }

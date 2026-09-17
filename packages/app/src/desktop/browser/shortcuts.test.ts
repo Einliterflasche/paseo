@@ -7,6 +7,19 @@ import {
 import { buildEffectiveBindings, resolveKeyboardShortcut } from "../../keyboard/keyboard-shortcuts";
 
 describe("buildBrowserKeyboardPolicy", () => {
+  it("never forwards guest dictation keys into the host composer", () => {
+    for (const isMac of [true, false]) {
+      const policy = buildBrowserKeyboardPolicy({
+        bindings: buildEffectiveBindings({}),
+        isMac,
+        isDesktop: true,
+      });
+      const dictationPrefixes = policy.prefixes.filter(
+        (prefix) => prefix.code === "KeyD" && !prefix.shift && !prefix.alt,
+      );
+      expect(dictationPrefixes).toEqual([]);
+    }
+  });
   it("publishes only chord starts while no browser chord is pending", () => {
     const bindings = buildEffectiveBindings({
       "workspace-tab-new-ctrl-t-non-mac": "Ctrl+Y",

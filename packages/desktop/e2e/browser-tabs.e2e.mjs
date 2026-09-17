@@ -426,6 +426,51 @@ async function selectElementAndReadAnnotationPaint({ page, client, browserId, ar
     name: "Message to the agent about this element…",
   });
   await comment.waitFor({ state: "visible", timeout: timeoutMs });
+  const annotation = page.getByTestId("browser-element-annotation");
+  await assertDictationShortcutNotConsumed(
+    page,
+    annotation.getByRole("button", { name: "Attach", exact: true }),
+  );
+  await assertDictationShortcutNotConsumed(
+    page,
+    annotation.getByRole("button", { name: "Cancel", exact: true }).last(),
+  );
+  await comment.fill("Retained annotation draft");
+  const originalInput = await comment.elementHandle();
+  const browserTab = page
+    .getByTestId(`workspace-tab-browser_${browserId}`)
+    .filter({ visible: true })
+    .last();
+  const tabRow = browserTab.locator('xpath=ancestor::*[@data-testid="workspace-tabs-row"]');
+  await tabRow.getByTestId("workspace-new-tab-button").click();
+  await page.getByTestId("workspace-new-tab-menu-agent").filter({ visible: true }).click();
+  await comment.waitFor({ state: "hidden", timeout: timeoutMs });
+  assert(
+    await page.evaluate(() => document.activeElement?.tagName.toLowerCase() !== "webview"),
+    "Hiding an annotation must not restore focus to its parked guest before the new chat receives input",
+  );
+  assert(
+    await originalInput.evaluate((element) => element.isConnected),
+    "Hidden annotation must retain its original editor and dictation owner",
+  );
+  const chat = page
+    .getByTestId("message-input-root")
+    .filter({ visible: true })
+    .last()
+    .locator("textarea");
+  await chat.fill("Separate chat draft");
+  await browserTab.click({ position: { x: 12, y: 13 } });
+  await comment.waitFor({ state: "visible", timeout: timeoutMs });
+  assert(
+    (await comment.inputValue()) === "Retained annotation draft",
+    "Annotation draft changed while visiting chat",
+  );
+  assert(
+    await comment.evaluate((element, original) => element === original, originalInput),
+    "Returning to annotation must reuse the same editor",
+  );
+  await originalInput.dispose();
+  await comment.focus();
   const bounds = await comment.boundingBox();
   assert(bounds, "Element annotation comment box had no bounds");
   const receivesInput = await comment.evaluate((element) => {
@@ -448,11 +493,42 @@ async function selectElementAndReadAnnotationPaint({ page, client, browserId, ar
   });
   await page.keyboard.press("Escape");
   await comment.waitFor({ state: "hidden", timeout: timeoutMs });
+  await assertDictationShortcutNotConsumed(
+    page,
+    page.getByRole("textbox", { name: "Browser URL", exact: true }).filter({ visible: true }),
+  );
   const closedPixels = await page.screenshot({
     clip,
     path: path.join(artifactDir, "element-annotation-closed.png"),
   });
   return receivesInput && !openPixels.equals(closedPixels);
+}
+
+async function assertDictationShortcutNotConsumed(page, target) {
+  await target.focus();
+  await page.evaluate(() => {
+    window.__dictationShortcutObserved = [];
+    window.__dictationShortcutObserver = (event) => {
+      if (event.key.toLowerCase() === "d" && event.ctrlKey) {
+        window.__dictationShortcutObserved.push(event.defaultPrevented);
+      }
+    };
+    window.addEventListener("keydown", window.__dictationShortcutObserver, true);
+  });
+  try {
+    await page.keyboard.press("Control+d");
+    const prevented = await page.evaluate(() => window.__dictationShortcutObserved);
+    assert(
+      prevented.length === 1 && prevented[0] === false,
+      "Ctrl+D from annotation actions or browser URL must not fall through to the chat composer",
+    );
+  } finally {
+    await page.evaluate(() => {
+      window.removeEventListener("keydown", window.__dictationShortcutObserver, true);
+      delete window.__dictationShortcutObserver;
+      delete window.__dictationShortcutObserved;
+    });
+  }
 }
 
 function recordViewportMismatch(failures, label, actual, expected) {
@@ -972,8 +1048,14 @@ async function main() {
     browser = await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`);
     const page = await waitForAppPage(browser, expoPort);
     const status = await waitForDesktopStatus(page);
+    // Preload is ready before a cold Metro bundle has hydrated the application.
+    await page.getByRole("button", { name: "Settings", exact: true }).waitFor({
+      state: "visible",
+      timeout: timeoutMs,
+    });
 
-    const settingsMemory = await runSettingsMemoryRegression(page);
+    const browserOnly = process.env.PASEO_DESKTOP_BROWSER_ONLY === "1";
+    const settingsMemory = browserOnly ? null : await runSettingsMemoryRegression(page);
     if (process.env.PASEO_DESKTOP_SETTINGS_MEMORY_ONLY === "1") {
       writeJson(path.join(artifactDir, "result.json"), { settingsMemory });
       console.log(
@@ -982,7 +1064,7 @@ async function main() {
       return;
     }
 
-    await runAppearanceFontSizeRegression(page);
+    if (!browserOnly) await runAppearanceFontSizeRegression(page);
 
     const callerAgentId = await createCallerAgent(daemonPort);
     const transport = new StreamableHTTPClientTransport(

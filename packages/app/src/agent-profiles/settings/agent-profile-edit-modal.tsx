@@ -1,3 +1,4 @@
+import { DictationTextInput } from "@/dictation/text-input";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from "react";
 import { Text, View } from "react-native";
 import { useTranslation } from "react-i18next";
@@ -353,7 +354,9 @@ function OpenAgentProfileEditModal({
           hint={t("settings.host.agentProfiles.notesHint")}
           testID="agent-profile-notes-field"
         >
-          <FormTextInput
+          <DictationTextInput
+            appearance="form"
+            serverId={serverId}
             initialValue={profile?.notes ?? ""}
             onChangeText={model.setNotes}
             placeholder={t("settings.host.agentProfiles.notesPlaceholder")}

@@ -81,7 +81,7 @@ export function useWorkingDiff({
       }),
     [baseRef, cwd, diffMode, ignoreWhitespace, serverId, workspaceId],
   );
-  const reviewActions = useInlineReviewController({ reviewDraftKey });
+  const reviewActions = useInlineReviewController({ reviewDraftKey, serverId });
   const reviewAttachment = useReviewAttachmentSnapshot({
     key: reviewDraftKey,
     diffFiles: files,

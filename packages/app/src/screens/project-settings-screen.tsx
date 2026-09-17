@@ -388,6 +388,7 @@ function renderContent({
   return (
     <ProjectConfigForm
       key={formKey}
+      serverId={selectedHost.serverId}
       baseConfig={loadedConfig}
       revision={loadedRevision}
       hasUncommittedWorktreeSetupChanges={hasUncommittedWorktreeSetupChanges}
@@ -469,6 +470,7 @@ function errorToDetail(error: unknown): string | null {
 }
 
 interface ProjectConfigFormProps {
+  serverId: string;
   baseConfig: PaseoConfigRaw;
   revision: PaseoConfigRevision | null;
   hasUncommittedWorktreeSetupChanges: boolean;
@@ -479,6 +481,7 @@ interface ProjectConfigFormProps {
 }
 
 function ProjectConfigForm({
+  serverId,
   baseConfig,
   revision,
   hasUncommittedWorktreeSetupChanges,
@@ -765,6 +768,8 @@ function ProjectConfigForm({
         {METADATA_PROMPT_KEYS.map((key, index) => (
           <MetadataPromptSection
             key={key}
+            serverId={serverId}
+            editable={!saveMutation.isPending}
             promptKey={key}
             value={draft.metadataPrompts[key]}
             onChange={handleMetadataPromptChange}
@@ -875,13 +880,22 @@ function ProjectTitleIcon({
 }
 
 interface MetadataPromptSectionProps {
+  serverId: string;
+  editable: boolean;
   promptKey: MetadataPromptKey;
   value: string;
   onChange: (key: MetadataPromptKey, text: string) => void;
   flush?: boolean;
 }
 
-function MetadataPromptSection({ promptKey, value, onChange, flush }: MetadataPromptSectionProps) {
+function MetadataPromptSection({
+  serverId,
+  editable,
+  promptKey,
+  value,
+  onChange,
+  flush,
+}: MetadataPromptSectionProps) {
   const { t } = useTranslation();
   const meta = METADATA_PROMPT_FIELDS[promptKey];
   const title = t(meta.titleKey);
@@ -892,6 +906,8 @@ function MetadataPromptSection({ promptKey, value, onChange, flush }: MetadataPr
   return (
     <SettingsSection title={title} testID={meta.sectionTestID} flush={flush}>
       <SettingsTextAreaCard
+        dictationServerId={serverId}
+        editable={editable}
         testID={meta.inputTestID}
         accessibilityLabel={title}
         value={value}

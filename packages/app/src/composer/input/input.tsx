@@ -16,6 +16,7 @@ import {
   useLayoutEffect,
   useImperativeHandle,
   useMemo,
+  useId,
   forwardRef,
 } from "react";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
@@ -23,6 +24,9 @@ import { useTranslation } from "react-i18next";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
 import { ArrowUp, Mic, MicOff, CornerDownLeft, Plus, Square } from "lucide-react-native";
 import { useDictation } from "@/hooks/use-dictation";
+import { useRetainedPanelActive } from "@/components/retained-panel";
+import { registerDictationKeyboardTarget } from "@/dictation/keyboard-targets";
+import { isDictationInputFocused } from "@/dictation/focus";
 import { DictationOverlay } from "@/components/dictation-controls";
 import { RealtimeVoiceOverlay } from "@/components/realtime-voice-overlay";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
@@ -979,8 +983,9 @@ function computeIsDictationStartEnabled(
   isReadyForDictation: boolean | undefined,
   isConnected: boolean,
   disabled: boolean,
+  busyElsewhere: boolean,
 ): boolean {
-  return (isReadyForDictation ?? isConnected) && !disabled;
+  return (isReadyForDictation ?? isConnected) && !disabled && !busyElsewhere;
 }
 
 function resolveMaxInputHeight(windowHeight: number): number {
@@ -1336,6 +1341,13 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       [toast],
     );
 
+    const transcriptHandlerRef = useRef(handleDictationTranscript);
+    transcriptHandlerRef.current = handleDictationTranscript;
+    const deliverDictationTranscript = useCallback(
+      (text: string, meta: { requestId: string }) => transcriptHandlerRef.current(text, meta),
+      [],
+    );
+
     const dictationUnavailableMessage = resolveVoiceUnavailableMessage({
       serverInfo,
       mode: "dictation",
@@ -1346,23 +1358,18 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         computeCanStartDictation({
           client,
           isReadyForDictation,
-          disabled,
+          disabled: disabled || !mode.showVoice,
           dictationUnavailableMessage,
         }),
-      [client, disabled, dictationUnavailableMessage, isReadyForDictation],
+      [client, disabled, dictationUnavailableMessage, isReadyForDictation, mode.showVoice],
     );
 
     const canConfirmDictation = useCallback(() => client?.isConnected ?? false, [client]);
     const isConnected = client?.isConnected ?? false;
-    const isDictationStartEnabled = computeIsDictationStartEnabled(
-      isReadyForDictation,
-      isConnected,
-      disabled,
-    );
-
     const {
       isRecording: isDictating,
       isRecordingActive: isDictationActive,
+      isSessionActive: isDictationSessionActive,
       isProcessing: isDictationProcessing,
       partialTranscript: _dictationPartialTranscript,
       volume: dictationVolume,
@@ -1374,14 +1381,23 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       confirmDictation,
       retryFailedDictation,
       discardFailedDictation,
+      busyElsewhere,
     } = useDictation({
       client,
-      onTranscript: handleDictationTranscript,
+      enabled: !disabled,
+      targetKey: JSON.stringify([voiceAgentId, cwd, inputMode]),
+      onTranscript: deliverDictationTranscript,
       onError: handleDictationError,
       canStart: canStartDictation,
       canConfirm: canConfirmDictation,
       enableDuration: true,
     });
+    const isDictationStartEnabled = computeIsDictationStartEnabled(
+      isReadyForDictation,
+      isConnected,
+      disabled,
+      busyElsewhere,
+    );
 
     const isRealtimeVoiceForCurrentAgent = computeIsRealtimeVoiceForAgent(
       voice,
@@ -1454,6 +1470,63 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
     const handleDiscardFailedRecording = useCallback(() => {
       discardFailedDictation();
     }, [discardFailedDictation]);
+
+    const dictationTargetId = useId();
+    const dictationPanelActive = useRetainedPanelActive();
+    const keyboardDictation = useRef({
+      dictationPanelActive,
+      handleAcceptRecording,
+      isDictationSessionActive,
+      isDictationActive,
+      isDictationProcessing,
+      dictationStatus,
+      startDictationIfAvailable,
+      handleAcceptAndSendRecording,
+      handleCancelRecording,
+      handleRetryFailedRecording,
+      handleDiscardFailedRecording,
+    });
+    keyboardDictation.current = {
+      dictationPanelActive,
+      handleAcceptRecording,
+      isDictationSessionActive,
+      isDictationActive,
+      isDictationProcessing,
+      dictationStatus,
+      startDictationIfAvailable,
+      handleAcceptAndSendRecording,
+      handleCancelRecording,
+      handleRetryFailedRecording,
+      handleDiscardFailedRecording,
+    };
+    useEffect(
+      () =>
+        registerDictationKeyboardTarget({
+          id: dictationTargetId,
+          isFocused: () => isDictationInputFocused(textInputRef, rootRef),
+          isActive: () => keyboardDictation.current.isDictationSessionActive(),
+          isVisible: () => keyboardDictation.current.dictationPanelActive,
+          toggle: () => {
+            const current = keyboardDictation.current;
+            if (current.isDictationProcessing) return;
+            if (current.dictationStatus === "failed") current.handleRetryFailedRecording();
+            else if (current.isDictationActive()) {
+              if (current.dictationPanelActive) void current.handleAcceptAndSendRecording();
+              else void current.handleAcceptRecording();
+            } else void current.startDictationIfAvailable();
+          },
+          cancel: () => {
+            const current = keyboardDictation.current;
+            if (current.dictationStatus === "failed") current.handleDiscardFailedRecording();
+            else void current.handleCancelRecording();
+          },
+          confirm: () => {
+            const current = keyboardDictation.current;
+            if (current.isDictationActive()) void current.handleAcceptAndSendRecording();
+          },
+        }),
+      [dictationTargetId],
+    );
 
     const handleStopRealtimeVoice = useCallback(async () => {
       try {

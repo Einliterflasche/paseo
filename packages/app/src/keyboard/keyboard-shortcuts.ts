@@ -102,6 +102,8 @@ interface ShortcutHelp {
 
 interface ShortcutBinding {
   id: string;
+  /** Suppress this default alias when its primary binding is customized. */
+  defaultAliasFor?: string;
   action: KeyboardActionId;
   combo: string;
   repeat?: false;
@@ -1115,7 +1117,13 @@ const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = [
     id: "message-input-dictation-toggle-cmd-d-mac",
     action: "message-input.action",
     combo: "Cmd+D",
-    when: { mac: true, commandCenter: false, terminal: false },
+    repeat: false,
+    when: {
+      mac: true,
+      commandCenter: false,
+      terminal: false,
+      focusScope: ["message-input", "editable", "other"],
+    },
     payload: { type: "message-input", kind: "dictation-toggle" },
     help: {
       id: "dictation-toggle",
@@ -1124,10 +1132,30 @@ const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = [
     },
   },
   {
+    id: "message-input-dictation-toggle-ctrl-d-mac",
+    defaultAliasFor: "message-input-dictation-toggle-cmd-d-mac",
+    action: "message-input.action",
+    combo: "Ctrl+D",
+    repeat: false,
+    when: {
+      mac: true,
+      commandCenter: false,
+      terminal: false,
+      focusScope: ["message-input", "editable", "other"],
+    },
+    payload: { type: "message-input", kind: "dictation-toggle" },
+  },
+  {
     id: "message-input-dictation-toggle-ctrl-d-non-mac",
     action: "message-input.action",
     combo: "Ctrl+D",
-    when: { mac: false, commandCenter: false, terminal: false },
+    repeat: false,
+    when: {
+      mac: false,
+      commandCenter: false,
+      terminal: false,
+      focusScope: ["message-input", "editable", "other"],
+    },
     payload: { type: "message-input", kind: "dictation-toggle" },
     help: {
       id: "dictation-toggle",
@@ -1152,7 +1180,11 @@ const SHORTCUT_BINDINGS: readonly ShortcutBinding[] = [
     id: "message-input-dictation-confirm-enter",
     action: "message-input.action",
     combo: "Enter",
-    when: { commandCenter: false, terminal: false },
+    when: {
+      commandCenter: false,
+      terminal: false,
+      focusScope: ["message-input", "editable", "other"],
+    },
     payload: { type: "message-input", kind: "dictation-confirm" },
   },
 
@@ -1210,7 +1242,7 @@ export const DEFAULT_BINDINGS: readonly ParsedShortcutBinding[] =
 export type ShortcutOverrides = Record<string, string | null>;
 
 export function buildEffectiveBindings(overrides: ShortcutOverrides): ParsedShortcutBinding[] {
-  return DEFAULT_BINDINGS.map(function (binding) {
+  const effective = DEFAULT_BINDINGS.map(function (binding) {
     const override = overrides[binding.id];
     if (override === UNASSIGNED_COMBO) {
       return { ...binding, combo: "", parsedChord: [] };
@@ -1234,6 +1266,12 @@ export function buildEffectiveBindings(overrides: ShortcutOverrides): ParsedShor
     }
     const { defaultDisplayKeys: _defaultDisplayKeys, ...help } = binding.help;
     return { ...binding, combo: override, parsedChord, help };
+  });
+  return effective.filter((binding) => {
+    if (!binding.defaultAliasFor) return true;
+    const primary = effective.find((entry) => entry.id === binding.defaultAliasFor);
+    const original = DEFAULT_BINDINGS.find((entry) => entry.id === binding.defaultAliasFor);
+    return primary?.combo === original?.combo;
   });
 }
 

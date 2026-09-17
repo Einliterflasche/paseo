@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DaemonServerInfo } from "@/stores/session-store";
 import type { AudioEngine } from "@/voice/audio-engine-types";
 import { createVoiceRuntime, type VoiceSessionAdapter } from "@/voice/voice-runtime";
+import { createMicrophoneCoordinator, type MicrophoneCoordinator } from "@/voice/microphone";
 import { REALTIME_VOICE_VAD_CONFIG } from "@/voice/realtime-voice-config";
 
 function createAudioEngineMock(): AudioEngine {
@@ -64,11 +65,13 @@ function createServerInfo(): DaemonServerInfo {
 
 function createRuntime(options?: {
   engine?: AudioEngine;
+  microphone?: MicrophoneCoordinator;
   getServerInfo?: (serverId: string) => DaemonServerInfo | null;
 }) {
   const engine = options?.engine ?? createAudioEngineMock();
   const runtime = createVoiceRuntime({
     engine,
+    microphone: options?.microphone,
     getServerInfo: options?.getServerInfo ?? (() => createServerInfo()),
     activateKeepAwake: vi.fn().mockResolvedValue(undefined),
     deactivateKeepAwake: vi.fn().mockResolvedValue(undefined),
@@ -84,6 +87,163 @@ describe("voice runtime", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it("does not interrupt dictation when live voice tries to start", async () => {
+    const microphone = createMicrophoneCoordinator();
+    const releaseDictation = microphone.acquire("dictation");
+    const { runtime, engine } = createRuntime({ microphone });
+    runtime.registerSession(createSessionAdapter());
+
+    await expect(runtime.startVoice("server-1", "agent-1")).rejects.toThrow(
+      "Finish or cancel dictation",
+    );
+    await runtime.stopVoice();
+
+    expect(engine.initialize).not.toHaveBeenCalled();
+    expect(engine.startCapture).not.toHaveBeenCalled();
+    expect(engine.stopCapture).not.toHaveBeenCalled();
+    expect(microphone.getSnapshot()).toBe("dictation");
+    releaseDictation?.();
+  });
+
+  it("holds its microphone lease through a permission prompt and pending stop", async () => {
+    const microphone = createMicrophoneCoordinator();
+    let resolveCapture!: () => void;
+    let captureStarted!: () => void;
+    const permission = new Promise<void>((resolve) => {
+      resolveCapture = resolve;
+    });
+    const enteredCapture = new Promise<void>((resolve) => {
+      captureStarted = resolve;
+    });
+    const engine = createAudioEngineMock();
+    vi.mocked(engine.startCapture).mockImplementation(() => {
+      captureStarted();
+      return permission;
+    });
+    const { runtime } = createRuntime({ microphone, engine });
+    runtime.registerSession(createSessionAdapter());
+
+    const starting = runtime.startVoice("server-1", "agent-1");
+    await enteredCapture;
+    const stopping = runtime.stopVoice();
+    expect(microphone.acquire("dictation")).toBe(null);
+    expect(engine.stopCapture).not.toHaveBeenCalled();
+    resolveCapture();
+    await Promise.all([starting, stopping]);
+
+    expect(engine.stopCapture).toHaveBeenCalledTimes(1);
+    expect(runtime.getSnapshot().phase).toBe("disabled");
+    expect(microphone.getSnapshot()).toBe(null);
+  });
+
+  it("releases microphone ownership when daemon disable fails", async () => {
+    const microphone = createMicrophoneCoordinator();
+    const { runtime, engine } = createRuntime({ microphone });
+    const adapter = createSessionAdapter();
+    runtime.registerSession(adapter);
+    await runtime.startVoice("server-1", "agent-1");
+    vi.mocked(adapter.setVoiceMode).mockRejectedValueOnce(new Error("host disconnected"));
+
+    await expect(runtime.stopVoice()).rejects.toThrow("host disconnected");
+
+    expect(engine.stopCapture).toHaveBeenCalledTimes(1);
+    expect(runtime.getSnapshot().phase).toBe("disabled");
+    expect(microphone.getSnapshot()).toBe(null);
+  });
+
+  it("keeps microphone ownership until a failed capture stop is retried successfully", async () => {
+    const microphone = createMicrophoneCoordinator();
+    const { runtime, engine } = createRuntime({ microphone });
+    runtime.registerSession(createSessionAdapter());
+    await runtime.startVoice("server-1", "agent-1");
+    vi.mocked(engine.stopCapture).mockRejectedValueOnce(new Error("capture still active"));
+    await expect(runtime.stopVoice()).rejects.toThrow("capture still active");
+    expect(microphone.acquire("dictation")).toBe(null);
+    await runtime.stopVoice();
+    expect(microphone.getSnapshot()).toBe(null);
+  });
+
+  it("stops local capture and playback before a slow daemon disable reply", async () => {
+    const microphone = createMicrophoneCoordinator();
+    const { runtime, engine } = createRuntime({ microphone });
+    const adapter = createSessionAdapter();
+    runtime.registerSession(adapter);
+    await runtime.startVoice("server-1", "agent-1");
+    let resolveDisable!: () => void;
+    const disabled = new Promise<void>((resolve) => {
+      resolveDisable = resolve;
+    });
+    vi.mocked(adapter.setVoiceMode).mockImplementation(() => disabled);
+    let resolvePlayback!: (duration: number) => void;
+    vi.mocked(engine.play).mockImplementation(
+      () =>
+        new Promise<number>((resolve) => {
+          resolvePlayback = resolve;
+        }),
+    );
+    runtime.handleAudioOutput(
+      "server-1",
+      createAudioPayload({ id: "playing", groupId: "group", chunkIndex: 0, isLastChunk: false }),
+    );
+    runtime.handleAudioOutput(
+      "server-1",
+      createAudioPayload({ id: "queued", groupId: "group", chunkIndex: 1, isLastChunk: true }),
+    );
+    await Promise.resolve();
+    const playedBeforeStop = vi.mocked(engine.play).mock.calls.length;
+    const stopping = runtime.stopVoice();
+    runtime.handleCapturePcm(new Uint8Array(32000));
+    runtime.handleAudioOutput(
+      "server-1",
+      createAudioPayload({ id: "late", groupId: "late-group", chunkIndex: 0, isLastChunk: true }),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(adapter.sendVoiceAudioChunk).not.toHaveBeenCalled();
+    expect(engine.stop).toHaveBeenCalled();
+    expect(engine.clearQueue).toHaveBeenCalled();
+    expect(engine.stopCapture).toHaveBeenCalledTimes(1);
+    expect(microphone.getSnapshot()).toBe(null);
+    resolvePlayback(0.1);
+    await Promise.resolve();
+    expect(engine.play).toHaveBeenCalledTimes(playedBeforeStop);
+    resolveDisable();
+    await stopping;
+  });
+
+  it("releases local audio while voice enable is awaiting the daemon and suppresses its late capture", async () => {
+    const microphone = createMicrophoneCoordinator();
+    const { runtime, engine } = createRuntime({ microphone });
+    const adapter = createSessionAdapter();
+    let resolveEnable!: () => void;
+    let enableEntered!: () => void;
+    const enabled = new Promise<void>((resolve) => {
+      resolveEnable = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      enableEntered = resolve;
+    });
+    vi.mocked(adapter.setVoiceMode).mockImplementation(async (value) => {
+      if (value) {
+        enableEntered();
+        await enabled;
+      }
+    });
+    runtime.registerSession(adapter);
+    const starting = runtime.startVoice("server-1", "agent-1");
+    await entered;
+    const stopping = runtime.stopVoice();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(engine.stopCapture).toHaveBeenCalledTimes(1);
+    expect(microphone.getSnapshot()).toBe(null);
+    const releaseDictation = microphone.acquire("dictation");
+    resolveEnable();
+    await Promise.all([starting, stopping]);
+    expect(engine.startCapture).not.toHaveBeenCalled();
+    expect(microphone.getSnapshot()).toBe("dictation");
+    releaseDictation?.();
   });
 
   it("starts voice when adapter is ready", async () => {

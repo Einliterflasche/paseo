@@ -1,3 +1,5 @@
+import { createPanelRetention, type PanelRetention } from "@/panels/panel-retention";
+import { PanelRetentionContext } from "@/panels/panel-retention-context";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import { getOpenAgentTabLabel } from "@getpaseo/protocol/agent-labels";
@@ -9,6 +11,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type ReactElement,
   type ReactNode,
 } from "react";
@@ -617,6 +620,7 @@ function MobileWorkspaceTabOption({
   const renderPresentation = useCallback(
     (presentation: WorkspaceTabPresentation) => (
       <WorkspaceTabOptionRow
+        testID={`workspace-tab-option-${tab.tabId}`}
         presentation={presentation}
         selected={selected}
         active={active}
@@ -624,7 +628,7 @@ function MobileWorkspaceTabOption({
         trailingAccessory={trailingAccessory}
       />
     ),
-    [selected, active, onPress, trailingAccessory],
+    [selected, active, onPress, trailingAccessory, tab.tabId],
   );
 
   return (
@@ -778,6 +782,7 @@ const MobileWorkspaceTabSwitcher = memo(function MobileWorkspaceTabSwitcher({
 });
 
 interface MobileMountedTabSlotProps {
+  retention: PanelRetention;
   tabDescriptor: WorkspaceTabDescriptor;
   isVisible: boolean;
   isWorkspaceFocused: boolean;
@@ -791,6 +796,7 @@ interface MobileMountedTabSlotProps {
 }
 
 const MobileMountedTabSlot = memo(function MobileMountedTabSlot({
+  retention,
   tabDescriptor,
   isVisible,
   isWorkspaceFocused,
@@ -807,6 +813,10 @@ const MobileMountedTabSlot = memo(function MobileMountedTabSlot({
       }),
     [buildPaneContentModel, paneId, tabDescriptor],
   );
+  const retentionContext = useMemo(
+    () => ({ retention, tabId: tabDescriptor.tabId }),
+    [retention, tabDescriptor.tabId],
+  );
   const handleTouch = useCallback(() => {
     if (!isPaneFocused && paneId) onFocusPane(paneId);
     return false;
@@ -814,15 +824,17 @@ const MobileMountedTabSlot = memo(function MobileMountedTabSlot({
 
   return (
     <RenderProfile id={`MobileMountedTabSlot:${tabDescriptor.kind}:${tabDescriptor.tabId}`}>
-      <RetainedPanel active={isVisible} style={styles.mobileMountedTabSlot}>
-        <View style={styles.mobileMountedTabSlot} onStartShouldSetResponderCapture={handleTouch}>
-          <WorkspacePaneContent
-            content={content}
-            isWorkspaceFocused={isWorkspaceFocused}
-            isPaneFocused={isPaneFocused}
-          />
-        </View>
-      </RetainedPanel>
+      <PanelRetentionContext.Provider value={retentionContext}>
+        <RetainedPanel active={isVisible} style={styles.mobileMountedTabSlot}>
+          <View style={styles.mobileMountedTabSlot} onStartShouldSetResponderCapture={handleTouch}>
+            <WorkspacePaneContent
+              content={content}
+              isWorkspaceFocused={isWorkspaceFocused}
+              isPaneFocused={isPaneFocused}
+            />
+          </View>
+        </RetainedPanel>
+      </PanelRetentionContext.Provider>
     </RenderProfile>
   );
 });
@@ -1080,6 +1092,7 @@ function parsePaneDirection(actionId: string): PaneDirection | null {
 }
 
 interface RenderWorkspaceContentInput {
+  retention: PanelRetention;
   isMissingWorkspaceDirectory: boolean;
   activeTabDescriptor: WorkspaceTabDescriptor | null;
   hasHydratedAgents: boolean;
@@ -1143,6 +1156,7 @@ function renderWorkspaceContent(input: RenderWorkspaceContentInput): React.React
     }
     return (
       <MobileMountedTabSlot
+        retention={input.retention}
         key={tabId}
         tabDescriptor={tabDescriptor}
         isVisible={isRouteFocused && tabId === activeTabDescriptor.tabId}
@@ -3615,11 +3629,21 @@ function WorkspaceScreenContent({
     workspaceId: normalizedWorkspaceId,
     tabIds: focusedPaneTabIds,
   });
+  const [mobilePanelRetention] = useState(createPanelRetention);
+  const leasedFocusedPaneTabIds = useSyncExternalStore(
+    mobilePanelRetention.subscribe,
+    mobilePanelRetention.getSnapshot,
+    mobilePanelRetention.getSnapshot,
+  );
+  const retainedFocusedPaneTabIds = useMemo(
+    () => new Set([...modifiedFocusedPaneTabIds, ...leasedFocusedPaneTabIds]),
+    [modifiedFocusedPaneTabIds, leasedFocusedPaneTabIds],
+  );
   const focusedPaneTabDescriptorMap = useStableTabDescriptorMap(tabs);
   const { mountedTabIds: mountedFocusedPaneTabIdsSet } = useMountedTabSet({
     activeTabId,
     allTabIds: focusedPaneTabIds,
-    retainedTabIds: modifiedFocusedPaneTabIds,
+    retainedTabIds: retainedFocusedPaneTabIds,
     cap: 3,
   });
   const mountedFocusedPaneTabIds = useMemo(
@@ -3646,6 +3670,7 @@ function WorkspaceScreenContent({
     focusWorkspacePane(persistenceKey, paneId);
   });
   const content = renderWorkspaceContent({
+    retention: mobilePanelRetention,
     isMissingWorkspaceDirectory,
     activeTabDescriptor,
     hasHydratedAgents,

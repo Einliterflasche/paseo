@@ -1,4 +1,5 @@
 import { Buffer } from "buffer";
+import { createMicrophoneCoordinator, type MicrophoneCoordinator } from "./microphone";
 import type { AgentStreamEventPayload, SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import { resolveVoiceUnavailableMessage } from "@/utils/server-info-capabilities";
 import type { DaemonServerInfo } from "@/stores/session-store";
@@ -56,6 +57,7 @@ export interface VoiceSessionAdapter {
 
 export interface VoiceRuntimeDeps {
   engine: AudioEngine;
+  microphone?: MicrophoneCoordinator;
   getServerInfo(serverId: string): DaemonServerInfo | null;
   activateKeepAwake(tag: string): Promise<void>;
   deactivateKeepAwake(tag: string): Promise<void>;
@@ -181,6 +183,11 @@ export interface VoiceRuntime {
 
 export function createVoiceRuntime(deps: VoiceRuntimeDeps): VoiceRuntime {
   const instanceId = nextVoiceRuntimeInstanceId++;
+  const microphone = deps.microphone ?? createMicrophoneCoordinator();
+  let releaseMicrophone: (() => void) | null = null;
+  let pendingStart: Promise<void> | null = null;
+  let pendingAudioStart: Promise<void> | null = null;
+  let pendingStop: Promise<void> | null = null;
   const listeners = new Set<() => void>();
   const telemetryListeners = new Set<() => void>();
   const sessions = new Map<string, RuntimeSessionState>();
@@ -548,16 +555,34 @@ export function createVoiceRuntime(deps: VoiceRuntimeDeps): VoiceRuntime {
     }));
   }
 
-  async function performLocalStop(): Promise<void> {
+  async function runAudioStart(operation: Promise<void>): Promise<void> {
+    pendingAudioStart = operation;
+    try {
+      await operation;
+    } finally {
+      if (pendingAudioStart === operation) pendingAudioStart = null;
+    }
+  }
+
+  function suppressLocalVoice(): void {
+    state.transportReady = false;
     stopCue();
     uploader.reset();
     resetPlaybackState();
     deps.engine.stop();
     deps.engine.clearQueue();
-    await deps.engine.stopCapture().catch(() => undefined);
+    getActiveSession()?.adapter.setAssistantAudioPlaying(false);
+  }
+
+  async function performLocalStop(): Promise<void> {
+    if (!releaseMicrophone) return;
+    suppressLocalVoice();
+    await deps.engine.stopCapture();
     await deps.deactivateKeepAwake(KEEP_AWAKE_TAG).catch(() => undefined);
     getActiveSession()?.adapter.setAssistantAudioPlaying(false);
     resetToDisabledState();
+    releaseMicrophone();
+    releaseMicrophone = null;
   }
 
   async function resyncVoiceMode(serverId: string): Promise<void> {
@@ -616,7 +641,9 @@ export function createVoiceRuntime(deps: VoiceRuntimeDeps): VoiceRuntime {
         const activeServerId = state.snapshot.activeServerId;
         sessions.delete(adapter.serverId);
         if (activeServerId === adapter.serverId) {
-          void performLocalStop();
+          void api.stopVoice().catch((error) => {
+            console.error("[VoiceRuntime] Failed to stop removed session", error);
+          });
         }
       };
     },
@@ -710,6 +737,8 @@ export function createVoiceRuntime(deps: VoiceRuntimeDeps): VoiceRuntime {
     },
 
     async startVoice(serverId, agentId) {
+      if (pendingStop) await pendingStop;
+      if (pendingStart) return pendingStart;
       const session = sessions.get(serverId);
       if (!session) {
         throw new Error(`Voice runtime is not ready for host ${serverId}`);
@@ -727,6 +756,12 @@ export function createVoiceRuntime(deps: VoiceRuntimeDeps): VoiceRuntime {
         throw new Error(unavailableMessage);
       }
 
+      if (!releaseMicrophone) {
+        releaseMicrophone = microphone.acquire("voice");
+        if (!releaseMicrophone)
+          throw new Error("Finish or cancel dictation before starting live voice.");
+      }
+
       const previousServerId = state.snapshot.activeServerId;
       const previousAgentId = state.snapshot.activeAgentId;
       const generation = state.generation + 1;
@@ -741,78 +776,97 @@ export function createVoiceRuntime(deps: VoiceRuntimeDeps): VoiceRuntime {
         activeAgentId: agentId,
       }));
 
-      try {
-        if (
-          state.snapshot.isVoiceMode &&
-          previousServerId &&
-          (previousServerId !== serverId || previousAgentId !== agentId)
-        ) {
-          const previousSession = sessions.get(previousServerId);
-          if (previousSession) {
-            previousSession.adapter.setAssistantAudioPlaying(false);
-            await previousSession.adapter.setVoiceMode(false);
+      const start = (async () => {
+        try {
+          if (
+            state.snapshot.isVoiceMode &&
+            previousServerId &&
+            (previousServerId !== serverId || previousAgentId !== agentId)
+          ) {
+            const previousSession = sessions.get(previousServerId);
+            if (previousSession) {
+              previousSession.adapter.setAssistantAudioPlaying(false);
+              await previousSession.adapter.setVoiceMode(false);
+            }
           }
-        }
 
-        await deps.activateKeepAwake(KEEP_AWAKE_TAG).catch((error) => {
-          console.warn("[VoiceRuntime] Failed to activate keep-awake:", error);
-        });
+          await deps.activateKeepAwake(KEEP_AWAKE_TAG).catch((error) => {
+            console.warn("[VoiceRuntime] Failed to activate keep-awake:", error);
+          });
 
-        await deps.engine.initialize();
-        await session.adapter.setVoiceMode(true, agentId);
-        enabledCurrentVoiceMode = true;
-        await deps.engine.startCapture();
-        if (state.generation !== generation) {
-          return;
-        }
+          if (state.generation !== generation) return;
+          await runAudioStart(deps.engine.initialize());
+          if (state.generation !== generation) return;
+          await session.adapter.setVoiceMode(true, agentId);
+          enabledCurrentVoiceMode = true;
+          if (state.generation !== generation) {
+            await session.adapter.setVoiceMode(false).catch(() => undefined);
+            return;
+          }
+          await runAudioStart(deps.engine.startCapture());
+          if (state.generation !== generation) {
+            return;
+          }
 
-        state.transportReady = true;
-        state.turnInProgress = false;
-        uploader.reset();
-        resetCaptureTelemetry();
-        patchSnapshot((prev) => ({
-          ...prev,
-          isVoiceMode: true,
-          isVoiceSwitching: false,
-          phase: "listening",
-          isMuted: deps.engine.isMuted(),
-        }));
-      } catch (error) {
-        if (enabledCurrentVoiceMode) {
-          await session.adapter.setVoiceMode(false).catch(() => undefined);
+          state.transportReady = true;
+          state.turnInProgress = false;
+          uploader.reset();
+          resetCaptureTelemetry();
+          patchSnapshot((prev) => ({
+            ...prev,
+            isVoiceMode: true,
+            isVoiceSwitching: false,
+            phase: "listening",
+            isMuted: deps.engine.isMuted(),
+          }));
+        } catch (error) {
+          const remoteStop = enabledCurrentVoiceMode
+            ? session.adapter.setVoiceMode(false).catch(() => undefined)
+            : Promise.resolve();
+          await Promise.all([performLocalStop(), remoteStop]);
+          throw error;
         }
-        await performLocalStop();
-        throw error;
+      })();
+      pendingStart = start;
+      try {
+        await start;
+      } finally {
+        if (pendingStart === start) pendingStart = null;
       }
     },
 
     async stopVoice() {
+      if (pendingStop) return pendingStop;
+      if (!releaseMicrophone) return;
       const activeSession = getActiveSession();
       const generation = state.generation + 1;
       state.generation = generation;
       patchSnapshot((prev) => ({
         ...prev,
+        isVoiceMode: false,
         isVoiceSwitching: true,
         phase: "stopping",
       }));
+      suppressLocalVoice();
 
+      const stop = (async () => {
+        const localStop = (async () => {
+          await pendingAudioStart?.catch(() => undefined);
+          await performLocalStop();
+        })();
+        // The daemon reply can be slow or absent. Local capture teardown must
+        // make progress independently while its microphone lease stays held.
+        const remoteStop = activeSession?.adapter.setVoiceMode(false);
+        const outcomes = await Promise.allSettled([localStop, remoteStop]);
+        for (const outcome of outcomes) {
+          if (outcome.status === "rejected") throw outcome.reason;
+        }
+      })();
+      pendingStop = stop;
       try {
-        stopCue();
-        uploader.reset();
-        state.transportReady = false;
-        resetPlaybackState();
-        deps.engine.stop();
-        deps.engine.clearQueue();
-        activeSession?.adapter.setAssistantAudioPlaying(false);
-        if (activeSession) {
-          await activeSession.adapter.setVoiceMode(false);
-        }
-        await deps.engine.stopCapture();
-        await deps.deactivateKeepAwake(KEEP_AWAKE_TAG).catch(() => undefined);
+        await stop;
       } finally {
-        if (state.generation === generation) {
-          resetToDisabledState();
-        }
+        if (pendingStop === stop) pendingStop = null;
       }
     },
 

@@ -137,7 +137,7 @@ import { DownloadTokenStore } from "./file-download/token-store.js";
 import type { OpenAiSpeechProviderConfig } from "./speech/providers/openai/config.js";
 import type { LocalSpeechProviderConfig } from "./speech/providers/local/config.js";
 import type { RequestedSpeechProviders } from "./speech/speech-types.js";
-import { createSpeechService } from "./speech/speech-runtime.js";
+import { createSpeechService, type SpeechService } from "./speech/speech-runtime.js";
 import { AgentManager } from "./agent/agent-manager.js";
 import { AgentStorage } from "./agent/agent-storage.js";
 import { attachAgentStoragePersistence } from "./persistence-hooks.js";
@@ -489,6 +489,7 @@ export interface PaseoDaemon {
 }
 
 export interface PaseoDaemonDependencies {
+  speechService?: SpeechService;
   hubRelationshipRemote?: HubRelationshipRemote;
   hubRelationshipClock?: HubRelationshipClock;
   hubRelationshipRetryPolicy?: HubRelationshipRetryPolicy;
@@ -1600,11 +1601,13 @@ export async function createPaseoDaemon(
     logger.info({ route: agentMcpRoute, enabled: mcpEnabled }, "Agent MCP route mounted");
   }
 
-  const speechService = createSpeechService({
-    logger,
-    openaiConfig: config.openai,
-    speechConfig: config.speech,
-  });
+  const speechService =
+    dependencies.speechService ??
+    createSpeechService({
+      logger,
+      openaiConfig: config.openai,
+      speechConfig: config.speech,
+    });
   logger.info({ elapsed: elapsed() }, "Speech service created");
 
   logger.info({ elapsed: elapsed() }, "Bootstrap complete, ready to start listening");

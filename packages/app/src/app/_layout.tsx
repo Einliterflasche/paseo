@@ -679,13 +679,11 @@ function ProvidersWrapper({ children }: { children: ReactNode }) {
 
   return (
     <AppearanceProvider>
-      <VoiceProvider>
-        <DesktopWindowControlsSync />
-        <OfferLinkListener upsertDaemonFromOfferUrl={upsertConnectionFromOfferUrl} />
-        <HostSessionManager />
-        <FaviconStatusSync />
-        {children}
-      </VoiceProvider>
+      <DesktopWindowControlsSync />
+      <OfferLinkListener upsertDaemonFromOfferUrl={upsertConnectionFromOfferUrl} />
+      <HostSessionManager />
+      <FaviconStatusSync />
+      {children}
     </AppearanceProvider>
   );
 }
@@ -967,6 +965,16 @@ function RuntimeProviders({ children }: { children: ReactNode }) {
 // auth, settings, ...) must wrap PortalProvider, not be wrapped by it.
 // BottomSheetModalProvider is the exception: Gorhom modals consume portal
 // context and need one shared provider for sibling sheets to stack.
+function OverlayProviders({ children }: { children: ReactNode }) {
+  return (
+    <VoiceProvider>
+      <PortalProvider>
+        <BottomSheetModalProvider>{children}</BottomSheetModalProvider>
+      </PortalProvider>
+    </VoiceProvider>
+  );
+}
+
 function RootProviders({ children }: { children: ReactNode }) {
   return (
     <KeyboardActionDispatcherProvider>
@@ -974,9 +982,7 @@ function RootProviders({ children }: { children: ReactNode }) {
         <KeyboardProvider>
           <KeyboardShiftProvider>
             <ToastProvider>
-              <PortalProvider>
-                <BottomSheetModalProvider>{children}</BottomSheetModalProvider>
-              </PortalProvider>
+              <OverlayProviders>{children}</OverlayProviders>
             </ToastProvider>
           </KeyboardShiftProvider>
         </KeyboardProvider>

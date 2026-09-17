@@ -4,6 +4,25 @@ import type {
   AudioPlaybackSource,
 } from "@/voice/audio-engine-types";
 
+// Native audio is process-wide; disposing an idle engine must not tear down
+// another engine that still owns capture or playback.
+const initializedEngines = new Set<NativeEngineState>();
+
+interface NativeEngineState {
+  initialized: boolean;
+  captureActive: boolean;
+  muted: boolean;
+  queue: QueuedAudio[];
+  processingQueue: boolean;
+  playbackTimeout: ReturnType<typeof setTimeout> | null;
+  activePlayback: {
+    resolve: (duration: number) => void;
+    reject: (error: Error) => void;
+    settled: boolean;
+  } | null;
+  destroyed: boolean;
+}
+
 interface QueuedAudio {
   audio: AudioPlaybackSource;
   resolve: (duration: number) => void;
@@ -13,6 +32,20 @@ interface QueuedAudio {
 interface AudioEngineTraceOptions {
   traceLabel?: string;
 }
+
+export type NativeAudioAdapter = Pick<
+  typeof import("@getpaseo/expo-two-way-audio"),
+  | "initialize"
+  | "addExpoTwoWayAudioEventListener"
+  | "releaseAudioSession"
+  | "getMicrophonePermissionsAsync"
+  | "requestMicrophonePermissionsAsync"
+  | "resumePlayback"
+  | "playPCMData"
+  | "stopPlayback"
+  | "toggleRecording"
+  | "tearDown"
+>;
 
 function parsePcmSampleRate(mimeType: string): number | null {
   const match = /rate=(\d+)/i.exec(mimeType);
@@ -70,22 +103,14 @@ export function createAudioEngine(
   callbacks: AudioEngineCallbacks,
   _options?: AudioEngineTraceOptions,
 ): AudioEngine {
-  const native = require("@getpaseo/expo-two-way-audio");
+  return createNativeAudioEngine(callbacks, require("@getpaseo/expo-two-way-audio"));
+}
 
-  const refs: {
-    initialized: boolean;
-    captureActive: boolean;
-    muted: boolean;
-    queue: QueuedAudio[];
-    processingQueue: boolean;
-    playbackTimeout: ReturnType<typeof setTimeout> | null;
-    activePlayback: {
-      resolve: (duration: number) => void;
-      reject: (error: Error) => void;
-      settled: boolean;
-    } | null;
-    destroyed: boolean;
-  } = {
+export function createNativeAudioEngine(
+  callbacks: AudioEngineCallbacks,
+  native: NativeAudioAdapter,
+): AudioEngine {
+  const refs: NativeEngineState = {
     initialized: false,
     captureActive: false,
     muted: false,
@@ -140,7 +165,10 @@ export function createAudioEngine(
     if (!success) {
       throw new Error("expo-two-way-audio: native initialize() returned false");
     }
-    refs.initialized = true;
+    if (!refs.initialized) {
+      refs.initialized = true;
+      initializedEngines.add(refs);
+    }
   }
 
   /**
@@ -153,8 +181,8 @@ export function createAudioEngine(
     if (!refs.initialized || refs.destroyed) {
       return;
     }
-    if (refs.captureActive || refs.activePlayback || refs.queue.length > 0) {
-      return;
+    for (const engine of initializedEngines) {
+      if (engine.captureActive || engine.activePlayback || engine.queue.length > 0) return;
     }
     // The wrapper no-ops on binaries whose native module predates this function.
     native.releaseAudioSession();
@@ -262,8 +290,9 @@ export function createAudioEngine(
       refs.muted = false;
       callbacks.onVolumeLevel(0);
       if (refs.initialized) {
-        native.tearDown();
         refs.initialized = false;
+        initializedEngines.delete(refs);
+        if (initializedEngines.size === 0) native.tearDown();
       }
       microphoneSubscription.remove();
       volumeSubscription.remove();
@@ -324,7 +353,7 @@ export function createAudioEngine(
     },
 
     stop() {
-      native.stopPlayback();
+      if (refs.activePlayback) native.stopPlayback();
       clearPlaybackTimeout();
       const active = refs.activePlayback;
       refs.activePlayback = null;

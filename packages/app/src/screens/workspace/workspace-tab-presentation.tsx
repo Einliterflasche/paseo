@@ -187,6 +187,7 @@ export function WorkspaceTabIcon({
 }
 
 interface WorkspaceTabOptionRowProps {
+  testID?: string;
   presentation: WorkspaceTabPresentation;
   selected: boolean;
   active: boolean;
@@ -195,6 +196,7 @@ interface WorkspaceTabOptionRowProps {
 }
 
 export function WorkspaceTabOptionRow({
+  testID,
   presentation,
   selected,
   active,
@@ -220,7 +222,7 @@ export function WorkspaceTabOptionRow({
   );
   return (
     <View style={optionRowStyle}>
-      <Pressable onPress={onPress} style={pressableStyle}>
+      <Pressable testID={testID} onPress={onPress} style={pressableStyle}>
         {(state) => {
           const optionActive = isOptionActive(state);
           return (

@@ -1,9 +1,13 @@
 import type { StyleProp, TextStyle } from "react-native";
-import { useMemo } from "react";
+import { useLayoutEffect, useMemo, useRef } from "react";
 import { View } from "react-native";
-import { StyleSheet, useUnistyles } from "react-native-unistyles";
+import { StyleSheet } from "react-native-unistyles";
 import { settingsStyles } from "@/styles/settings";
-import { EditingTextInput as TextInput } from "@/components/ui/text-input";
+import {
+  EditingTextInput as TextInput,
+  type EditingTextInputHandle,
+} from "@/components/ui/text-input";
+import { DictationTextInput } from "@/dictation/text-input";
 
 interface SettingsTextAreaProps {
   accessibilityLabel: string;
@@ -12,6 +16,8 @@ interface SettingsTextAreaProps {
   placeholder?: string;
   testID?: string;
   style?: StyleProp<TextStyle>;
+  editable?: boolean;
+  dictationServerId?: string | null;
 }
 
 export function SettingsTextArea({
@@ -21,9 +27,33 @@ export function SettingsTextArea({
   placeholder,
   testID,
   style,
+  editable,
+  dictationServerId,
 }: SettingsTextAreaProps) {
-  const { theme } = useUnistyles();
   const inputStyle = useMemo(() => [styles.input, style], [style]);
+  const dictationInput = useRef<EditingTextInputHandle | null>(null);
+  useLayoutEffect(() => {
+    const input = dictationInput.current;
+    if (input && input.getText() !== value) input.replaceText(value);
+  }, [value]);
+
+  if (dictationServerId !== undefined) {
+    return (
+      <DictationTextInput
+        ref={dictationInput}
+        serverId={dictationServerId}
+        testID={testID}
+        accessibilityLabel={accessibilityLabel}
+        multiline
+        initialValue={value}
+        onChangeText={onChangeText}
+        placeholder={placeholder}
+        placeholderTextColor={styles.placeholder.color}
+        style={inputStyle}
+        editable={editable}
+      />
+    );
+  }
 
   return (
     <TextInput
@@ -33,8 +63,9 @@ export function SettingsTextArea({
       initialValue={value}
       onChangeText={onChangeText}
       placeholder={placeholder}
-      placeholderTextColor={theme.colors.foregroundMuted}
+      placeholderTextColor={styles.placeholder.color}
       style={inputStyle}
+      editable={editable}
     />
   );
 }
@@ -48,6 +79,7 @@ export function SettingsTextAreaCard(props: SettingsTextAreaProps) {
 }
 
 const styles = StyleSheet.create((theme) => ({
+  placeholder: { color: theme.colors.foregroundMuted },
   input: {
     color: theme.colors.foreground,
     fontSize: theme.fontSize.base,

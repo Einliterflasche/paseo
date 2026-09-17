@@ -39,7 +39,18 @@ import {
   navigateToLastWorkspace,
   useActiveWorkspaceSelection,
 } from "@/stores/navigation-active-workspace-store";
-import { dispatchTopWebOverlayKeyDown } from "@/lib/overlay-root";
+import { dispatchTopWebOverlayKeyDown, registerWebOverlayKeyInterceptor } from "@/lib/overlay-root";
+import { dispatchDictationKeyboardAction } from "@/dictation/keyboard-targets";
+import { handleDictationSessionKeyDown } from "@/dictation/keyboard-events";
+import type { KeyboardActionDefinition } from "@/keyboard/keyboard-action-dispatcher";
+
+const DICTATION_ACTIONS: Partial<
+  Record<KeyboardActionDefinition["id"], "toggle" | "confirm" | "cancel">
+> = {
+  "message-input.dictation-toggle": "toggle",
+  "message-input.dictation-confirm": "confirm",
+  "message-input.dictation-cancel": "cancel",
+};
 
 export function useKeyboardShortcuts({
   enabled,
@@ -163,6 +174,29 @@ export function useKeyboardShortcuts({
       "cycle-theme": cycleTheme,
     };
 
+    const dispatchKeyboardAction = (
+      action: KeyboardActionDefinition,
+      event: KeyboardEvent | null,
+    ) => {
+      const dictationAction = DICTATION_ACTIONS[action.id];
+      if (dictationAction) {
+        const store = useKeyboardShortcutsStore.getState();
+        const result = dispatchDictationKeyboardAction({
+          action: dictationAction,
+          focusScope: event
+            ? resolveKeyboardFocusScope({
+                target: event.target,
+                commandCenterOpen: store.commandCenterOpen,
+              })
+            : "browser",
+          commandCenterOpen: store.commandCenterOpen,
+          overlayOpen: hasActiveWebOverlay(),
+        });
+        if (result !== "composer") return result === "handled";
+      }
+      return keyboardActionDispatcher.dispatch(action);
+    };
+
     const performShortcutAction = (
       action: ShortcutAction,
       event: KeyboardEvent | null,
@@ -172,7 +206,7 @@ export function useKeyboardShortcuts({
         case "none":
           return false;
         case "dispatch":
-          return keyboardActionDispatcher.dispatch(action.action);
+          return dispatchKeyboardAction(action.action, event);
         case "navigate-workspace":
           keyboardWorkspaceSelectionRef.current = {
             serverId: action.serverId,
@@ -315,6 +349,10 @@ export function useKeyboardShortcuts({
       }
     };
 
+    const removeDictationKeyInterceptor = registerWebOverlayKeyInterceptor((event) => {
+      return shouldHandle() && handleDictationSessionKeyDown(event);
+    });
+
     const handleKeyDown = (event: KeyboardEvent) => {
       if (!shouldHandle()) {
         return;
@@ -396,6 +434,7 @@ export function useKeyboardShortcuts({
         })
       : null;
     return () => {
+      removeDictationKeyInterceptor();
       if (chordStateRef.current.timeoutId !== null) {
         clearTimeout(chordStateRef.current.timeoutId);
         chordStateRef.current = {

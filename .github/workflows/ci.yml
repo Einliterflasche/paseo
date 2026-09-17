@@ -356,6 +356,14 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
+      - name: Build bundled browser UI
+        if: ${{ env.PLAYWRIGHT_SHARD == '1/4' }}
+        run: npm run build:daemon-web-ui
+
+      - name: Test dictation in bundled browser UI
+        if: ${{ env.PLAYWRIGHT_SHARD == '1/4' }}
+        run: npm run test:e2e:dictation --workspace=@getpaseo/app
+
       - name: Upload test artifacts
         uses: actions/upload-artifact@v4
         if: failure()

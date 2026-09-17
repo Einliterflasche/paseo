@@ -11,11 +11,15 @@ export interface UseDictationOptions {
   canStart?: () => boolean;
   canConfirm?: () => boolean;
   enableDuration?: boolean;
+  enabled?: boolean;
+  targetKey?: string | number;
 }
 
 export interface UseDictationResult {
   isRecording: boolean;
   isRecordingActive: () => boolean;
+  isSessionActive: () => boolean;
+  busyElsewhere: boolean;
   isProcessing: boolean;
   partialTranscript: string;
   volume: number;
