@@ -8,14 +8,17 @@ series reviewable is the constraint.
 ## Branches
 
 - `upstream`: fetch remote for `https://github.com/getpaseo/paseo.git`.
+- `origin`: publishing remote for `https://github.com/Einliterflasche/paseo.git`;
+  `klaus-botty` has push access.
 - `main`: unmodified mirror of `upstream/main`.
 - `upstream-base`: upstream commit underneath the current patch series.
 - `fork`: working branch; all commits after `upstream-base` are fork patches.
 
 The checkout is `/home/agent/code/paseo`. The initial upstream base is v0.8.0 revision,
 `b8e24677e12b226c7c38c1c3a40649daa9f1152f`. Fetching newer upstream code does
-not upgrade the running daemon. This repository is local to the VM; a publishing
-remote has not been configured.
+not upgrade the running daemon. Commit and push completed changes to `origin/fork`
+unless Raphael explicitly requests local-only work. His standing authorization
+to push to this fork was given on 2026-09-18.
 
 ## Update upstream
 
@@ -50,8 +53,8 @@ git rev-list --merges upstream-base..fork
 ```
 
 The final command must produce no commits. Every subject in the patch range must
-start with `fork patch: `. If a fork remote is configured later, publish rebased
-history with `--force-with-lease`, preserving collaborators' unexpected changes.
+start with `fork patch: `. Publish rebased history to `origin/fork` with
+`--force-with-lease`, preserving collaborators' unexpected changes.
 Never push our patches to the upstream remote.
 
 ## Deployment baseline
@@ -82,7 +85,7 @@ Update the `paseoSrc` archive URL and unpacked hash in
 `/etc/nixos/configuration.nix`, preserving the packaging overrides above. Keep the
 previous archive and host configuration. A checkout edit or a history-only squash
 does not update the running package; a squash with the same Git tree needs no
-service restart. A publishing remote is optional.
+service restart. Push the committed revision to `origin/fork` before deployment.
 
 What the CLI now owns is the activation step after that pin update: `paseo daemon
 deploy -- <activation argv>` prepares a checkpoint on the _running_ daemon, runs the
