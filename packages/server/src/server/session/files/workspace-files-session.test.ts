@@ -19,8 +19,11 @@ import {
 import {
   WorkspaceFilesSession,
   type WorkspaceFilesSessionHost,
+  type WorkspaceFilesSessionOptions,
 } from "./workspace-files-session.js";
 import { DownloadTokenStore } from "../../file-download/token-store.js";
+import { PreviewGrantStore } from "../../file-preview/grant-store.js";
+import { getFileAccessInfo } from "../../file-explorer/service.js";
 import type { SessionOutboundMessage } from "../../messages.js";
 
 const tempDirs: string[] = [];
@@ -41,6 +44,9 @@ function makeSubsystem(
   options: {
     hasBinaryChannel?: boolean;
     emitBinary?: (frame: Uint8Array) => Promise<void> | void;
+    sessionId?: string;
+    previewGrantStore?: PreviewGrantStore;
+    getFileAccessInfo?: WorkspaceFilesSessionOptions["getFileAccessInfo"];
   } = {},
 ) {
   const emitted: SessionOutboundMessage[] = [];
@@ -55,17 +61,24 @@ function makeSubsystem(
     hasBinaryChannel: () => hasBinary,
   };
   const paseoHome = makeDir("workspace-files-home-");
+  const previewGrantStore = options.previewGrantStore ?? new PreviewGrantStore();
+  const sessionId = options.sessionId ?? "session-under-test";
   const subsystem = new WorkspaceFilesSession({
     host,
+    sessionId,
     downloadTokenStore: new DownloadTokenStore({ ttlMs: 60_000 }),
+    previewGrantStore,
     paseoHome,
     logger: pino({ level: "silent" }),
+    getFileAccessInfo: options.getFileAccessInfo,
   });
   return {
     subsystem,
     emitted,
     binary,
     paseoHome,
+    sessionId,
+    previewGrantStore,
     setHasBinary: (value: boolean) => {
       hasBinary = value;
     },
@@ -531,6 +544,212 @@ describe("WorkspaceFilesSession", () => {
         }),
       },
     ]);
+  });
+
+  test("classifies a text file and never issues a preview token for it", async () => {
+    const cwd = makeDir("workspace-files-access-");
+    writeFileSync(join(cwd, "notes.txt"), "hello world");
+    const { subsystem, emitted } = makeSubsystem();
+
+    await subsystem.handleFilesGetAccessRequest({
+      type: "files.get_access.request",
+      cwd,
+      path: "notes.txt",
+      preview: true,
+      requestId: "req-access-text",
+    });
+
+    expect(emitted).toEqual([
+      {
+        type: "files.get_access.response",
+        payload: {
+          requestId: "req-access-text",
+          file: {
+            path: "notes.txt",
+            fileName: "notes.txt",
+            mimeType: "text/plain",
+            size: 11,
+            kind: "text",
+          },
+          previewToken: null,
+          error: null,
+        },
+      },
+    ]);
+  });
+
+  test("classifies a PDF whose sample looks like text as binary with the real MIME type", async () => {
+    const cwd = makeDir("workspace-files-access-");
+    writeFileSync(join(cwd, "doc.pdf"), "%PDF-1.4\nharmless printable header\n");
+    const { subsystem, emitted } = makeSubsystem();
+
+    await subsystem.handleFilesGetAccessRequest({
+      type: "files.get_access.request",
+      cwd,
+      path: "doc.pdf",
+      preview: true,
+      requestId: "req-access-pdf",
+    });
+
+    const message = emitted[0];
+    if (message.type !== "files.get_access.response") {
+      throw new Error(`expected files.get_access.response, got ${message.type}`);
+    }
+    expect(message.payload.file).toEqual({
+      path: "doc.pdf",
+      fileName: "doc.pdf",
+      mimeType: "application/pdf",
+      size: 35,
+      kind: "binary",
+    });
+    expect(message.payload.error).toBeNull();
+    expect(typeof message.payload.previewToken).toBe("string");
+  });
+
+  test("never grants a preview token for HTML even when preview is requested", async () => {
+    const cwd = makeDir("workspace-files-access-");
+    writeFileSync(join(cwd, "page.html"), "<html></html>");
+    const { subsystem, emitted } = makeSubsystem();
+
+    await subsystem.handleFilesGetAccessRequest({
+      type: "files.get_access.request",
+      cwd,
+      path: "page.html",
+      preview: true,
+      requestId: "req-access-html",
+    });
+
+    const message = emitted[0];
+    if (message.type !== "files.get_access.response") {
+      throw new Error(`expected files.get_access.response, got ${message.type}`);
+    }
+    expect(message.payload.previewToken).toBeNull();
+    expect(message.payload.error).toBeNull();
+    expect(message.payload.file?.kind).toBe("text");
+  });
+
+  test("reuses the same preview token for repeat requests in one session", async () => {
+    const cwd = makeDir("workspace-files-access-");
+    writeFileSync(join(cwd, "clip.mp4"), "not-really-a-video-but-thats-fine-for-mime-lookup");
+    const { subsystem, emitted } = makeSubsystem();
+
+    for (const requestId of ["req-a", "req-b"]) {
+      await subsystem.handleFilesGetAccessRequest({
+        type: "files.get_access.request",
+        cwd,
+        path: "clip.mp4",
+        preview: true,
+        requestId,
+      });
+    }
+
+    const [first, second] = emitted;
+    if (first.type !== "files.get_access.response" || second.type !== "files.get_access.response") {
+      throw new Error("expected two files.get_access.response messages");
+    }
+    expect(first.payload.previewToken).toBeTruthy();
+    expect(second.payload.previewToken).toBe(first.payload.previewToken);
+  });
+
+  test("rejects an empty file-access cwd with an error envelope", async () => {
+    const { subsystem, emitted } = makeSubsystem();
+
+    await subsystem.handleFilesGetAccessRequest({
+      type: "files.get_access.request",
+      cwd: "",
+      path: "notes.txt",
+      requestId: "req-access-empty",
+    });
+
+    expect(emitted).toEqual([
+      {
+        type: "files.get_access.response",
+        payload: {
+          requestId: "req-access-empty",
+          file: null,
+          previewToken: null,
+          error: "cwd is required",
+        },
+      },
+    ]);
+  });
+
+  test("reports an error for a missing file", async () => {
+    const cwd = makeDir("workspace-files-access-");
+    const { subsystem, emitted } = makeSubsystem();
+
+    await subsystem.handleFilesGetAccessRequest({
+      type: "files.get_access.request",
+      cwd,
+      path: "missing.txt",
+      requestId: "req-access-missing",
+    });
+
+    const message = emitted[0];
+    if (message.type !== "files.get_access.response") {
+      throw new Error(`expected files.get_access.response, got ${message.type}`);
+    }
+    expect(message.payload.file).toBeNull();
+    expect(message.payload.previewToken).toBeNull();
+    expect(message.payload.error).toBeTruthy();
+  });
+
+  test("does not mint a preview grant, or emit a response, for a request resolved after dispose", async () => {
+    const cwd = makeDir("workspace-files-access-");
+    writeFileSync(join(cwd, "clip.mp4"), "video-bytes");
+
+    let releaseClassification: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      releaseClassification = resolve;
+    });
+    const { subsystem, emitted, sessionId, previewGrantStore } = makeSubsystem({
+      getFileAccessInfo: async (params) => {
+        await gate;
+        return getFileAccessInfo(params);
+      },
+    });
+
+    const pending = subsystem.handleFilesGetAccessRequest({
+      type: "files.get_access.request",
+      cwd,
+      path: "clip.mp4",
+      preview: true,
+      requestId: "req-access-race",
+    });
+
+    subsystem.dispose();
+    releaseClassification();
+    await pending;
+
+    expect(emitted).toHaveLength(0);
+    expect(previewGrantStore.hasSessionGrants(sessionId)).toBe(false);
+  });
+
+  test("revokes an already-issued preview grant when the session disposes", async () => {
+    const cwd = makeDir("workspace-files-access-");
+    writeFileSync(join(cwd, "clip.mp4"), "video-bytes");
+    const { subsystem, emitted, sessionId, previewGrantStore } = makeSubsystem();
+
+    await subsystem.handleFilesGetAccessRequest({
+      type: "files.get_access.request",
+      cwd,
+      path: "clip.mp4",
+      preview: true,
+      requestId: "req-access-dispose",
+    });
+
+    const message = emitted[0];
+    if (message.type !== "files.get_access.response") {
+      throw new Error(`expected files.get_access.response, got ${message.type}`);
+    }
+    const token = message.payload.previewToken;
+    expect(token).toBeTruthy();
+    expect(previewGrantStore.getGrant(token as string)).not.toBeNull();
+
+    subsystem.dispose();
+
+    expect(previewGrantStore.getGrant(token as string)).toBeNull();
+    expect(previewGrantStore.hasSessionGrants(sessionId)).toBe(false);
   });
 
   test("responds to a project icon request", async () => {

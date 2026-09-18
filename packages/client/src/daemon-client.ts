@@ -33,6 +33,7 @@ import type {
   CreateAgentRequestMessage,
   CreatePaseoWorktreeRequest,
   FileDownloadTokenResponse,
+  FilesGetAccessResponse,
   FileUploadResponse,
   FileExplorerResponse,
   FileVersion,
@@ -465,6 +466,7 @@ export interface FileUploadInput {
 }
 export type FileUploadResult = FileUploadResponse["payload"];
 type FileDownloadTokenPayload = FileDownloadTokenResponse["payload"];
+type FilesGetAccessPayload = FilesGetAccessResponse["payload"];
 type ListProviderFeaturesPayload = ListProviderFeaturesResponseMessage["payload"];
 type ListProviderModelsPayload = ListProviderModelsResponseMessage["payload"];
 type ListProviderModesPayload = ListProviderModesResponseMessage["payload"];
@@ -4794,6 +4796,23 @@ export class DaemonClient {
         path,
       },
       responseType: "file_download_token_response",
+    });
+  }
+
+  async getFileAccess(params: {
+    cwd: string;
+    path: string;
+    preview?: boolean;
+    requestId?: string;
+  }): Promise<FilesGetAccessPayload> {
+    return this.sendNamespacedCorrelatedSessionRequest<"files.get_access.response">({
+      requestId: params.requestId,
+      message: {
+        type: "files.get_access.request",
+        cwd: params.cwd,
+        path: params.path,
+        preview: params.preview,
+      },
     });
   }
 

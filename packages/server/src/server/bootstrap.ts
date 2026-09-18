@@ -134,6 +134,9 @@ import { createPaseoWorktree as createRegisteredPaseoWorktree } from "./paseo-wo
 import { createWorkspaceProvisioningService } from "./session/workspace-provisioning/workspace-provisioning-service.js";
 import { createPaseoWorktreeWorkflow } from "./worktree-session.js";
 import { DownloadTokenStore } from "./file-download/token-store.js";
+import { fileContentDisposition } from "./file-download/content-disposition.js";
+import { PreviewGrantStore } from "./file-preview/grant-store.js";
+import { createFilePreviewRouteHandler } from "./file-preview/serve.js";
 import type { OpenAiSpeechProviderConfig } from "./speech/providers/openai/config.js";
 import type { LocalSpeechProviderConfig } from "./speech/providers/local/config.js";
 import type { RequestedSpeechProviders } from "./speech/speech-types.js";
@@ -639,6 +642,7 @@ export async function createPaseoDaemon(
   const downloadTokenStore = new DownloadTokenStore({
     ttlMs: downloadTokenTtlMs,
   });
+  const previewGrantStore = new PreviewGrantStore();
 
   // Capability token authenticating the daemon's own agents to the loopback
   // Agent MCP endpoint (/mcp/agents). Random per daemon run, injected only into
@@ -825,9 +829,8 @@ export async function createPaseoDaemon(
         return;
       }
 
-      const safeFileName = entry.fileName.replace(/["\r\n]/g, "_");
       res.setHeader("Content-Type", entry.mimeType);
-      res.setHeader("Content-Disposition", `attachment; filename="${safeFileName}"`);
+      res.setHeader("Content-Disposition", fileContentDisposition("attachment", entry.fileName));
       res.setHeader("Content-Length", fileStats.size.toString());
 
       const stream = fileHandle.createReadStream();
@@ -854,6 +857,8 @@ export async function createPaseoDaemon(
   app.get("/api/files/download", (req, res) => {
     void handleFileDownload(req, res);
   });
+
+  app.get("/api/files/preview", createFilePreviewRouteHandler({ previewGrantStore, logger }));
 
   const httpServer = createHTTPServer(app);
 
@@ -1697,6 +1702,7 @@ export async function createPaseoDaemon(
               agentManager,
               agentStorage,
               downloadTokenStore,
+              previewGrantStore,
               config.paseoHome,
               daemonConfigStore,
               mcpBaseUrl,

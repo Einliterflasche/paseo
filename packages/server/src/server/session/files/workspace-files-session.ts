@@ -12,6 +12,7 @@ import type {
   FileEntryDuplicateRequest,
   FileEntryRenameRequest,
   FileExplorerRequest,
+  FilesGetAccessRequest,
   FileUploadRequest,
   FileSubscribeRequest,
   FileUnsubscribeRequest,
@@ -21,11 +22,14 @@ import type {
 } from "../../messages.js";
 import { FileUploadStore } from "../../file-upload/index.js";
 import type { DownloadTokenStore } from "../../file-download/token-store.js";
+import type { PreviewGrantStore } from "../../file-preview/grant-store.js";
 import {
   createExplorerEntry,
   deleteExplorerEntry,
   duplicateExplorerEntry,
   getDownloadableFileInfo,
+  getFileAccessInfo as getFileAccessInfoDefault,
+  isPassiveMediaMimeType,
   listDirectoryEntries,
   readExplorerFile,
   renameExplorerEntry,
@@ -49,10 +53,14 @@ export interface WorkspaceFilesSessionHost {
 
 export interface WorkspaceFilesSessionOptions {
   host: WorkspaceFilesSessionHost;
+  sessionId: string;
   downloadTokenStore: DownloadTokenStore;
+  previewGrantStore: PreviewGrantStore;
   paseoHome: string;
   logger: pino.Logger;
   fileObserver?: FileObserver;
+  /** Test seam: lets a test control when file-access classification resolves. */
+  getFileAccessInfo?: typeof getFileAccessInfoDefault;
 }
 
 /**
@@ -64,16 +72,23 @@ export interface WorkspaceFilesSessionOptions {
  */
 export class WorkspaceFilesSession {
   private readonly host: WorkspaceFilesSessionHost;
+  private readonly sessionId: string;
   private readonly downloadTokenStore: DownloadTokenStore;
+  private readonly previewGrantStore: PreviewGrantStore;
   private readonly logger: pino.Logger;
   private readonly fileUploads: FileUploadStore;
   private readonly fileObserver: FileObserver;
   private readonly fileSubscriptions = new Map<string, () => void>();
+  private readonly getFileAccessInfo: typeof getFileAccessInfoDefault;
+  private disposed = false;
 
   constructor(options: WorkspaceFilesSessionOptions) {
     this.host = options.host;
+    this.sessionId = options.sessionId;
     this.downloadTokenStore = options.downloadTokenStore;
+    this.previewGrantStore = options.previewGrantStore;
     this.logger = options.logger;
+    this.getFileAccessInfo = options.getFileAccessInfo ?? getFileAccessInfoDefault;
     this.fileUploads = new FileUploadStore({ paseoHome: options.paseoHome });
     this.fileObserver = options.fileObserver ?? workspaceFileObserver;
   }
@@ -214,8 +229,10 @@ export class WorkspaceFilesSession {
   }
 
   dispose(): void {
+    this.disposed = true;
     for (const unsubscribe of this.fileSubscriptions.values()) unsubscribe();
     this.fileSubscriptions.clear();
+    this.previewGrantStore.revokeSession(this.sessionId);
   }
 
   async handleFileExplorerRequest(request: FileExplorerRequest, source?: object): Promise<void> {
@@ -458,6 +475,66 @@ export class WorkspaceFilesSession {
           error: getErrorMessage(error),
           requestId,
         },
+      });
+    }
+  }
+
+  async handleFilesGetAccessRequest(request: FilesGetAccessRequest): Promise<void> {
+    const { cwd: workspaceCwd, path: requestedPath, preview = false, requestId } = request;
+    const cwd = workspaceCwd.trim();
+    if (!cwd) {
+      this.host.emit({
+        type: "files.get_access.response",
+        payload: { requestId, file: null, previewToken: null, error: "cwd is required" },
+      });
+      return;
+    }
+
+    try {
+      const info = await this.getFileAccessInfo({ root: cwd, relativePath: requestedPath });
+
+      if (this.disposed) {
+        // The session disposed while classification was in flight. Nobody
+        // owns this response anymore, and minting a grant now would attach
+        // it to a session id that will never call revokeSession again.
+        return;
+      }
+
+      let previewToken: string | null = null;
+      if (preview && isPassiveMediaMimeType(info.mimeType)) {
+        const grant = this.previewGrantStore.issueGrant({
+          sessionId: this.sessionId,
+          absolutePath: info.absolutePath,
+          fileName: info.fileName,
+          mimeType: info.mimeType,
+          identity: info.identity,
+        });
+        previewToken = grant.token;
+      }
+
+      this.host.emit({
+        type: "files.get_access.response",
+        payload: {
+          requestId,
+          file: {
+            path: info.path,
+            fileName: info.fileName,
+            mimeType: info.mimeType,
+            size: info.size,
+            kind: info.kind,
+          },
+          previewToken,
+          error: null,
+        },
+      });
+    } catch (error) {
+      this.logger.error(
+        { err: error, cwd, path: requestedPath },
+        `Failed to resolve file access for workspace ${cwd}`,
+      );
+      this.host.emit({
+        type: "files.get_access.response",
+        payload: { requestId, file: null, previewToken: null, error: getErrorMessage(error) },
       });
     }
   }

@@ -187,6 +187,7 @@ import type { HubRelationshipManagement } from "./hub/relationship-controller.js
 import { HubExecutionController } from "./hub/execution-controller.js";
 import type { HubExecutionAgents } from "./hub/daemon-executions.js";
 import { DownloadTokenStore } from "./file-download/token-store.js";
+import { PreviewGrantStore } from "./file-preview/grant-store.js";
 import type { PushNotifications } from "./push/index.js";
 import {
   archivePersistedWorkspaceRecord,
@@ -461,6 +462,7 @@ export interface SessionOptions {
   onWorkspaceRecovered?: (workspace: PersistedWorkspaceRecord) => Promise<void>;
   logger: pino.Logger;
   downloadTokenStore: DownloadTokenStore;
+  previewGrantStore: PreviewGrantStore;
   pushNotifications: PushNotifications;
   paseoHome: string;
   worktreesRoot?: string;
@@ -779,6 +781,7 @@ export class Session {
       onWorkspaceRecovered,
       logger,
       downloadTokenStore,
+      previewGrantStore,
       pushNotifications,
       paseoHome,
       worktreesRoot,
@@ -852,7 +855,9 @@ export class Session {
         emitBinary: (frame, source) => this.emitBinaryForFileTransfer(frame, source),
         hasBinaryChannel: () => this.onBinaryMessage !== null,
       },
+      sessionId: this.sessionId,
       downloadTokenStore,
+      previewGrantStore,
       paseoHome,
       logger: this.sessionLogger,
     });
@@ -2660,6 +2665,8 @@ export class Session {
         return this.handleProjectIconGetRequest(msg.projectId, msg.requestId);
       case "file_download_token_request":
         return this.workspaceFilesSession.handleFileDownloadTokenRequest(msg);
+      case "files.get_access.request":
+        return this.workspaceFilesSession.handleFilesGetAccessRequest(msg);
       case "file.upload.request":
         this.workspaceFilesSession.handleFileUploadRequest(msg);
         return undefined;

@@ -293,6 +293,15 @@ from one stable file handle. Each transfer awaits completion of its own physical
 reading the next chunk; it is scoped to the requesting physical socket and does not queue unrelated
 messages or transfers.
 
+Browser file links use the active host connection for HTTP delivery; a saved
+loopback or LAN address may be unreachable from the browser. Preview access is
+issued over the authenticated WebSocket and belongs to that session and file
+revision. Reconnects need a fresh grant. Keep ordinary downloads one-use and
+serve seekable media through the separate preview endpoint. Only passive media
+and PDF may use inline HTTP delivery on the app origin; HTML stays inside its
+existing sandboxed viewer. Automatic browser opens or downloads belong to the
+link-click action, never to a file pane mounting or becoming visible.
+
 ### Compatibility rules
 
 - WebSocket schemas are append-only. Add fields, do not remove fields, and never make optional fields required.

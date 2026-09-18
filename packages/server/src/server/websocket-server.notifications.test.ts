@@ -4,6 +4,7 @@ import type pino from "pino";
 import type { AgentManager } from "./agent/agent-manager.js";
 import type { AgentStorage } from "./agent/agent-storage.js";
 import type { DownloadTokenStore } from "./file-download/token-store.js";
+import type { PreviewGrantStore } from "./file-preview/grant-store.js";
 import type { DaemonConfigStore } from "./daemon-config-store.js";
 import type { ScheduleService } from "./schedule/service.js";
 import type { CheckoutDiffManager } from "./checkout-diff-manager.js";
@@ -111,6 +112,7 @@ function createServer(agentManagerOverrides?: Record<string, unknown>) {
     createStub<AgentManager>(agentManager),
     createStub<AgentStorage>({}),
     createStub<DownloadTokenStore>({}),
+    createStub<PreviewGrantStore>({}),
     "/tmp/paseo-test",
     createStub<DaemonConfigStore>(daemonConfigStore),
     null,

@@ -8,6 +8,7 @@ import { monitorEventLoopDelay } from "node:perf_hooks";
 import type { AgentManager, AgentMetricsSnapshot } from "./agent/agent-manager.js";
 import type { AgentStorage } from "./agent/agent-storage.js";
 import type { DownloadTokenStore } from "./file-download/token-store.js";
+import type { PreviewGrantStore } from "./file-preview/grant-store.js";
 import type { TerminalManager } from "../terminal/terminal-manager.js";
 import type pino from "pino";
 import type { ProjectRegistry, WorkspaceRegistry } from "./workspace-registry.js";
@@ -562,6 +563,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly workspaceGitService: WorkspaceGitService;
   private readonly workspaceAutoName: WorkspaceAutoName;
   private readonly downloadTokenStore: DownloadTokenStore;
+  private readonly previewGrantStore: PreviewGrantStore;
   private readonly paseoHome: string;
   private readonly worktreesRoot: string | undefined;
   private readonly daemonConfigStore: DaemonConfigStore;
@@ -626,6 +628,7 @@ export class VoiceAssistantWebSocketServer {
     agentManager: AgentManager,
     agentStorage: AgentStorage,
     downloadTokenStore: DownloadTokenStore,
+    previewGrantStore: PreviewGrantStore,
     paseoHome: string,
     daemonConfigStore: DaemonConfigStore,
     mcpBaseUrl: string | null,
@@ -698,6 +701,7 @@ export class VoiceAssistantWebSocketServer {
     this.workspaceGitService = workspaceGitService ?? createFallbackWorkspaceGitService();
     this.workspaceAutoName = workspaceAutoName;
     this.downloadTokenStore = downloadTokenStore;
+    this.previewGrantStore = previewGrantStore;
     this.paseoHome = paseoHome;
     this.worktreesRoot = daemonRuntimeConfig?.worktreesRoot;
     this.daemonConfigStore = daemonConfigStore;
@@ -1421,6 +1425,7 @@ export class VoiceAssistantWebSocketServer {
         );
       },
       downloadTokenStore: this.downloadTokenStore,
+      previewGrantStore: this.previewGrantStore,
       pushNotifications: this.pushNotifications,
       paseoHome: this.paseoHome,
       worktreesRoot: this.worktreesRoot,
@@ -1734,6 +1739,7 @@ export class VoiceAssistantWebSocketServer {
         workspaceRecovery: true,
         // COMPAT(workspaceFileEditing): added in v0.2.0, remove after 2027-01-18 once daemon floor >= v0.2.0.
         workspaceFileEditing: true,
+        fileAccess: true,
         // COMPAT(providerUsageList): added in v0.1.98, drop the gate when daemon floor >= v0.1.98.
         providerUsageList: true,
         // COMPAT(agentDetach): added in v0.1.98, remove gate after 2026-12-19 once daemon floor >= v0.1.98.

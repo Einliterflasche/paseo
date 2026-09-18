@@ -2763,6 +2763,14 @@ export const FileDownloadTokenRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const FilesGetAccessRequestSchema = z.object({
+  type: z.literal("files.get_access.request"),
+  cwd: z.string(),
+  path: z.string(),
+  preview: z.boolean().optional(),
+  requestId: z.string(),
+});
+
 export const FileUploadRequestSchema = z.object({
   type: z.literal("file.upload.request"),
   fileName: z.string().min(1),
@@ -3222,6 +3230,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ProjectIconRequestSchema,
   ProjectIconGetRequestSchema,
   FileDownloadTokenRequestSchema,
+  FilesGetAccessRequestSchema,
   FileUploadRequestSchema,
   ClearAgentAttentionMessageSchema,
   ClientHeartbeatMessageSchema,
@@ -3523,6 +3532,7 @@ export const ServerInfoStatusPayloadSchema = z
         workspaceRecovery: z.boolean().optional(),
         // COMPAT(workspaceFileEditing): added in v0.2.0, remove after 2027-01-18 once daemon floor >= v0.2.0.
         workspaceFileEditing: z.boolean().optional(),
+        fileAccess: z.boolean().optional(),
         // COMPAT(providerUsageList): added in v0.1.98, drop the gate when daemon floor >= v0.1.98.
         providerUsageList: z.boolean().optional(),
         // COMPAT(agentDetach): added in v0.1.98, remove gate after 2026-12-19 once daemon floor >= v0.1.98.
@@ -5860,6 +5870,24 @@ export const FileDownloadTokenResponseSchema = z.object({
   }),
 });
 
+export const FileAccessInfoSchema = z.object({
+  path: z.string(),
+  fileName: z.string(),
+  mimeType: z.string(),
+  size: z.number(),
+  kind: z.enum(["text", "image", "binary"]),
+});
+
+export const FilesGetAccessResponseSchema = z.object({
+  type: z.literal("files.get_access.response"),
+  payload: z.object({
+    requestId: z.string(),
+    file: FileAccessInfoSchema.nullable(),
+    previewToken: z.string().nullable(),
+    error: z.string().nullable(),
+  }),
+});
+
 export const FileUploadResponseSchema = z.object({
   type: z.literal("file.upload.response"),
   payload: z.object({
@@ -6636,6 +6664,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   ProjectIconResponseSchema,
   ProjectIconGetResponseSchema,
   FileDownloadTokenResponseSchema,
+  FilesGetAccessResponseSchema,
   FileUploadResponseSchema,
   ListProviderModelsResponseMessageSchema,
   ListProviderModesResponseMessageSchema,
@@ -7082,6 +7111,9 @@ export type ProjectIconGetResponse = z.infer<typeof ProjectIconGetResponseSchema
 export type ProjectIcon = z.infer<typeof ProjectIconSchema>;
 export type FileDownloadTokenRequest = z.infer<typeof FileDownloadTokenRequestSchema>;
 export type FileDownloadTokenResponse = z.infer<typeof FileDownloadTokenResponseSchema>;
+export type FilesGetAccessRequest = z.infer<typeof FilesGetAccessRequestSchema>;
+export type FilesGetAccessResponse = z.infer<typeof FilesGetAccessResponseSchema>;
+export type FileAccessInfo = z.infer<typeof FileAccessInfoSchema>;
 export type FileUploadRequest = z.infer<typeof FileUploadRequestSchema>;
 export type FileUploadResponse = z.infer<typeof FileUploadResponseSchema>;
 export type RestartServerRequestMessage = z.infer<typeof RestartServerRequestMessageSchema>;
