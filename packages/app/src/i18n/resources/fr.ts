@@ -1803,6 +1803,7 @@ export const fr: TranslationResources = {
     dontAskAgain: "Ne demande plus",
   },
   downloads: {
+    browserStarted: en.downloads.browserStarted,
     requestTokenFailed: "Échec de la demande du jeton de téléchargement.",
     hostUnavailable: "L'hôte de téléchargement n'est pas disponible.",
     cancelled: "Le téléchargement a été annulé.",
@@ -1829,12 +1830,15 @@ export const fr: TranslationResources = {
     archiveFinishedAction: "Archiver les sous-agents terminés",
     archiveFinishedRetry: "Réessayer ({{failed}}/{{total}})",
   },
+  fileOpening: en.fileOpening,
   panels: {
     draft: {
       newAgent: "Nouvel agent",
       creatingAgent: "Agent créateur",
     },
     file: {
+      media: en.panels.file.media,
+      pdf: en.panels.file.pdf,
       directoryMissing: "Répertoire Workspace introuvable.",
       loading: "Chargement du fichier...",
       noPreview: "Aucun aperçu disponible",

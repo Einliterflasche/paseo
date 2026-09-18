@@ -1732,6 +1732,7 @@ export const zhCN: TranslationResources = {
     dontAskAgain: "不再询问",
   },
   downloads: {
+    browserStarted: en.downloads.browserStarted,
     requestTokenFailed: "请求下载 token 失败。",
     hostUnavailable: "下载 Host 不可用。",
     cancelled: "下载已取消。",
@@ -1758,12 +1759,15 @@ export const zhCN: TranslationResources = {
     archiveFinishedAction: "归档已完成的 subagent",
     archiveFinishedRetry: "重试 ({{failed}}/{{total}})",
   },
+  fileOpening: en.fileOpening,
   panels: {
     draft: {
       newAgent: "新建 Agent",
       creatingAgent: "正在创建 Agent",
     },
     file: {
+      media: en.panels.file.media,
+      pdf: en.panels.file.pdf,
       directoryMissing: "未找到 workspace 目录。",
       loading: "正在加载文件...",
       noPreview: "没有可用预览",

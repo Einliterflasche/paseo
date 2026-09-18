@@ -1753,6 +1753,7 @@ export const ar: TranslationResources = {
     dontAskAgain: "لا تسأل مرة أخرى",
   },
   downloads: {
+    browserStarted: en.downloads.browserStarted,
     requestTokenFailed: "فشل طلب رمز التنزيل.",
     hostUnavailable: "مضيف التنزيل غير متاح.",
     cancelled: "تم إلغاء التنزيل.",
@@ -1779,12 +1780,15 @@ export const ar: TranslationResources = {
     archiveFinishedAction: "أرشفة الوكلاء الفرعيين المكتملين",
     archiveFinishedRetry: "إعادة المحاولة ({{failed}}/{{total}})",
   },
+  fileOpening: en.fileOpening,
   panels: {
     draft: {
       newAgent: "وكيل جديد",
       creatingAgent: "وكيل الخلق",
     },
     file: {
+      media: en.panels.file.media,
+      pdf: en.panels.file.pdf,
       directoryMissing: "لم يتم العثور على دليل Workspace.",
       loading: "جارٍ تحميل الملف...",
       noPreview: "لا تتوفر معاينة",

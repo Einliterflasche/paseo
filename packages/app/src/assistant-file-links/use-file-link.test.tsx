@@ -160,6 +160,7 @@ describe("useFileLink", () => {
     await waitFor(() => {
       expect(toast.show).toHaveBeenCalledWith("No file found for dumm.md", {
         variant: "error",
+        durationMs: null,
         testID: "assistant-file-link-not-found-toast",
       });
     });

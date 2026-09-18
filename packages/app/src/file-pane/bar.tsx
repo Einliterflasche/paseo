@@ -1,15 +1,23 @@
 import { Text, View } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { useTranslation } from "react-i18next";
+import { Download } from "lucide-react-native";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
-import { PaneContentToolbar } from "@/components/ui/pane-content-toolbar";
+import {
+  PaneContentToolbar,
+  paneContentToolbarIconSize,
+  ToolbarButton,
+} from "@/components/ui/pane-content-toolbar";
+import { extraMutedIconColorMapping } from "@/components/ui/icon-button-chrome";
 import { SegmentedControl } from "@/components/ui/segmented-control";
+import { useIsCompactFormFactor } from "@/constants/layout";
 import type { Theme } from "@/styles/theme";
 import { FileConflictAlert, type FileConflictAlertState } from "./conflict-alert";
 import type { FileEditorStatus } from "./editor/model";
 
 const ThemedSpinner = withUnistyles(LoadingSpinner);
 const spinnerMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
+const ThemedDownload = withUnistyles(Download);
 
 export function FilePanelBar({
   size,
@@ -20,8 +28,9 @@ export function FilePanelBar({
   cursor,
   vimMode,
   conflict,
+  onDownload,
 }: {
-  size: number;
+  size?: number;
   lineCount?: number;
   mode?: "preview" | "source";
   onModeChange?(mode: "preview" | "source"): void;
@@ -29,8 +38,10 @@ export function FilePanelBar({
   cursor?: { line: number; column: number };
   vimMode?: string | null;
   conflict?: FileConflictAlertState;
+  onDownload?(): void;
 }) {
   const { t } = useTranslation();
+  const isCompact = useIsCompactFormFactor();
   const previewModes = [
     {
       value: "preview" as const,
@@ -44,12 +55,16 @@ export function FilePanelBar({
       <PaneContentToolbar testID="file-panel-bar">
         <View style={styles.row}>
           <View style={styles.metadata}>
-            <Text
-              style={styles.whisper}
-              accessibilityLabel={t("panels.file.editor.fileSize", { size: formatFileSize(size) })}
-            >
-              {formatFileSize(size)}
-            </Text>
+            {size !== undefined ? (
+              <Text
+                style={styles.whisper}
+                accessibilityLabel={t("panels.file.editor.fileSize", {
+                  size: formatFileSize(size),
+                })}
+              >
+                {formatFileSize(size)}
+              </Text>
+            ) : null}
             {lineCount !== undefined ? (
               <Text
                 style={styles.whisper}
@@ -107,6 +122,20 @@ export function FilePanelBar({
               testID="file-preview-mode"
               options={previewModes}
             />
+          ) : null}
+          {onDownload ? (
+            <ToolbarButton
+              compact={isCompact}
+              label={t("workspace.fileActions.download")}
+              onPress={onDownload}
+              testID="file-download-button"
+            >
+              <ThemedDownload
+                size={paneContentToolbarIconSize(isCompact)}
+                strokeWidth={1.5}
+                uniProps={extraMutedIconColorMapping}
+              />
+            </ToolbarButton>
           ) : null}
         </View>
       </PaneContentToolbar>

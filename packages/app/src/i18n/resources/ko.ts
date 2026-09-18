@@ -1763,6 +1763,7 @@ export const ko: TranslationResources = {
     dontAskAgain: "다시 묻지 않기",
   },
   downloads: {
+    browserStarted: en.downloads.browserStarted,
     requestTokenFailed: "다운로드 토큰을 요청하지 못했습니다.",
     hostUnavailable: "다운로드 호스트를 사용할 수 없습니다.",
     cancelled: "다운로드가 취소되었습니다.",
@@ -1789,12 +1790,15 @@ export const ko: TranslationResources = {
     archiveFinishedAction: "완료된 하위 에이전트 보관",
     archiveFinishedRetry: "다시 시도 ({{failed}}/{{total}})",
   },
+  fileOpening: en.fileOpening,
   panels: {
     draft: {
       newAgent: "새 에이전트",
       creatingAgent: "에이전트 생성 중",
     },
     file: {
+      media: en.panels.file.media,
+      pdf: en.panels.file.pdf,
       directoryMissing: "워크스페이스 디렉터리를 찾을 수 없습니다.",
       loading: "파일 불러오는 중...",
       noPreview: "사용 가능한 미리보기가 없습니다",

@@ -259,6 +259,16 @@ function parseSettledAssistantImageMarkdown(prompt: AgentPromptInput): string | 
   return match?.[1] ?? null;
 }
 
+// Test-only seam: lets e2e specs drive the real assistant-file-link click
+// dispatcher (a markdown link to an arbitrary absolute path) without a paid
+// real agent. Mirrors parseSettledAssistantImageMarkdown above.
+function parseSettledAssistantLinkMarkdown(prompt: AgentPromptInput): string | null {
+  const match = /^emit settled assistant link markdown:\s*(\[[^\]\r\n]*\]\(.+\))\s*$/i.exec(
+    promptToText(prompt),
+  );
+  return match?.[1] ?? null;
+}
+
 function parseMockQuestionPrompt(prompt: AgentPromptInput): MockQuestionPromptRequest | null {
   const text = promptToText(prompt);
   if (!/emit\s+(?:a\s+)?synthetic\s+questions?/i.test(text)) {
@@ -821,6 +831,7 @@ export class MockLoadTestAgentSession implements AgentSession {
     const questionPrompt = parseMockQuestionPrompt(prompt);
     const structuredBranchName = parseStructuredBranchNamePrompt(prompt);
     const settledAssistantImageMarkdown = parseSettledAssistantImageMarkdown(prompt);
+    const settledAssistantLinkMarkdown = parseSettledAssistantLinkMarkdown(prompt);
     const steeringReplayShape = parseSteeringReplayShape(prompt);
     const scheduleTurn = () => {
       if (shouldEmitTurnFailure(prompt)) {
@@ -835,6 +846,8 @@ export class MockLoadTestAgentSession implements AgentSession {
         this.scheduleSettledAssistantTurn(turn, JSON.stringify(structuredBranchName));
       } else if (settledAssistantImageMarkdown) {
         this.scheduleSettledAssistantTurn(turn, settledAssistantImageMarkdown);
+      } else if (settledAssistantLinkMarkdown) {
+        this.scheduleSettledAssistantTurn(turn, settledAssistantLinkMarkdown);
       } else if (shouldEmitPlanApprovalPrompt(prompt)) {
         this.schedulePlanApprovalTurn(turn);
       } else if (questionPrompt) {

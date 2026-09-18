@@ -1763,12 +1763,23 @@ export const en = {
     dontAskAgain: "Don't ask again",
   },
   downloads: {
+    browserStarted: "Download sent to browser",
     requestTokenFailed: "Failed to request download token.",
     hostUnavailable: "Download host is unavailable.",
     cancelled: "Download was cancelled.",
     failed: "Failed to download file.",
     shareFile: "Share file",
     shareFileNamed: "Share {{fileName}}",
+  },
+  fileOpening: {
+    pending: "Opening file…",
+    opened: "File opened",
+    downloadRequested: "Download requested",
+    failed: "Could not open file.",
+    missingPath: "This file has no workspace or absolute path.",
+    popupBlocked: "The file needs a browser tab. Allow pop-ups for Paseo, then Retry.",
+    missingGrant: "The host could not open this file for preview.",
+    downloadFailed: "The download could not start. Check the connection and Retry.",
   },
   menu: {
     backdrop: "Menu backdrop",
@@ -1822,6 +1833,14 @@ export const en = {
         reload: "Reload",
         reloadTitle: "Reload from disk?",
         reloadMessage: "Your local changes will be lost.",
+      },
+      media: {
+        loadError: "Unable to play this file",
+      },
+      pdf: {
+        openInBrowser: "Open in browser",
+        tabBlocked: "Your browser blocked the new tab. Allow pop-ups and try again.",
+        openFailed: "Unable to open this file",
       },
     },
     files: {

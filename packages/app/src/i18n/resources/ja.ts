@@ -1770,6 +1770,7 @@ export const ja: TranslationResources = {
     dontAskAgain: "次回から確認しない",
   },
   downloads: {
+    browserStarted: en.downloads.browserStarted,
     requestTokenFailed: "ダウンロードトークンのリクエストに失敗しました。",
     hostUnavailable: "ダウンロードホストが利用できません。",
     cancelled: "ダウンロードがキャンセルされました。",
@@ -1796,12 +1797,15 @@ export const ja: TranslationResources = {
     archiveFinishedAction: "完了したサブエージェントをアーカイブ",
     archiveFinishedRetry: "再試行 ({{failed}}/{{total}})",
   },
+  fileOpening: en.fileOpening,
   panels: {
     draft: {
       newAgent: "新しいエージェント",
       creatingAgent: "エージェントを作成中",
     },
     file: {
+      media: en.panels.file.media,
+      pdf: en.panels.file.pdf,
       directoryMissing: "ワークスペースディレクトリが見つかりません。",
       loading: "ファイルを読み込み中...",
       noPreview: "プレビューが利用できません",

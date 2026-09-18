@@ -1785,6 +1785,7 @@ export const ptBR: TranslationResources = {
     dontAskAgain: "Não perguntar novamente",
   },
   downloads: {
+    browserStarted: en.downloads.browserStarted,
     requestTokenFailed: "Falha ao solicitar token de download.",
     hostUnavailable: "Host de download indisponível.",
     cancelled: "Download cancelado.",
@@ -1811,12 +1812,15 @@ export const ptBR: TranslationResources = {
     archiveFinishedAction: "Arquivar subagentes concluídos",
     archiveFinishedRetry: "Tentar novamente ({{failed}}/{{total}})",
   },
+  fileOpening: en.fileOpening,
   panels: {
     draft: {
       newAgent: "Novo Agente",
       creatingAgent: "Criando agente",
     },
     file: {
+      media: en.panels.file.media,
+      pdf: en.panels.file.pdf,
       directoryMissing: "Diretório do workspace não encontrado.",
       loading: "Carregando arquivo...",
       noPreview: "Nenhuma prévia disponível",

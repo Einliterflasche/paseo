@@ -7,6 +7,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { StyleSheet, useUnistyles } from "react-native-unistyles";
 import { Check, X, XCircle } from "lucide-react-native";
 import { useDownloadStore, formatSpeed, formatEta, type Download } from "@/stores/download-store";
+import { isWeb } from "@/constants/platform";
 
 const AUTO_DISMISS_DELAY = 3000;
 
@@ -17,7 +18,8 @@ function getDownloadStatusText(download: Download, t: TFunction): string {
     }
     return t("common.states.starting");
   }
-  if (download.status === "complete") return t("common.states.downloadComplete");
+  if (download.status === "complete")
+    return t(isWeb ? "downloads.browserStarted" : "common.states.downloadComplete");
   return download.message ?? t("common.states.downloadFailed");
 }
 
@@ -38,7 +40,7 @@ export function DownloadToast() {
       dismissTimeoutRef.current = null;
     }
 
-    if (activeDownload && activeDownload.status !== "downloading") {
+    if (activeDownload?.status === "complete") {
       dismissTimeoutRef.current = setTimeout(() => {
         dismissDownload(activeDownload.id);
       }, AUTO_DISMISS_DELAY);

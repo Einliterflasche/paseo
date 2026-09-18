@@ -24,12 +24,20 @@ import { useAppActivelyVisible } from "@/hooks/use-app-visible";
 import { isFileQueryEnabled } from "@/components/file-pane-enabled";
 import { isWeb } from "@/constants/platform";
 import { useAppSettings } from "@/hooks/use-settings";
+import { useFileDownload } from "@/hooks/use-file-download";
+import { useFileAccess, resolveFilePreviewUrl } from "@/files/access";
+import { getMediaKind } from "@/files/presentation";
 import { useLiveFile } from "./live-file/hook";
 import { useFilePreview } from "./preview-lifecycle/hook";
-import { resolveFilePreviewLifecycle } from "./preview-lifecycle/model";
+import {
+  resolveFilePreviewLifecycle,
+  type FilePreviewLifecycleSnapshot,
+} from "./preview-lifecycle/model";
 import { FilePanelBar } from "./bar";
 import { FileHtmlPreview } from "./html-preview";
 import { FileMarkdownPreview } from "./markdown-preview";
+import { MediaPreview } from "./media-preview";
+import { PdfPreview } from "./pdf-preview";
 import { FileEditorModel, getFileConflictCallout, type FileConflictCallout } from "./editor/model";
 import { createFileObservationSource } from "./editor/observation-source";
 import { FileEditorView } from "./editor/view";
@@ -40,6 +48,9 @@ import { confirmDialog } from "@/utils/confirm-dialog";
 import { usePublishPanelInstanceAttributes } from "@/panels/panel-instance-attributes";
 import type { Theme } from "@/styles/theme";
 import { ZoomableImage } from "@/components/zoomable-viewport/image";
+
+type FileAccessResult = NonNullable<ReturnType<typeof useFileAccess>["data"]>;
+type AccessFile = NonNullable<FileAccessResult["file"]>;
 
 const ThemedLoadingSpinner = withUnistyles(LoadingSpinner);
 const foregroundMutedColorMapping = (theme: Theme) => ({
@@ -64,6 +75,93 @@ function trimNonEmpty(value: string | null | undefined): string | null {
   }
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+function classifyAccessedFile(file: AccessFile | null): {
+  mediaKind: "video" | "audio" | null;
+  isPdf: boolean;
+} {
+  if (!file) {
+    return { mediaKind: null, isPdf: false };
+  }
+  return { mediaKind: getMediaKind(file.mimeType), isPdf: file.mimeType === "application/pdf" };
+}
+
+function resolveAccessErrorMessage(input: {
+  isError: boolean;
+  error: unknown;
+  hasData: boolean;
+  connectionError: string | null;
+  fallback: string;
+}): string | null {
+  if (input.isError) {
+    return input.error instanceof Error ? input.error.message : input.fallback;
+  }
+  // Metadata already loaded once (even if now stale) keeps rendering from
+  // that data — a later offline blip must not blank out an open editor.
+  if (!input.hasData && input.connectionError) {
+    return input.connectionError;
+  }
+  return null;
+}
+
+function resolveMediaUrl(input: {
+  mediaKind: "video" | "audio" | null;
+  previewToken: string | null;
+  serverId: string;
+  fallback: string;
+}): { url: string | null; error: string | null } {
+  if (!input.mediaKind || !input.previewToken) {
+    return { url: null, error: null };
+  }
+  // resolveFilePreviewUrl throws when the connection dropped since access
+  // resolved; catch here so no render path ever throws.
+  try {
+    return { url: resolveFilePreviewUrl(input.serverId, input.previewToken), error: null };
+  } catch (err) {
+    return { url: null, error: err instanceof Error ? err.message : input.fallback };
+  }
+}
+
+function isTextExplorerFile(file: ExplorerFile | null): file is TextExplorerFile {
+  return file !== null && file.kind === "text";
+}
+
+function isLiveReadableKind(kind: AccessFile["kind"] | undefined): boolean {
+  return kind === "text" || kind === "image";
+}
+
+function derivePreviewDisplayState(input: {
+  previewLifecycle: FilePreviewLifecycleSnapshot;
+  preview: ExplorerFile | null;
+  hasLineTarget: boolean;
+  path: string;
+  previewMode: "preview" | "source";
+  setPreviewMode: (mode: "preview" | "source") => void;
+}): {
+  lineCount: number | undefined;
+  errorMessage: string | null;
+  isLoading: boolean;
+  activePreviewMode: "preview" | "source" | undefined;
+  activeOnPreviewModeChange: ((mode: "preview" | "source") => void) | undefined;
+} {
+  const canTogglePreviewMode =
+    isRenderablePreview(input.preview, input.path) && !input.hasLineTarget;
+  const lineCount =
+    input.preview?.kind === "text" ? (input.preview.content ?? "").split("\n").length : undefined;
+  const errorMessage =
+    input.previewLifecycle.status === "error" ? input.previewLifecycle.message : null;
+  const isLoading =
+    input.previewLifecycle.status === "initial" ||
+    input.previewLifecycle.status === "read_pending" ||
+    input.previewLifecycle.status === "preparing";
+  return {
+    lineCount,
+    errorMessage,
+    isLoading,
+    activePreviewMode: canTogglePreviewMode ? input.previewMode : undefined,
+    activeOnPreviewModeChange: canTogglePreviewMode ? input.setPreviewMode : undefined,
+  };
 }
 
 function formatFileSize({ size }: { size: number }): string {
@@ -123,6 +221,31 @@ function TooLargeSource({ size }: { size?: number }) {
     <View style={styles.centerState} testID="file-source-too-large">
       <Text style={styles.emptyText}>{t("panels.file.tooLargeToDisplay")}</Text>
       {size ? <Text style={styles.binaryMetaText}>{formatFileSize({ size })}</Text> : null}
+    </View>
+  );
+}
+
+function BinaryFilePreview({
+  fileName,
+  size,
+  onDownload,
+}: {
+  fileName: string;
+  size: number;
+  onDownload?: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <View style={styles.centerState} testID="file-binary-preview">
+      <Text style={styles.emptyText}>{t("panels.file.binaryPreviewUnavailable")}</Text>
+      <Text style={styles.binaryMetaText}>
+        {fileName} · {formatFileSize({ size })}
+      </Text>
+      {onDownload ? (
+        <Button variant="outline" size="sm" onPress={onDownload}>
+          {t("workspace.fileActions.download")}
+        </Button>
+      ) : null}
     </View>
   );
 }
@@ -262,11 +385,41 @@ export function FilePane({
     isTabActive: isActive,
     isAppVisible,
   });
+  const targetCwd = readTarget?.cwd ?? null;
+  const targetPath = readTarget?.path ?? null;
+
+  // Obtain metadata before the live text read: a video/audio/PDF file gets its
+  // own player/placeholder and must never flow through the text-preview budget.
+  const access = useFileAccess({ serverId, cwd: targetCwd, path: targetPath, enabled });
+  const accessFile = access.data?.file ?? null;
+  const { mediaKind, isPdf } = classifyAccessedFile(accessFile);
+  const accessErrorMessage = resolveAccessErrorMessage({
+    isError: access.isError,
+    error: access.error,
+    hasData: access.data !== undefined,
+    connectionError: access.connectionError,
+    fallback: t("panels.file.failedToLoad"),
+  });
+  const previewToken = access.data?.previewToken ?? null;
+  const mediaUrl = useMemo(
+    () =>
+      resolveMediaUrl({
+        mediaKind,
+        previewToken,
+        serverId,
+        fallback: t("panels.file.failedToLoadPreview"),
+      }),
+    [mediaKind, previewToken, serverId, t],
+  );
+
+  // Only text/image content goes through the live-read/text-preview pipeline.
+  // Media, PDF, and ordinary binary files are rendered from access metadata
+  // alone and never get whole-read into the text-preview budget.
   const liveFile = useLiveFile({
     client,
-    cwd: readTarget?.cwd ?? null,
-    path: readTarget?.path ?? null,
-    enabled,
+    cwd: targetCwd,
+    path: targetPath,
+    enabled: enabled && isLiveReadableKind(accessFile?.kind),
     liveUpdates: supportsEditing,
   });
 
@@ -280,19 +433,36 @@ export function FilePane({
 
   const { file: preview, imageAttachment } = resolveFilePreviewLifecycle(previewLifecycle);
   const imagePreviewUri = useAttachmentPreviewUrl(imageAttachment);
-  const isRenderable = isRenderablePreview(preview, location.path);
   const editable = isEditableTextFile({
     preview,
     supportsEditing,
   });
-  const canTogglePreviewMode = isRenderable && !location.lineStart;
-  const lineCount =
-    preview?.kind === "text" ? (preview.content ?? "").split("\n").length : undefined;
-  const errorMessage = previewLifecycle.status === "error" ? previewLifecycle.message : null;
-  const isLoading =
-    previewLifecycle.status === "initial" ||
-    previewLifecycle.status === "read_pending" ||
-    previewLifecycle.status === "preparing";
+  const { lineCount, errorMessage, isLoading, activePreviewMode, activeOnPreviewModeChange } =
+    derivePreviewDisplayState({
+      previewLifecycle,
+      preview,
+      hasLineTarget: Boolean(location.lineStart),
+      path: location.path,
+      previewMode,
+      setPreviewMode,
+    });
+
+  const filename = getFileNameFromPath(location.path) ?? location.path;
+  const downloadFile = useFileDownload({
+    serverId,
+    workspaceRoot: targetCwd ?? normalizedWorkspaceRoot,
+  });
+  const downloadCurrentFile = useCallback(() => {
+    if (!readTarget) return;
+    downloadFile({ fileName: filename, path: readTarget.path });
+  }, [downloadFile, filename, readTarget]);
+  const onDownload = readTarget ? downloadCurrentFile : undefined;
+  const retryMediaAccess = useCallback(async () => {
+    const result = await access.refetch();
+    if (result.error) {
+      throw result.error;
+    }
+  }, [access]);
 
   return (
     <FilePanePresentation
@@ -304,9 +474,9 @@ export function FilePane({
       onRetryRead={liveFile.refresh}
       retryingRead={liveFile.isRetrying}
       retryLabel={t("common.actions.retry")}
-      filename={getFileNameFromPath(location.path) ?? location.path}
-      previewMode={canTogglePreviewMode ? previewMode : undefined}
-      onPreviewModeChange={canTogglePreviewMode ? setPreviewMode : undefined}
+      filename={filename}
+      previewMode={activePreviewMode}
+      onPreviewModeChange={activeOnPreviewModeChange}
       lineCount={lineCount}
       editable={editable}
       disconnectedMessage={t("workspace.terminal.hostDisconnected")}
@@ -316,6 +486,16 @@ export function FilePane({
       location={location}
       navigationRevision={navigationRevision}
       imagePreviewUri={imagePreviewUri}
+      onDownload={onDownload}
+      mediaKind={mediaKind}
+      isPdf={isPdf}
+      accessFile={accessFile}
+      accessErrorMessage={accessErrorMessage}
+      mediaUrl={mediaUrl.url}
+      mediaUrlError={mediaUrl.error}
+      onRetryAccess={access.refetch}
+      onRetryMediaAccess={retryMediaAccess}
+      isPanelActive={isActive}
     />
   );
 }
@@ -334,6 +514,87 @@ function isEditableTextFile(input: {
     input.preview?.kind === "text" &&
     input.preview.size <= 1024 * 1024,
   );
+}
+
+type FilePaneView =
+  | { kind: "disconnected" }
+  | { kind: "accessError"; message: string }
+  | {
+      kind: "media";
+      mediaKind: "video" | "audio";
+      accessFile: AccessFile;
+      url: string | null;
+      urlError: string | null;
+    }
+  | { kind: "pdf"; accessFile: AccessFile; cwd: string; path: string }
+  | { kind: "binary"; accessFile: AccessFile }
+  | { kind: "editable"; client: DaemonClient; cwd: string; path: string; preview: TextExplorerFile }
+  | { kind: "tooLarge" }
+  | { kind: "error"; message: string }
+  | { kind: "default" };
+
+function resolveFilePaneView(input: {
+  client: DaemonClient | null;
+  readTarget: { cwd: string; path: string } | null;
+  accessErrorMessage: string | null;
+  accessFile: AccessFile | null;
+  mediaKind: "video" | "audio" | null;
+  isPdf: boolean;
+  mediaUrl: string | null;
+  mediaUrlError: string | null;
+  editable: boolean;
+  preview: ExplorerFile | null;
+  errorMessage: string | null;
+}): FilePaneView {
+  const { client, readTarget } = input;
+  if (!client && readTarget) {
+    return { kind: "disconnected" };
+  }
+  if (!client || !readTarget) {
+    return { kind: "default" };
+  }
+  // Once loaded, the editor owns its draft and file-conflict handling. A failed
+  // metadata refresh (or changed file classification) must not unmount that owner.
+  const { preview } = input;
+  if (input.editable && isTextExplorerFile(preview)) {
+    return {
+      kind: "editable",
+      client,
+      cwd: readTarget.cwd,
+      path: readTarget.path,
+      preview,
+    };
+  }
+  if (input.accessErrorMessage) {
+    return { kind: "accessError", message: input.accessErrorMessage };
+  }
+  if (input.accessFile && input.mediaKind) {
+    return {
+      kind: "media",
+      mediaKind: input.mediaKind,
+      accessFile: input.accessFile,
+      url: input.mediaUrl,
+      urlError: input.mediaUrlError,
+    };
+  }
+  if (input.accessFile && input.isPdf) {
+    return {
+      kind: "pdf",
+      accessFile: input.accessFile,
+      cwd: readTarget.cwd,
+      path: readTarget.path,
+    };
+  }
+  if (input.accessFile && input.accessFile.kind === "binary") {
+    return { kind: "binary", accessFile: input.accessFile };
+  }
+  if (input.errorMessage === "File is too large to display") {
+    return { kind: "tooLarge" };
+  }
+  if (input.errorMessage) {
+    return { kind: "error", message: input.errorMessage };
+  }
+  return { kind: "default" };
 }
 
 function FilePanePresentation({
@@ -357,6 +618,16 @@ function FilePanePresentation({
   location,
   navigationRevision,
   imagePreviewUri,
+  onDownload,
+  mediaKind,
+  isPdf,
+  accessFile,
+  accessErrorMessage,
+  mediaUrl,
+  mediaUrlError,
+  onRetryAccess,
+  onRetryMediaAccess,
+  isPanelActive,
 }: {
   serverId: string;
   client: DaemonClient | null;
@@ -378,80 +649,173 @@ function FilePanePresentation({
   location: WorkspaceFileLocation;
   navigationRevision: number;
   imagePreviewUri: string | null;
+  onDownload?: () => void;
+  mediaKind: "video" | "audio" | null;
+  isPdf: boolean;
+  accessFile: AccessFile | null;
+  accessErrorMessage: string | null;
+  mediaUrl: string | null;
+  mediaUrlError: string | null;
+  onRetryAccess: () => void;
+  onRetryMediaAccess: () => Promise<void>;
+  isPanelActive: boolean;
 }) {
-  if (!client && readTarget) {
-    return (
-      <View style={styles.container} testID="workspace-file-pane">
-        <View style={styles.centerState}>
-          <Text style={styles.errorText}>{disconnectedMessage}</Text>
-        </View>
-      </View>
-    );
-  }
+  const view = resolveFilePaneView({
+    client,
+    readTarget,
+    accessErrorMessage,
+    accessFile,
+    mediaKind,
+    isPdf,
+    mediaUrl,
+    mediaUrlError,
+    editable,
+    preview,
+    errorMessage,
+  });
 
-  if (editable && client && readTarget && preview?.kind === "text") {
-    return (
-      <EditableFilePane
-        key={`${serverId}:${readTarget.cwd}:${readTarget.path}`}
-        client={client}
-        cwd={readTarget.cwd}
-        path={readTarget.path}
-        preview={preview as TextExplorerFile}
-        liveFile={liveFile}
-        onRetryRead={onRetryRead}
-        retryingRead={retryingRead}
-        filename={filename}
-        mode={previewMode}
-        onModeChange={onPreviewModeChange}
-        isLoading={isLoading}
-        isMobile={isMobile}
-        location={location}
-        navigationRevision={navigationRevision}
-      />
-    );
-  }
-
-  if (errorMessage) {
-    if (errorMessage === "File is too large to display") {
+  switch (view.kind) {
+    case "disconnected":
       return (
         <View style={styles.container} testID="workspace-file-pane">
+          <View style={styles.centerState}>
+            <Text style={styles.errorText}>{disconnectedMessage}</Text>
+          </View>
+        </View>
+      );
+
+    case "accessError":
+      return (
+        <View style={styles.container} testID="workspace-file-pane">
+          <FilePanelBar onDownload={onDownload} />
+          <View style={styles.centerState}>
+            <Text style={styles.errorText}>{view.message}</Text>
+            <Button variant="outline" size="sm" onPress={onRetryAccess}>
+              {retryLabel}
+            </Button>
+          </View>
+        </View>
+      );
+
+    case "media":
+      return (
+        <View style={styles.container} testID="workspace-file-pane">
+          <FilePanelBar size={view.accessFile.size} onDownload={onDownload} />
+          {view.url ? (
+            <MediaPreview
+              kind={view.mediaKind}
+              src={view.url}
+              fileName={view.accessFile.fileName}
+              size={view.accessFile.size}
+              isActive={isPanelActive}
+              onDownload={onDownload}
+              onRetry={onRetryMediaAccess}
+            />
+          ) : (
+            <View style={styles.centerState}>
+              <Text style={styles.errorText}>{view.urlError ?? disconnectedMessage}</Text>
+              <Button variant="outline" size="sm" onPress={onRetryAccess}>
+                {retryLabel}
+              </Button>
+            </View>
+          )}
+        </View>
+      );
+
+    case "pdf":
+      return (
+        <View style={styles.container} testID="workspace-file-pane">
+          <FilePanelBar size={view.accessFile.size} onDownload={onDownload} />
+          <PdfPreview
+            serverId={serverId}
+            cwd={view.cwd}
+            path={view.path}
+            fileName={view.accessFile.fileName}
+            size={view.accessFile.size}
+            onDownload={onDownload}
+          />
+        </View>
+      );
+
+    case "binary":
+      return (
+        <View style={styles.container} testID="workspace-file-pane">
+          <FilePanelBar size={view.accessFile.size} onDownload={onDownload} />
+          <BinaryFilePreview
+            fileName={view.accessFile.fileName}
+            size={view.accessFile.size}
+            onDownload={onDownload}
+          />
+        </View>
+      );
+
+    case "editable":
+      return (
+        <EditableFilePane
+          key={`${serverId}:${view.cwd}:${view.path}`}
+          client={view.client}
+          cwd={view.cwd}
+          path={view.path}
+          preview={view.preview}
+          liveFile={liveFile}
+          onRetryRead={onRetryRead}
+          retryingRead={retryingRead}
+          filename={filename}
+          mode={previewMode}
+          onModeChange={onPreviewModeChange}
+          isLoading={isLoading}
+          isMobile={isMobile}
+          location={location}
+          navigationRevision={navigationRevision}
+          onDownload={onDownload}
+        />
+      );
+
+    case "tooLarge":
+      return (
+        <View style={styles.container} testID="workspace-file-pane">
+          <FilePanelBar onDownload={onDownload} />
           <TooLargeSource />
         </View>
       );
-    }
-    return (
-      <View style={styles.container} testID="workspace-file-pane">
-        <View style={styles.centerState}>
-          <Text style={styles.errorText}>{errorMessage}</Text>
-          <Button variant="outline" size="sm" onPress={onRetryRead} loading={retryingRead}>
-            {retryLabel}
-          </Button>
-        </View>
-      </View>
-    );
-  }
 
-  return (
-    <View style={styles.container} testID="workspace-file-pane">
-      {preview ? (
-        <FilePanelBar
-          size={preview.size}
-          lineCount={lineCount}
-          mode={previewMode}
-          onModeChange={onPreviewModeChange}
-        />
-      ) : null}
-      <FilePreviewBody
-        preview={preview}
-        mode={previewMode}
-        isLoading={isLoading}
-        isMobile={isMobile}
-        location={location}
-        navigationRevision={navigationRevision}
-        imagePreviewUri={imagePreviewUri}
-      />
-    </View>
-  );
+    case "error":
+      return (
+        <View style={styles.container} testID="workspace-file-pane">
+          <FilePanelBar onDownload={onDownload} />
+          <View style={styles.centerState}>
+            <Text style={styles.errorText}>{view.message}</Text>
+            <Button variant="outline" size="sm" onPress={onRetryRead} loading={retryingRead}>
+              {retryLabel}
+            </Button>
+          </View>
+        </View>
+      );
+
+    case "default":
+      return (
+        <View style={styles.container} testID="workspace-file-pane">
+          {preview || onDownload ? (
+            <FilePanelBar
+              size={preview?.size}
+              lineCount={lineCount}
+              mode={previewMode}
+              onModeChange={onPreviewModeChange}
+              onDownload={onDownload}
+            />
+          ) : null}
+          <FilePreviewBody
+            preview={preview}
+            mode={previewMode}
+            isLoading={isLoading}
+            isMobile={isMobile}
+            location={location}
+            navigationRevision={navigationRevision}
+            imagePreviewUri={imagePreviewUri}
+          />
+        </View>
+      );
+  }
 }
 
 function EditableFilePane({
@@ -469,6 +833,7 @@ function EditableFilePane({
   isMobile,
   location,
   navigationRevision,
+  onDownload,
 }: {
   client: DaemonClient;
   cwd: string;
@@ -484,6 +849,7 @@ function EditableFilePane({
   isMobile: boolean;
   location: WorkspaceFileLocation;
   navigationRevision: number;
+  onDownload?: () => void;
 }) {
   const { settings } = useAppSettings();
   const { t } = useTranslation();
@@ -601,6 +967,7 @@ function EditableFilePane({
         conflict={conflict}
         mode={mode}
         onModeChange={onModeChange}
+        onDownload={onDownload}
       />
       {showSource ? (
         <FileEditorView
