@@ -2,8 +2,8 @@ import { create } from "zustand";
 import { File as FSFile, Paths } from "expo-file-system";
 import * as LegacyFileSystem from "expo-file-system/legacy";
 import * as Sharing from "expo-sharing";
-import type { HostProfile } from "@/types/host-connection";
-import { buildDaemonWebSocketUrl } from "@/utils/daemon-endpoints";
+import { captureFileConnection } from "@/files/access";
+import { fileGrantUrl } from "@/files/http-target";
 import { openExternalUrl } from "@/utils/open-external-url";
 import { isWeb } from "@/constants/platform";
 import { i18n } from "@/i18n/i18next";
@@ -21,6 +21,7 @@ export interface Download {
   serverId: string;
   scopeId: string;
   fileName: string;
+  path: string;
   status: "downloading" | "complete" | "error";
   message?: string;
   progress?: DownloadProgress;
@@ -36,14 +37,8 @@ interface DownloadState {
     scopeId: string;
     fileName: string;
     path: string;
-    daemonProfile: HostProfile | undefined;
-    requestFileDownloadToken: (path: string) => Promise<{
-      token: string | null;
-      fileName: string | null;
-      mimeType: string | null;
-      error: string | null;
-    }>;
-  }) => Promise<void>;
+    cwd: string;
+  }) => Promise<boolean>;
 
   updateProgress: (id: string, progress: DownloadProgress) => void;
   completeDownload: (id: string) => void;
@@ -60,20 +55,24 @@ export const useDownloadStore = create<DownloadState>()((set, get) => ({
   downloads: new Map(),
   activeDownloadId: null,
 
-  startDownload: async ({
-    serverId,
-    scopeId,
-    fileName,
-    path,
-    daemonProfile,
-    requestFileDownloadToken,
-  }) => {
+  startDownload: async ({ serverId, scopeId, fileName, path, cwd }) => {
+    for (const download of get().downloads.values()) {
+      if (
+        download.status === "downloading" &&
+        download.serverId === serverId &&
+        download.scopeId === scopeId &&
+        download.path === path
+      ) {
+        return false;
+      }
+    }
     const id = generateDownloadId();
     const download: Download = {
       id,
       serverId,
       scopeId,
       fileName,
+      path,
       status: "downloading",
       startedAt: Date.now(),
     };
@@ -84,27 +83,21 @@ export const useDownloadStore = create<DownloadState>()((set, get) => ({
     }));
 
     try {
-      const tokenResponse = await requestFileDownloadToken(path);
+      const connection = captureFileConnection(serverId);
+      const downloadTarget = connection.httpTarget();
+      const tokenResponse = await connection.client.requestDownloadToken(cwd, path);
+      connection.assertCurrent();
       if (tokenResponse.error || !tokenResponse.token) {
         throw new Error(tokenResponse.error ?? i18n.t("downloads.requestTokenFailed"));
       }
 
-      const downloadTarget = resolveDaemonDownloadTarget(daemonProfile);
-      if (!downloadTarget.baseUrl) {
-        throw new Error(i18n.t("downloads.hostUnavailable"));
-      }
-
       const resolvedFileName = tokenResponse.fileName ?? fileName;
-      const downloadUrl = buildDownloadUrl(
-        downloadTarget.baseUrl,
-        tokenResponse.token,
-        isWeb ? downloadTarget.authCredentials : null,
-      );
+      const downloadUrl = fileGrantUrl(downloadTarget, "download", tokenResponse.token, isWeb);
 
       if (isWeb) {
         triggerBrowserDownload(downloadUrl, resolvedFileName);
         get().completeDownload(id);
-        return;
+        return true;
       }
 
       const downloadStartTime = Date.now();
@@ -154,14 +147,16 @@ export const useDownloadStore = create<DownloadState>()((set, get) => ({
             : i18n.t("downloads.shareFile"),
         });
       }
+      return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : i18n.t("downloads.failed");
       if (isWeb) {
         console.warn("[DownloadStore] Download failed:", message);
         get().failDownload(id, message);
-        return;
+        return false;
       }
       get().failDownload(id, message);
+      return false;
     }
   },
 
@@ -236,67 +231,6 @@ function findMostRecentDownloadId(downloads: Map<string, Download>): string | nu
     }
   }
   return mostRecent?.id ?? null;
-}
-
-interface DownloadTarget {
-  baseUrl: string | null;
-  authHeader: string | null;
-  authCredentials: { username: string; password: string } | null;
-}
-
-function resolveDaemonDownloadTarget(daemon?: HostProfile): DownloadTarget {
-  const connection = daemon?.connections.find((conn) => conn.type === "directTcp") ?? null;
-  if (!connection) {
-    return { baseUrl: null, authHeader: null, authCredentials: null };
-  }
-
-  let parsed: URL;
-  try {
-    parsed = new URL(
-      buildDaemonWebSocketUrl(connection.endpoint, { useTls: connection.useTls ?? false }),
-    );
-  } catch {
-    return { baseUrl: null, authHeader: null, authCredentials: null };
-  }
-
-  if (parsed.protocol === "ws:") {
-    parsed.protocol = "http:";
-  } else if (parsed.protocol === "wss:") {
-    parsed.protocol = "https:";
-  }
-
-  let authCredentials: { username: string; password: string } | null = null;
-  if (parsed.username || parsed.password) {
-    authCredentials = {
-      username: decodeURIComponent(parsed.username),
-      password: decodeURIComponent(parsed.password),
-    };
-    parsed.username = "";
-    parsed.password = "";
-  }
-
-  parsed.pathname = parsed.pathname.replace(/\/ws\/?$/, "/");
-
-  const baseUrl = parsed.origin;
-  const authHeader = authCredentials
-    ? `Basic ${btoa(`${authCredentials.username}:${authCredentials.password}`)}`
-    : null;
-
-  return { baseUrl, authHeader, authCredentials };
-}
-
-function buildDownloadUrl(
-  baseUrl: string,
-  token: string,
-  authCredentials: { username: string; password: string } | null,
-): string {
-  const url = new URL("/api/files/download", baseUrl);
-  url.searchParams.set("token", token);
-  if (authCredentials) {
-    url.username = authCredentials.username;
-    url.password = authCredentials.password;
-  }
-  return url.toString();
 }
 
 function triggerBrowserDownload(url: string, fileName: string) {

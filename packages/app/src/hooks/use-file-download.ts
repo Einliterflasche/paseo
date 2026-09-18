@@ -1,7 +1,5 @@
 import { useCallback, useMemo } from "react";
-import { useHosts } from "@/runtime/host-runtime";
 import { useDownloadStore } from "@/stores/download-store";
-import { useFileExplorerActions } from "@/hooks/use-file-explorer-actions";
 
 interface UseFileDownloadParams {
   serverId: string;
@@ -20,21 +18,11 @@ export function useFileDownload({
   workspaceId,
   workspaceRoot,
 }: UseFileDownloadParams): (input: { fileName: string; path: string }) => void {
-  const daemons = useHosts();
-  const daemonProfile = useMemo(
-    () => daemons.find((daemon) => daemon.serverId === serverId),
-    [daemons, serverId],
-  );
   const normalizedWorkspaceRoot = useMemo(() => workspaceRoot.trim(), [workspaceRoot]);
   const workspaceScopeId = useMemo(
     () => workspaceId?.trim() || normalizedWorkspaceRoot,
     [normalizedWorkspaceRoot, workspaceId],
   );
-  const { requestFileDownloadToken } = useFileExplorerActions({
-    serverId,
-    workspaceId,
-    workspaceRoot: normalizedWorkspaceRoot,
-  });
   const startDownload = useDownloadStore((state) => state.startDownload);
 
   return useCallback(
@@ -47,10 +35,9 @@ export function useFileDownload({
         scopeId: workspaceScopeId,
         fileName,
         path,
-        daemonProfile,
-        requestFileDownloadToken: (targetPath) => requestFileDownloadToken(targetPath),
+        cwd: normalizedWorkspaceRoot,
       });
     },
-    [daemonProfile, requestFileDownloadToken, serverId, startDownload, workspaceScopeId],
+    [normalizedWorkspaceRoot, serverId, startDownload, workspaceScopeId],
   );
 }

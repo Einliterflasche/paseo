@@ -57,6 +57,7 @@ import { useFileExplorerActions } from "@/hooks/use-file-explorer-actions";
 import { useLoadOlderAgentHistory } from "@/hooks/use-load-older-agent-history";
 import { resolveContentMaxWidth, useSettings } from "@/hooks/use-settings";
 import type { ToastApi } from "@/components/toast-host";
+import { useOpenLinkedFile } from "@/files/use-open-linked-file";
 import { returnToTimelineTail } from "./timeline-tail-navigation";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { ToolCallDetailsContent } from "@/components/tool-call-details";
@@ -719,6 +720,13 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       [context.capabilities, agentId, client, pendingClientMessageIds, resolvedServerId],
     );
 
+    const { open: openLinkedFile, prepare: prepareLinkedFile } = useOpenLinkedFile({
+      serverId: resolvedServerId,
+      workspaceRoot,
+      openPane: handleInlinePathPress,
+      toast,
+    });
+
     const renderAssistantMessageItem = useCallback(
       (layoutItem: StreamLayoutItem, item: Extract<StreamItem, { kind: "assistant_message" }>) => {
         return (
@@ -726,7 +734,8 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
             client={client}
             serverId={resolvedServerId}
             workspaceRoot={workspaceRoot}
-            onOpenWorkspaceFile={handleInlinePathPress}
+            onOpenWorkspaceFile={openLinkedFile}
+            prepareWorkspaceFileOpen={prepareLinkedFile}
             toast={toast}
           >
             <ChatFindExpansion messageId={getStreamItemMessageId(item)}>
@@ -747,7 +756,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
           </AssistantFileLinkResolverProvider>
         );
       },
-      [agentId, client, handleInlinePathPress, resolvedServerId, toast, workspaceRoot],
+      [agentId, client, openLinkedFile, prepareLinkedFile, resolvedServerId, toast, workspaceRoot],
     );
 
     const renderThoughtItem = useCallback(

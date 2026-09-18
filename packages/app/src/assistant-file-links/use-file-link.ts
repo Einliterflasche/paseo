@@ -8,6 +8,7 @@ import type { InlinePathTarget } from "./parse";
 import {
   useAssistantFileLinkResolverContext,
   type AssistantFileLinkResolverContextValue,
+  type FileOpenPreparation,
 } from "./provider";
 import {
   classifyForResolution,
@@ -164,6 +165,10 @@ function openAssistantFileLink(input: {
   const capturedResolution = classifyForResolution(input.source, {
     workspaceRoot: capturedConfig.workspaceRoot,
   });
+  let hint: InlinePathTarget | null = null;
+  if (capturedResolution.kind === "needsLookup") hint = capturedResolution.target;
+  else if (capturedResolution.value.kind === "file") hint = capturedResolution.value.target;
+  const preparation = hint ? capturedConfig.prepareWorkspaceFileOpen?.(hint) : undefined;
 
   if (capturedResolution.kind === "resolved") {
     void dispatchResolvedLink({
@@ -172,6 +177,7 @@ function openAssistantFileLink(input: {
       capturedServerId: capturedConfig.serverId,
       capturedWorkspaceRoot: capturedConfig.workspaceRoot,
       context: input.context,
+      preparation,
     });
     return;
   }
@@ -203,8 +209,10 @@ function openAssistantFileLink(input: {
         capturedServerId: capturedConfig.serverId,
         capturedWorkspaceRoot: capturedConfig.workspaceRoot,
         context: input.context,
+        preparation,
       });
     } catch (error) {
+      preparation?.tab?.close();
       await dispatchUnresolvedError({
         error,
         noFileFoundMessage: input.formatNoFileFoundMessage(capturedResolution.token),
@@ -256,6 +264,7 @@ function assistantFileLinkQueryKey(input: {
 }
 
 async function dispatchResolvedLink(input: {
+  preparation?: FileOpenPreparation;
   resolution: Extract<AssistantFileLinkResolution, { kind: "resolved" }>;
   disposition: OpenFileDisposition;
   capturedServerId?: string;
@@ -270,6 +279,7 @@ async function dispatchResolvedLink(input: {
       capturedServerId: input.capturedServerId,
       capturedWorkspaceRoot: input.capturedWorkspaceRoot,
       context: input.context,
+      preparation: input.preparation,
     });
     return;
   }
@@ -284,6 +294,7 @@ async function dispatchResolvedLink(input: {
 }
 
 async function dispatchFileTarget(input: {
+  preparation?: FileOpenPreparation;
   target: InlinePathTarget;
   disposition: OpenFileDisposition;
   capturedServerId?: string;
@@ -295,9 +306,14 @@ async function dispatchFileTarget(input: {
     current.serverId !== input.capturedServerId ||
     current.workspaceRoot !== input.capturedWorkspaceRoot
   ) {
+    input.preparation?.tab?.close();
     return;
   }
-  current.onOpenWorkspaceFile?.(input.target, input.disposition);
+  if (current.onOpenWorkspaceFile) {
+    current.onOpenWorkspaceFile(input.target, input.disposition, input.preparation);
+  } else {
+    input.preparation?.tab?.close();
+  }
 }
 
 async function dispatchExternalUrl(input: {
@@ -332,6 +348,7 @@ async function dispatchUnresolvedError(input: {
   }
   current.toast?.show(input.noFileFoundMessage, {
     variant: "error",
+    durationMs: null,
     testID: "assistant-file-link-not-found-toast",
   });
 }
