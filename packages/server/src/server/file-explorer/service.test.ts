@@ -19,6 +19,7 @@ import {
   deleteExplorerEntry,
   duplicateExplorerEntry,
   getExplorerFileVersion,
+  getFileAccessInfo,
   readExplorerFile,
   renameExplorerEntry,
   streamExplorerFile,
@@ -587,6 +588,171 @@ describe("file explorer service", () => {
       await expect(
         deleteExplorerEntry({ root, relativePath: "../outside" }),
       ).resolves.toMatchObject({ status: "error" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("getFileAccessInfo", () => {
+  it.each([
+    ["ts", "video/mp2t"],
+    ["mts", "model/vnd.mts"],
+  ])(
+    "distinguishes TypeScript from binary transport streams for .%s",
+    async (ext, binaryMimeType) => {
+      const root = await createTempDir("paseo-file-access-");
+      try {
+        await writeFile(path.join(root, `source.${ext}`), "export const ready = true;", "utf8");
+        expect(await getFileAccessInfo({ root, relativePath: `source.${ext}` })).toMatchObject({
+          kind: "text",
+          mimeType: "text/plain",
+        });
+        await writeFile(path.join(root, `video.${ext}`), Buffer.from([0x47, 0, 0, 1]));
+        expect(await getFileAccessInfo({ root, relativePath: `video.${ext}` })).toMatchObject({
+          kind: "binary",
+          mimeType: binaryMimeType,
+        });
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("classifies a PDF as binary with the real MIME type even though its header looks like UTF-8", async () => {
+    const root = await createTempDir("paseo-file-access-");
+    try {
+      await writeFile(path.join(root, "doc.pdf"), "%PDF-1.4\nharmless printable header\n", "utf8");
+      const info = await getFileAccessInfo({ root, relativePath: "doc.pdf" });
+      expect(info.kind).toBe("binary");
+      expect(info.mimeType).toBe("application/pdf");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies an MP4 as binary with the real MIME type regardless of its content", async () => {
+    const root = await createTempDir("paseo-file-access-");
+    try {
+      await writeFile(path.join(root, "clip.mp4"), Buffer.from([0, 1, 2, 3, 4]));
+      const info = await getFileAccessInfo({ root, relativePath: "clip.mp4" });
+      expect(info.kind).toBe("binary");
+      expect(info.mimeType).toBe("video/mp4");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies a plain text file as text", async () => {
+    const root = await createTempDir("paseo-file-access-");
+    try {
+      await writeFile(path.join(root, "notes.txt"), "hello world", "utf8");
+      const info = await getFileAccessInfo({ root, relativePath: "notes.txt" });
+      expect(info).toMatchObject({ kind: "text", mimeType: "text/plain", size: 11 });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies a PNG as image", async () => {
+    const root = await createTempDir("paseo-file-access-");
+    try {
+      await writeFile(path.join(root, "pic.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+      const info = await getFileAccessInfo({ root, relativePath: "pic.png" });
+      expect(info).toMatchObject({ kind: "image", mimeType: "image/png" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies non-null-byte, invalid-UTF-8 content as binary instead of text", async () => {
+    const root = await createTempDir("paseo-file-access-");
+    try {
+      // Lone continuation byte: no NUL, no control-char run, but not valid UTF-8.
+      await writeFile(path.join(root, "garbled.dat"), Buffer.from([0x41, 0x42, 0x80, 0x43, 0x44]));
+      const info = await getFileAccessInfo({ root, relativePath: "garbled.dat" });
+      expect(info.kind).toBe("binary");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies an unknown binary extension as binary with a generic MIME fallback", async () => {
+    const root = await createTempDir("paseo-file-access-");
+    try {
+      await writeFile(path.join(root, "blob.unknownext"), Buffer.from([0, 1, 2, 3]));
+      const info = await getFileAccessInfo({ root, relativePath: "blob.unknownext" });
+      expect(info).toMatchObject({ kind: "binary", mimeType: "application/octet-stream" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("gives a zero-byte file a stable identity and empty text classification", async () => {
+    const root = await createTempDir("paseo-file-access-");
+    try {
+      await writeFile(path.join(root, "empty.txt"), "");
+      const info = await getFileAccessInfo({ root, relativePath: "empty.txt" });
+      expect(info).toMatchObject({ kind: "text", size: 0 });
+      expect(info.identity).toBeTruthy();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("changes identity when the file is replaced at the same path", async () => {
+    const root = await createTempDir("paseo-file-access-");
+    try {
+      const filePath = path.join(root, "clip.mp4");
+      await writeFile(filePath, Buffer.from([1, 2, 3]));
+      const before = await getFileAccessInfo({ root, relativePath: "clip.mp4" });
+
+      await rm(filePath);
+      await writeFile(filePath, Buffer.from([4, 5, 6, 7]));
+      const after = await getFileAccessInfo({ root, relativePath: "clip.mp4" });
+
+      expect(after.identity).not.toBe(before.identity);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("changes identity while a file grows in place so ranges cannot mix revisions", async () => {
+    const root = await createTempDir("paseo-file-access-");
+    try {
+      const filePath = path.join(root, "clip.mp4");
+      await writeFile(filePath, Buffer.from([1, 2, 3]));
+      const before = await getFileAccessInfo({ root, relativePath: "clip.mp4" });
+
+      await appendFile(filePath, Buffer.from([4, 5]));
+      const after = await getFileAccessInfo({ root, relativePath: "clip.mp4" });
+
+      expect(after.identity).not.toBe(before.identity);
+      expect(after.size).toBe(5);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts UTF-8 text when the metadata sample ends inside a multibyte character", async () => {
+    const root = await createTempDir("paseo-file-access-");
+    try {
+      await writeFile(path.join(root, "notes.txt"), "a".repeat(8191) + "✅ continuation", "utf8");
+      expect(await getFileAccessInfo({ root, relativePath: "notes.txt" })).toMatchObject({
+        kind: "text",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects incomplete UTF-8 when the sample includes the entire file", async () => {
+    const root = await createTempDir("paseo-file-access-");
+    try {
+      await writeFile(path.join(root, "notes.txt"), Buffer.from([0x61, 0xe2, 0x9c]));
+      expect(await getFileAccessInfo({ root, relativePath: "notes.txt" })).toMatchObject({
+        kind: "binary",
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

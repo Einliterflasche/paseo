@@ -112,7 +112,11 @@ export function createRequireBearerMiddleware(
   };
 }
 
-const SELF_AUTHENTICATING_ROUTES = new Set(["/api/files/download", "/mcp/agents"]);
+const SELF_AUTHENTICATING_ROUTES = new Set([
+  "/api/files/download",
+  "/api/files/preview",
+  "/mcp/agents",
+]);
 
 function isBearerFreeRoute(path: string): boolean {
   return path === "/api/health" || SELF_AUTHENTICATING_ROUTES.has(path);

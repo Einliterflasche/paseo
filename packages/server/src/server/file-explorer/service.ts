@@ -2,6 +2,7 @@ import { constants, promises as fs, type BigIntStats, type Stats } from "fs";
 import type { FileHandle } from "fs/promises";
 import path from "path";
 import { randomUUID } from "crypto";
+import mime from "mime-types";
 import { expandUserPath, resolvePathFromBase } from "../path-utils.js";
 import { runGitCommand } from "../../utils/run-git-command.js";
 
@@ -102,6 +103,15 @@ const ACCESS_OUTSIDE_WORKSPACE_MESSAGE = "Access outside of workspace is not all
 
 function fileRevision(stats: BigIntStats): string {
   return `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeNs}`;
+}
+
+/**
+ * Pin the revision as well as the inode: filesystems can reuse an inode after
+ * unlink, and an in-place rewrite keeps it. A changed/growing file needs a fresh
+ * grant so separate byte ranges cannot silently span different revisions.
+ */
+export function fileIdentity(stats: BigIntStats): string {
+  return `${fileRevision(stats)}:${stats.ctimeNs}`;
 }
 
 function matchesExpectedRevision(
@@ -570,6 +580,108 @@ export async function getDownloadableFileInfo({ root, relativePath }: ReadFilePa
     };
   } finally {
     await handle.close();
+  }
+}
+
+/**
+ * Passive media the browser can play/display inline without executing
+ * anything: eligible for a reusable preview grant. HTML, SVG, and other
+ * active content are deliberately excluded even though a browser can render
+ * them, since preview intentionally never serves them inline as this origin.
+ */
+export function isPassiveMediaMimeType(mimeType: string): boolean {
+  return (
+    mimeType.startsWith("video/") || mimeType.startsWith("audio/") || mimeType === "application/pdf"
+  );
+}
+
+export interface FileAccessInfo {
+  path: string;
+  absolutePath: string;
+  fileName: string;
+  mimeType: string;
+  size: number;
+  kind: ExplorerFileKind;
+  identity: string;
+}
+
+/**
+ * Metadata classification for the file-open flow: sample-only, like
+ * `getDownloadableFileInfo`, never reads the whole file. Extension-derived
+ * MIME types take priority over content sniffing so a PDF or MP4 whose first
+ * bytes happen to look like valid UTF-8 text is never misclassified as text.
+ */
+export async function getFileAccessInfo({
+  root,
+  relativePath,
+}: ReadFileParams): Promise<FileAccessInfo> {
+  const filePath = await resolveScopedPath({ root, relativePath });
+  const handle = await openFileForRead(filePath.resolvedPath);
+
+  try {
+    const stats = await handle.stat({ bigint: true });
+
+    if (!stats.isFile()) {
+      throw new Error("Requested path is not a file");
+    }
+
+    const ext = path.extname(filePath.resolvedPath).toLowerCase();
+    const size = Number(stats.size);
+    const { kind, mimeType } = await classifyFileAccess(handle, ext, size);
+
+    return {
+      path: normalizeRelativePath({ root, targetPath: filePath.requestedPath }),
+      absolutePath: filePath.resolvedPath,
+      fileName: path.basename(filePath.requestedPath),
+      mimeType,
+      size,
+      kind,
+      identity: fileIdentity(stats),
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function classifyFileAccess(
+  handle: FileHandle,
+  ext: string,
+  size: number,
+): Promise<{ kind: ExplorerFileKind; mimeType: string }> {
+  if (ext in IMAGE_MIME_TYPES) {
+    return { kind: "image", mimeType: IMAGE_MIME_TYPES[ext] };
+  }
+
+  const guessedMimeType = mime.lookup(ext) || null;
+  // MIME databases also use .ts/.mts for MPEG transport streams. Sample these
+  // ambiguous extensions so TypeScript stays editable and binary video still plays.
+  const couldBeTypeScript = ext === ".ts" || ext === ".mts";
+  if (guessedMimeType && isPassiveMediaMimeType(guessedMimeType) && !couldBeTypeScript) {
+    return { kind: "binary", mimeType: guessedMimeType };
+  }
+
+  const sample = Buffer.alloc(Math.min(FILE_TYPE_SAMPLE_BYTES, size));
+  const { bytesRead } = await handle.read(sample, 0, sample.length, 0);
+  const chunk = bytesRead < sample.length ? sample.subarray(0, bytesRead) : sample;
+  const sampleIsWholeFile = bytesRead >= size;
+  if (!isLikelyBinary(chunk) && isValidUtf8Sample(chunk, sampleIsWholeFile)) {
+    return { kind: "text", mimeType: textMimeTypeForExtension(ext) };
+  }
+
+  return { kind: "binary", mimeType: guessedMimeType ?? "application/octet-stream" };
+}
+
+/**
+ * Like `isValidUtf8`, but tolerant of a multi-byte sequence cut off at the
+ * end of a truncated sample: `stream: true` lets the decoder buffer a
+ * trailing partial sequence instead of treating it as invalid input.
+ */
+function isValidUtf8Sample(chunk: Buffer, isEntireFile: boolean): boolean {
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(chunk, { stream: !isEntireFile });
+    return true;
+  } catch {
+    return false;
   }
 }
 
