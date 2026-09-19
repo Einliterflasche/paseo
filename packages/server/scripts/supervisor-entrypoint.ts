@@ -13,6 +13,7 @@ import { loadPersistedConfig } from "../src/server/persisted-config.js";
 import { runSupervisor } from "./supervisor.js";
 import { resolveSupervisorLogFile } from "./supervisor-log-config.js";
 import { applySherpaLoaderEnv } from "../src/server/speech/providers/local/sherpa/sherpa-runtime-env.js";
+import { resolveDaemonHeapArgs } from "./daemon-heap.js";
 
 process.title = "Paseo Supervisor";
 
@@ -68,13 +69,15 @@ function resolveDevWorkerEntry(): string {
 }
 
 function resolveWorkerExecArgv(workerEntry: string, devMode: boolean): string[] {
-  const execArgv = workerEntry.endsWith(".ts") ? ["--import", "tsx"] : [];
+  const execArgv = [
+    ...resolveDaemonHeapArgs(process.env, devMode),
+    ...(workerEntry.endsWith(".ts") ? ["--import", "tsx"] : []),
+  ];
   if (!devMode) {
     return execArgv;
   }
   const devArgs = [
     "--heapsnapshot-near-heap-limit=3",
-    "--max-old-space-size=3072",
     "--report-on-fatalerror",
     "--report-directory=/tmp/paseo-reports",
   ];
@@ -102,6 +105,7 @@ async function main(): Promise<void> {
   const workerEntry = config.devMode ? resolveDevWorkerEntry() : resolveWorkerEntry();
   const workerExecArgv = resolveWorkerExecArgv(workerEntry, config.devMode);
   const workerEnv: NodeJS.ProcessEnv = { ...process.env };
+  delete workerEnv.PASEO_DAEMON_HEAP_MB;
   const packagedNodeEntrypointRunner =
     process.env.ELECTRON_RUN_AS_NODE === "1"
       ? resolvePackagedNodeEntrypointRunnerPath(fileURLToPath(import.meta.url))
@@ -161,6 +165,7 @@ async function main(): Promise<void> {
       ? (resolvedWorkerEntry) => ({
           command: process.execPath,
           args: [
+            ...workerExecArgv,
             packagedNodeEntrypointRunner,
             "node-script",
             resolvedWorkerEntry,

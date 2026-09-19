@@ -74,6 +74,14 @@ the existing host configuration. Use the project's flake for development tools.
 Develop against separate runtime state; the live state is
 `/home/agent/.local/state/paseo`.
 
+Set `services.paseo.environment.PASEO_DAEMON_HEAP_MB` in the host configuration
+to choose the daemon worker's Node old-space limit in MiB. This VM uses `6144`
+as temporary headroom while cumulative transcript retention is investigated.
+The supervisor passes the limit directly to the worker and removes the setting
+from its environment; agent subprocesses keep their own defaults. Do not use
+service-wide `NODE_OPTIONS` for this adjustment. The heap limit is an allowance,
+not reserved RAM, and excludes native buffers and other processes.
+
 The VM has run this fork with restart recovery since 2026-09-16. The initial
 handover is complete; its backups and verification are retained in
 `/home/agent/paseo-deployments/20260916T112552Z`. Do not reuse its one-time
