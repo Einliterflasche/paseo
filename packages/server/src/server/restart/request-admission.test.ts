@@ -15,7 +15,16 @@ test("management-protected reads remain available while mutations join the barri
     "schedule/update",
     "plugin.enable.request",
     "send_agent_message_request",
+    "service.preview.prepare.request",
+    "service.external.register.request",
+    "service.managed.enable.request",
   ] as const)
     expect(requiresRestartAdmission(type)).toBe(true);
   expect(requiresRestartAdmission("schedule/run-once")).toBe(false);
+  for (const type of [
+    "service.preview.close.request",
+    "service.external.disconnect.request",
+    "service.managed.disable.request",
+  ] as const)
+    expect(requiresRestartAdmission(type)).toBe(false);
 });

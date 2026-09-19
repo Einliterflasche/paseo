@@ -55,7 +55,12 @@ function normalizeSimpleWorkspaceTabTarget(value: WorkspaceTabTarget): Workspace
       const browserId = trimNonEmpty(value.browserId);
       return browserId ? { kind: "browser", browserId } : null;
     }
+    case "service_preview": {
+      const serviceId = trimNonEmpty(value.serviceId);
+      return serviceId ? { kind: "service_preview", serviceId } : null;
+    }
     case "changes_tree":
+    case "services":
     case "files":
     case "pull_request":
       return { kind: value.kind };
@@ -131,6 +136,13 @@ function secondaryWorkspaceTabTargetsEqual(
   left: WorkspaceTabTarget,
   right: WorkspaceTabTarget,
 ): boolean {
+  switch (left.kind) {
+    case "services":
+    case "files":
+    case "changes_tree":
+    case "pull_request":
+      return left.kind === right.kind;
+  }
   if (left.kind === "browser" && right.kind === "browser") {
     return left.browserId === right.browserId;
   }
@@ -140,14 +152,8 @@ function secondaryWorkspaceTabTargetsEqual(
   if (left.kind === "working_diff" && right.kind === "working_diff") {
     return left.focusPath === right.focusPath && left.focusRequestId === right.focusRequestId;
   }
-  if (left.kind === "files" && right.kind === "files") {
-    return true;
-  }
-  if (left.kind === "changes_tree" && right.kind === "changes_tree") {
-    return true;
-  }
-  if (left.kind === "pull_request" && right.kind === "pull_request") {
-    return true;
+  if (left.kind === "service_preview" && right.kind === "service_preview") {
+    return left.serviceId === right.serviceId;
   }
   if (left.kind === "setup" && right.kind === "setup") {
     return left.workspaceId === right.workspaceId;
@@ -219,6 +225,8 @@ export function buildDeterministicWorkspaceTabId(target: WorkspaceTabTarget): st
   if (target.kind === "working_diff") {
     return "working_diff";
   }
+  if (target.kind === "services") return "services";
+  if (target.kind === "service_preview") return `service_preview_${target.serviceId}`;
   if (target.kind === "changes_tree" || target.kind === "files" || target.kind === "pull_request") {
     return target.kind;
   }

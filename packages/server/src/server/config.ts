@@ -25,6 +25,7 @@ import { resolveSpeechConfig } from "./speech/speech-config-resolver.js";
 import type { RequestedSpeechProviders } from "./speech/speech-types.js";
 import { mergeHostnames, parseHostnamesEnv, type HostnamesConfig } from "./hostnames.js";
 import { resolveGitProcessPolicy } from "../utils/git-process-scheduler.js";
+import { resolvePreviewTransportEnvironment } from "./service-preview/transport-config.js";
 
 export {
   loadPersistedConfig,
@@ -638,6 +639,7 @@ export function resolveConfigFromPersisted(
     relayUseTls: relay.useTls,
     relayPublicUseTls: relay.publicUseTls,
     serviceProxy,
+    servicePreviewTransport: resolvePreviewTransportEnvironment(env),
     webUi,
     appBaseUrl,
     auth: resolveAuthConfig(env, persisted),

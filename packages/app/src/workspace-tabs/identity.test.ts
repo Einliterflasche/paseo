@@ -17,6 +17,23 @@ describe("New tab identity", () => {
   });
 });
 
+describe("service preview tab identity", () => {
+  it("focuses the same service independently of the gallery and other services", () => {
+    const first = { kind: "service_preview", serviceId: "atlas" } as const;
+    const second = { kind: "service_preview", serviceId: "beacon" } as const;
+    expect(normalizeWorkspaceTabTarget(first)).toEqual(first);
+    expect(workspaceTabTargetsEqual(first, { ...first })).toBe(true);
+    expect(workspaceTabTargetsEqual(first, second)).toBe(false);
+    expect(buildDeterministicWorkspaceTabId(first)).not.toBe(
+      buildDeterministicWorkspaceTabId(second),
+    );
+    expect(buildDeterministicWorkspaceTabId(first)).not.toBe(
+      buildDeterministicWorkspaceTabId({ kind: "services" }),
+    );
+    expect(normalizeWorkspaceTabTarget({ ...first, serviceId: " " })).toBeNull();
+  });
+});
+
 describe("provider subagent tab identity", () => {
   test("normalizes and compares the parent and provider child as one tab identity", () => {
     const target = normalizeWorkspaceTabTarget({

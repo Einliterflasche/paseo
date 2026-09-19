@@ -1047,6 +1047,7 @@ test("advertises client capabilities in hello", async () => {
       timeline_notifications: true,
       plugin_timeline_items: true,
       workspace_setup_blocked: true,
+      [CLIENT_CAPS.servicePreview]: 1,
       hello_rejection: true,
       browser_host: {
         supportedCommands: ["list_tabs"],

@@ -1,4 +1,5 @@
 import { BuiltinPluginLoader } from "../plugins/builtin/index.js";
+import { resolveSkillTargets } from "../orchestration-skills/internal/paths.js";
 import os from "node:os";
 import path from "node:path";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
@@ -105,6 +106,7 @@ export async function createTestPaseoDaemon(
     const logger = options.logger ?? pino({ level: "silent" });
     const daemon = await createPaseoDaemon(config, logger, {
       builtinPlugins: options.builtinPlugins ?? new BuiltinPluginLoader(undefined, []),
+      resolveSkillTargets: () => resolveSkillTargets(paseoHomeRoot),
       serverFeatureOverrides: {
         daemonStatusRpc: options.daemonStatusRpcCapability,
         relayConfig: options.relayConfigCapability,

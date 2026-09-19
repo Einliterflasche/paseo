@@ -17,6 +17,7 @@ interface SidebarResizeHandleProps {
 }
 
 const HIGHLIGHT_DELAY_MS = 100;
+const resizeSurfaceData = { surfaceOcclusion: "resize" };
 
 const webResizeCursorStyle = isWeb
   ? ({
@@ -73,6 +74,7 @@ function PointerResizeHandle({ edge, gesture, testID }: SidebarResizeHandleProps
     <GestureDetector gesture={gesture}>
       <Pressable
         testID={testID}
+        dataSet={resizeSurfaceData}
         style={hitAreaStyle}
         onHoverIn={handleHoverIn}
         onHoverOut={handleHoverOut}
@@ -109,6 +111,7 @@ function TouchResizeHandle({ edge, gesture, pressed, testID }: SidebarResizeHand
       <GestureDetector gesture={gesture}>
         <View
           testID={testID}
+          dataSet={resizeSurfaceData}
           role="separator"
           aria-orientation="vertical"
           collapsable={false}

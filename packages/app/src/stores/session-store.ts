@@ -283,6 +283,7 @@ export interface DaemonServerInfo {
   desktopManaged?: boolean;
   capabilities?: ServerCapabilities;
   features?: ServerInfoStatusPayload["features"];
+  servicePreviews?: ServerInfoStatusPayload["servicePreviews"];
   restartRecoveryState?: ServerInfoStatusPayload["restartRecoveryState"];
   restartRecoveryGeneration?: string;
   restartRecoveryError?: string;
@@ -301,6 +302,7 @@ export function toDaemonServerInfo(serverInfo: ServerInfoStatusPayload): DaemonS
       : {}),
     ...(serverInfo.capabilities ? { capabilities: serverInfo.capabilities } : {}),
     ...(serverInfo.features ? { features: serverInfo.features } : {}),
+    ...(serverInfo.servicePreviews ? { servicePreviews: serverInfo.servicePreviews } : {}),
     ...(serverInfo.restartRecoveryState
       ? { restartRecoveryState: serverInfo.restartRecoveryState }
       : {}),
@@ -932,6 +934,7 @@ export const useSessionStore = create<SessionStore>()(
           const nextRestartRecoveryAffectedAgents = info.restartRecoveryAffectedAgents;
 
           if (
+            equal(session.serverInfo?.servicePreviews, info.servicePreviews) &&
             isSessionServerInfoUnchanged({
               currentServerInfo: session.serverInfo,
               nextHostname,
@@ -966,6 +969,7 @@ export const useSessionStore = create<SessionStore>()(
                     : {}),
                   ...(nextCapabilities ? { capabilities: nextCapabilities } : {}),
                   ...(nextFeatures ? { features: nextFeatures } : {}),
+                  ...(info.servicePreviews ? { servicePreviews: info.servicePreviews } : {}),
                   ...(nextRestartRecoveryState
                     ? { restartRecoveryState: nextRestartRecoveryState }
                     : {}),

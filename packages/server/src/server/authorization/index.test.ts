@@ -150,3 +150,25 @@ describe("SessionAuthorization", () => {
     expect(() => parseDaemonPermissions(["hub.execution.*"])).toThrow("Invalid daemon permission");
   });
 });
+
+test("server info revocation stays deliverable after daemon read permission is removed", () => {
+  const authorization = new SessionAuthorization([]);
+  expect(
+    authorization.allowsOutbound({
+      type: "status",
+      payload: {
+        status: "server_info",
+        serverId: "isolated-host",
+        hostname: "isolated",
+        version: "0.10.0",
+        permissions: [],
+      },
+    }),
+  ).toBe(true);
+  expect(
+    authorization.allowsOutbound({
+      type: "status",
+      payload: { status: "error", message: "private daemon detail" },
+    }),
+  ).toBe(false);
+});

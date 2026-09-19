@@ -8,7 +8,7 @@ export type SidebarSection = PluginSidebarSection;
  * (Add project and the Hosts, Import session, Help and support, Settings icons) is fixed.
  */
 export const BUILTIN_SIDEBAR_ITEM_IDS = {
-  header: ["new-workspace", "history", "search", "schedules"],
+  header: ["new-workspace", "history", "search", "schedules", "services"],
   footer: ["usage"],
 } as const satisfies Record<SidebarSection, readonly string[]>;
 
@@ -46,6 +46,7 @@ const BUILTIN_LABEL_KEYS: Record<BuiltinSidebarItemId, string> = {
   search: "sidebar.sections.search",
   schedules: "sidebar.sections.schedules",
   usage: "sidebar.footer.usage",
+  services: "services.title",
 };
 
 export function builtinSidebarNavLabelKey(id: BuiltinSidebarItemId): string {
@@ -63,6 +64,7 @@ const BUILTIN_SHORTCUT_ACTIONS: Record<BuiltinSidebarItemId, string | null> = {
   search: "toggle-command-center",
   schedules: null,
   usage: null,
+  services: null,
 };
 
 export function builtinSidebarNavShortcutAction(id: BuiltinSidebarItemId): string | null {
@@ -85,6 +87,7 @@ function isBuiltinSidebarItemId<Section extends SidebarSection>(
 
 export function resolveSidebarNavItems<Section extends SidebarSection>(input: {
   section: Section;
+  servicesEnabled?: boolean;
   pluginGroups: readonly PluginSidebarGroup[];
   preferences: readonly SidebarNavPreference[];
 }): SidebarNavItem<Section>[] {
@@ -97,7 +100,8 @@ export function resolveSidebarNavItems<Section extends SidebarSection>(input: {
   const placed = new Set<string>();
 
   for (const preference of input.preferences) {
-    if (placed.has(preference.key)) continue;
+    if (placed.has(preference.key) || (preference.key === "services" && !input.servicesEnabled))
+      continue;
     const group = groupsByKey.get(preference.key);
     if (group) {
       placed.add(preference.key);
@@ -114,7 +118,7 @@ export function resolveSidebarNavItems<Section extends SidebarSection>(input: {
   }
 
   for (const id of builtinIds) {
-    if (placed.has(id)) continue;
+    if (placed.has(id) || (id === "services" && !input.servicesEnabled)) continue;
     items.push({ kind: "builtin", key: id, id, visible: true });
   }
   for (const [key, group] of groupsByKey) {

@@ -470,7 +470,7 @@ export interface SessionOptions {
   onBinaryMessageToSource?: (source: object, frame: Uint8Array) => Promise<void>;
   getTransportBufferedAmount?: (source?: object) => number | null;
   getJsonResponseCapacity?: (source?: object) => JsonResponseCapacity;
-  getServerInfo?: (session: Session) => ServerInfoStatusPayload;
+  getServerInfo?: (session: Session, source?: object) => ServerInfoStatusPayload;
   onLifecycleIntent?: SessionLifecycleHandler;
   onWorkspaceRecovered?: (workspace: PersistedWorkspaceRecord) => Promise<void>;
   logger: pino.Logger;
@@ -745,7 +745,7 @@ export class Session {
     | null;
   private readonly getTransportBufferedAmount: (source?: object) => number | null;
   private readonly getJsonResponseCapacity: (source?: object) => JsonResponseCapacity;
-  private readonly getServerInfo?: (session: Session) => ServerInfoStatusPayload;
+  private readonly getServerInfo?: (session: Session, source?: object) => ServerInfoStatusPayload;
   private readonly onLifecycleIntent: SessionLifecycleHandler | null;
   private readonly onWorkspaceRecovered:
     | ((workspace: PersistedWorkspaceRecord) => Promise<void>)
@@ -2346,7 +2346,11 @@ export class Session {
     );
   }
 
-  public publish(message: SessionOutboundMessage): void {
+  public publish(message: SessionOutboundMessage, source?: object): void {
+    if (source) {
+      this.emitSubscribedEvent(message, source);
+      return;
+    }
     this.emit(message);
   }
 
@@ -2779,7 +2783,7 @@ export class Session {
           source,
         );
         if (msg.events.includes("status.server_info") && this.getServerInfo) {
-          owner.emit({ type: "status", payload: this.getServerInfo(this) });
+          owner.emit({ type: "status", payload: this.getServerInfo(this, owner.source) });
         }
         this.refreshObservationProducers();
         if (!msg.events.includes("checkout_status_update")) return undefined;

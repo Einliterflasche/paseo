@@ -62,6 +62,32 @@ in
       description = "Whether to open the firewall for the Paseo daemon port.";
     };
 
+    previews = {
+      enable = lib.mkEnableOption "the independent same-address service preview front";
+
+      controlOrigin = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        example = "https://paseo.example.com";
+        description = ''
+          Exact existing HTTPS Paseo origin, including any nondefault port.
+          Required for the control-only front independently of preview policy.
+        '';
+      };
+
+      daemonPort = lib.mkOption {
+        type = lib.types.port;
+        default = 6768;
+        description = ''
+          Private daemon port when previews.enable is true. The public loopback
+          front keeps services.paseo.port, including during gateway failure.
+          First installation needs the checkpointed continuity preflight.
+        '';
+      };
+
+      frontPackage = lib.mkPackageOption pkgs "caddy" { };
+    };
+
     hostnames = lib.mkOption {
       type = lib.types.either (lib.types.enum [ true ]) (lib.types.listOf lib.types.str);
       default = [ ];
@@ -197,6 +223,29 @@ in
   config = lib.mkIf cfg.enable (
     let
       settingsFile = (pkgs.formats.json { }).generate "paseo-config.json" cfg.settings;
+      previewSocket = "/run/paseo-previews/gateway.sock";
+      previewFrontModule = pkgs.runCommand "paseo-preview-front.mjs" {
+        nativeBuildInputs = [ pkgs.esbuild ];
+      } ''
+        cp ${../packages/server/src/server/service-preview/front-config.ts} front-config.ts
+        cp ${../packages/server/src/server/service-preview/control-transport.ts} control-transport.ts
+        esbuild front-config.ts \
+          --bundle --platform=node --format=esm --outfile="$out"
+      '';
+      previewFrontConfig = pkgs.runCommand "paseo-preview-front.json" {
+        nativeBuildInputs = [ pkgs.nodejs_22 ];
+      } ''
+        node --input-type=module - ${previewFrontModule} \
+          ${toString cfg.port} ${toString cfg.previews.daemonPort} ${lib.escapeShellArg previewSocket} ${lib.escapeShellArg cfg.previews.controlOrigin} > "$out" <<'JS'
+        const { createPreviewFrontConfig } = await import(process.argv[2]);
+        process.stdout.write(JSON.stringify(createPreviewFrontConfig({
+          listenPort: Number(process.argv[3]),
+          daemonPort: Number(process.argv[4]),
+          gatewaySocketPath: process.argv[5],
+          controlOrigin: process.argv[6],
+        })));
+        JS
+      '';
     in
     {
     assertions = [
@@ -205,6 +254,14 @@ in
         message = ''
           services.paseo.relay.host must be set when relay.mode = "remote".
         '';
+      }
+      {
+        assertion = !cfg.previews.enable || (cfg.listenAddress == "127.0.0.1" && cfg.port != cfg.previews.daemonPort);
+        message = "Service previews require distinct front/daemon ports and listenAddress 127.0.0.1.";
+      }
+      {
+        assertion = !cfg.previews.enable || cfg.previews.controlOrigin != "";
+        message = "Service previews require the existing HTTPS controlOrigin independently of feature policy.";
       }
     ];
 
@@ -218,7 +275,25 @@ in
 
     systemd.tmpfiles.rules = [
       "d ${cfg.dataDir} 0700 ${cfg.user} ${cfg.group} - -"
+    ] ++ lib.optionals cfg.previews.enable [
+      "d /run/paseo-previews 0700 ${cfg.user} ${cfg.group} - -"
     ];
+
+    # This front has no PartOf/BindsTo relationship with the daemon or gateway.
+    # Preview worker failure must not interrupt ordinary Paseo connections.
+    systemd.services.paseo-preview-front = lib.mkIf cfg.previews.enable {
+      description = "Paseo same-address service preview front";
+      after = [ "network.target" "systemd-tmpfiles-setup.service" ];
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        User = cfg.user;
+        Group = cfg.group;
+        ExecStartPre = "${cfg.previews.frontPackage}/bin/caddy validate --config ${previewFrontConfig}";
+        ExecStart = "${cfg.previews.frontPackage}/bin/caddy run --config ${previewFrontConfig}";
+        Restart = "on-failure";
+        TimeoutStopSec = "infinity";
+      };
+    };
 
     systemd.services.paseo = {
       description = "Paseo - self-hosted daemon for AI coding agents";
@@ -231,7 +306,11 @@ in
 
       environment = {
         PASEO_HOME = cfg.dataDir;
-        PASEO_LISTEN = "${cfg.listenAddress}:${toString cfg.port}";
+        PASEO_LISTEN = "${cfg.listenAddress}:${toString (if cfg.previews.enable then cfg.previews.daemonPort else cfg.port)}";
+      } // lib.optionalAttrs cfg.previews.enable {
+        PASEO_SERVICES_FRONT_PORT = toString cfg.port;
+        PASEO_SERVICES_GATEWAY_SOCKET = previewSocket;
+        PASEO_SERVICES_CONTROL_ORIGIN = cfg.previews.controlOrigin;
       } // lib.optionalAttrs cfg.inheritUserEnvironment (
         let
           # Match dataDir's convention. We can't read users.users.<name>.home
@@ -278,6 +357,10 @@ in
 
         Restart = "on-failure";
         RestartSec = 5;
+
+        # Managed services and the preview gateway prefer OOM termination. Losing
+        # one must not make systemd stop the supervisor and every active agent.
+        OOMPolicy = "continue";
 
         # Graceful shutdown (server handles SIGTERM with a 10s timeout)
         KillSignal = "SIGTERM";

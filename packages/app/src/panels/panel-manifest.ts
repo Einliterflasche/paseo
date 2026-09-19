@@ -48,6 +48,16 @@ const manifests = {
     supportedHosts: ["explorer"],
     resourceKey: () => "changes_tree",
   },
+  services: {
+    kind: "services",
+    supportedHosts: ["main", "explorer"],
+    resourceKey: () => "services",
+  },
+  service_preview: {
+    kind: "service_preview",
+    supportedHosts: ["main"],
+    resourceKey: (target) => target.serviceId,
+  },
   files: {
     kind: "files",
     supportedHosts: ["explorer"],

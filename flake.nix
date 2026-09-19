@@ -47,10 +47,14 @@
 
       nixosModules.default = self.nixosModules.paseo;
       nixosModules.paseo =
-        { pkgs, lib, ... }:
+        { config, pkgs, lib, ... }:
         {
           imports = [ ./nix/module.nix ];
-          services.paseo.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+          services.paseo.package = lib.mkDefault (
+            self.packages.${pkgs.stdenv.hostPlatform.system}.default.override {
+              servicesCatalog = config.services.paseo.previews.enable;
+            }
+          );
         };
 
       devShells = forAllSystems (

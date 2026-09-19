@@ -5,7 +5,7 @@ import {
   type ReplicaSqliteConnection,
   type SqliteValue,
 } from "@/runtime/replica-cache/row-store-sqlite";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   DaemonClient,
   WorkspaceLabelListPayload,
@@ -24,6 +24,7 @@ import {
   DirectoryRefreshSupersededError,
   DirectorySync,
   type DirectoryCheckpointStorage,
+  type WorkspaceDirectoryState,
 } from "./index";
 
 import { subscriptionFixture } from "../subscription-fixture";
@@ -190,22 +191,25 @@ function createDirectory(
 ): {
   client: FakeDirectoryClient;
   directory: DirectorySync;
+  workspaceStates: WorkspaceDirectoryState[];
 } {
   serverIds.add(serverId);
   const client = new FakeDirectoryClient();
   client.supportsWorkspaceLabels = options?.workspaceLabels === true;
+  const workspaceStates: WorkspaceDirectoryState[] = [];
   const directory = new DirectorySync(serverId, {
     onAgentStoppedRunning: () => undefined,
     markAgentLoading: () => undefined,
     markAgentReady: () => undefined,
     markAgentError: () => undefined,
+    onWorkspaceState: (state) => workspaceStates.push(state),
   });
   directory.connectionChanged({
     client: client as unknown as DaemonClient,
     status: "online",
     source: { clientGeneration: 1, connectionEpoch: 1 },
   });
-  return { client, directory };
+  return { client, directory, workspaceStates };
 }
 
 function createAgent(serverId: string, id: string) {
@@ -1753,3 +1757,94 @@ it.each(["before", "during", "before-metadata", "damaged"] as const)(
     }
   },
 );
+
+it("publishes workspace readiness only after the current connection snapshot commits", async () => {
+  const serverId = "workspace-readiness";
+  const { client, directory, workspaceStates } = createDirectory(serverId);
+  const store = useSessionStore.getState();
+  store.initializeSession(serverId, client as unknown as DaemonClient, 1);
+  store.updateSessionServerInfo(serverId, {
+    serverId,
+    hostname: null,
+    version: "test",
+    features: { workspaceMultiplicity: true },
+  });
+  const first = await directory.refreshWorkspaces();
+  expect(first).toEqual({ status: "ready", source: { clientGeneration: 1, connectionEpoch: 1 } });
+  directory.connectionChanged({
+    client: client as unknown as DaemonClient,
+    status: "offline",
+    source: { clientGeneration: 1, connectionEpoch: 1 },
+  });
+  expect(await directory.refreshWorkspaces()).toBeNull();
+  const source = { clientGeneration: 1, connectionEpoch: 2 };
+  directory.connectionChanged({
+    client: client as unknown as DaemonClient,
+    status: "online",
+    source,
+  });
+  const release = client.holdWorkspaceFetch();
+  const pending = directory.refreshWorkspaces();
+  await vi.waitFor(() => expect(client.fetchWorkspacesCalls).toBe(2));
+  expect(workspaceStates.at(-1)).toEqual({ status: "loading", source });
+  release({
+    requestId: "snapshot",
+    entries: [],
+    emptyProjects: [],
+    pageInfo: { hasMore: false, nextCursor: null, prevCursor: null },
+  });
+  const second = await pending;
+  expect(second).toBe(workspaceStates.at(-1));
+  expect(second).toEqual({ status: "ready", source });
+  vi.spyOn(client, "fetchWorkspaces").mockRejectedValueOnce(new Error("snapshot failed"));
+  await expect(directory.refreshWorkspaces()).rejects.toThrow("snapshot failed");
+  expect(workspaceStates.at(-1)).toEqual({ status: "error", source, error: "snapshot failed" });
+  directory.dispose();
+});
+
+it("does not let a superseded workspace refresh overwrite newer readiness", async () => {
+  const serverId = "workspace-readiness-superseded";
+  const { client, directory, workspaceStates } = createDirectory(serverId);
+  const store = useSessionStore.getState();
+  store.initializeSession(serverId, client as unknown as DaemonClient, 1);
+  store.updateSessionServerInfo(serverId, {
+    serverId,
+    hostname: null,
+    version: "test",
+    features: { workspaceMultiplicity: true },
+  });
+  const release = client.holdWorkspaceFetch();
+  const pending = directory.refreshWorkspaces();
+  await vi.waitFor(() => expect(client.fetchWorkspacesCalls).toBe(1));
+  const current = await directory.refreshWorkspaces();
+  release({
+    requestId: "old",
+    entries: [],
+    emptyProjects: [],
+    pageInfo: { hasMore: false, nextCursor: null, prevCursor: null },
+  });
+  await expect(pending).rejects.toThrow(DirectoryRefreshSupersededError);
+  expect(workspaceStates.at(-1)).toBe(current);
+  directory.dispose();
+});
+
+it("commits workspace readiness for hosts using the client workspace adapter", async () => {
+  const serverId = "workspace-readiness-legacy";
+  const { client, directory, workspaceStates } = createDirectory(serverId);
+  const store = useSessionStore.getState();
+  store.initializeSession(serverId, client as unknown as DaemonClient, 1);
+  store.updateSessionServerInfo(serverId, {
+    serverId,
+    hostname: null,
+    version: "test",
+    features: {},
+  });
+  try {
+    const ready = await directory.refreshWorkspaces({ subscribe: true });
+    expect(client.fetchWorkspacesCalls).toBe(1);
+    expect(ready).toEqual({ status: "ready", source: { clientGeneration: 1, connectionEpoch: 1 } });
+    expect(workspaceStates.at(-1)).toBe(ready);
+  } finally {
+    directory.dispose();
+  }
+});

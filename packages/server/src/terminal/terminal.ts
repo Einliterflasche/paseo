@@ -6,6 +6,7 @@ import { tmpdir, userInfo } from "node:os";
 import { basename, delimiter, dirname, extname, join, resolve as resolvePath } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { serviceProcessCommand } from "../utils/service-process.js";
 import { createExternalProcessEnv } from "../server/paseo-env.js";
 import { writePrivateFileAtomicSync } from "../server/private-files.js";
 import { findExecutable } from "../executable-resolution/executable-resolution.js";
@@ -128,6 +129,7 @@ export interface CreateTerminalOptions {
   title?: string;
   command?: string;
   args?: string[];
+  serviceProcess?: boolean;
 }
 
 function toTerminalActivity(snapshot: {
@@ -941,7 +943,10 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
   const { command: spawnCommand, args: spawnArgs } = command
     ? await resolveTerminalSpawnCommand(command, args)
     : { command: resolvedShell, args: [] as string[] };
-  const ptyProcess = pty.spawn(spawnCommand, spawnArgs, {
+  const spawn = options.serviceProcess
+    ? serviceProcessCommand({ command: spawnCommand, args: spawnArgs })
+    : { command: spawnCommand, args: spawnArgs };
+  const ptyProcess = pty.spawn(spawn.command, spawn.args, {
     name: "xterm-256color",
     cols,
     rows,

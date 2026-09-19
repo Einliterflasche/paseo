@@ -5,6 +5,7 @@ export const PRIMARY_LAUNCH_ORDER = [
   "diff",
   "files",
   "browser",
+  "services",
   "pullRequest",
 ] as const;
 
@@ -15,6 +16,7 @@ export const SUPPORTING_LAUNCH_ORDER = [
   "terminal",
   "agent",
   "browser",
+  "services",
   "pullRequest",
 ] as const;
 

@@ -1,3 +1,4 @@
+import { servicesCatalogEnabled } from "@/services/feature";
 import { useCallback, useMemo } from "react";
 import { useAppSettings } from "@/hooks/use-settings";
 import type { AppSettings } from "@/hooks/use-settings/storage";
@@ -33,7 +34,13 @@ export function useSidebarNavItems<Section extends SidebarSection>(
   const pluginGroups = useMemo(() => groupPluginSidebarItems(plugins, section), [plugins, section]);
 
   const items = useMemo(
-    () => resolveSidebarNavItems({ section, pluginGroups, preferences }),
+    () =>
+      resolveSidebarNavItems({
+        section,
+        pluginGroups,
+        preferences,
+        servicesEnabled: servicesCatalogEnabled,
+      }),
     [pluginGroups, preferences, section],
   );
 
@@ -45,6 +52,7 @@ export function useSidebarNavItems<Section extends SidebarSection>(
           section,
           pluginGroups,
           preferences: previous,
+          servicesEnabled: servicesCatalogEnabled,
         });
         return {
           [field]: setSidebarNavItemVisible({ items: currentItems, key, visible, previous }),
@@ -62,6 +70,7 @@ export function useSidebarNavItems<Section extends SidebarSection>(
           section,
           pluginGroups,
           preferences: previous,
+          servicesEnabled: servicesCatalogEnabled,
         });
         return {
           [field]: moveSidebarNavItem({ items: currentItems, key, direction, previous }),

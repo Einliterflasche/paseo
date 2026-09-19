@@ -76,7 +76,12 @@ import { dispatchComposerAgentMessage, sendQueuedComposerMessageNow } from "@/co
 import { createMessageSubmissionWriter } from "@/composer/submission/writer";
 import { resolveComposerAttachmentSubmitFormat } from "@/composer/attachments/submit";
 import { encodeImages } from "@/utils/encode-images";
-import { DirectorySync, type RefreshAgentDirectoryResult } from "@/runtime/directory-sync";
+import {
+  DirectorySync,
+  type RefreshAgentDirectoryResult,
+  type WorkspaceDirectoryState,
+  type WorkspaceDirectoryReady,
+} from "@/runtime/directory-sync";
 import { ReplicaCache } from "@/runtime/replica-cache";
 import type { ReplicaRowStore } from "@/runtime/replica-cache/row-store";
 import { createReplicaRowStore } from "@/runtime/replica-cache/row-store-factory";
@@ -144,6 +149,7 @@ export interface HostRuntimeSnapshot {
   agentDirectoryStatus: HostRuntimeAgentDirectoryStatus;
   agentDirectoryError: string | null;
   hasEverLoadedAgentDirectory: boolean;
+  workspaceDirectory: WorkspaceDirectoryState | null;
   probeByConnectionId: Map<string, ConnectionProbeState>;
   clientGeneration: number;
   connectionEpoch: number;
@@ -674,6 +680,7 @@ export class HostRuntimeController {
       agentDirectoryStatus: "idle",
       agentDirectoryError: null,
       hasEverLoadedAgentDirectory: false,
+      workspaceDirectory: null,
       probeByConnectionId: new Map(),
       clientGeneration: 0,
     };
@@ -785,6 +792,16 @@ export class HostRuntimeController {
       agentDirectoryStatus: status,
       agentDirectoryError: null,
     });
+  }
+
+  markWorkspaceDirectoryState(workspaceDirectory: WorkspaceDirectoryState): void {
+    const { source } = workspaceDirectory;
+    if (
+      source.clientGeneration !== this.snapshot.clientGeneration ||
+      source.connectionEpoch !== this.snapshot.connectionEpoch
+    )
+      return;
+    this.updateSnapshot({ workspaceDirectory });
   }
 
   markAgentDirectorySyncReady(): void {
@@ -1908,6 +1925,7 @@ export class HostRuntimeStore {
         markAgentLoading: () => controller.markAgentDirectorySyncLoading(),
         markAgentReady: () => controller.markAgentDirectorySyncReady(),
         markAgentError: (error) => controller.markAgentDirectorySyncError(error),
+        onWorkspaceState: (state) => controller.markWorkspaceDirectoryState(state),
       },
       this.replicaCache,
     );
@@ -2413,6 +2431,7 @@ export class HostRuntimeStore {
           markAgentLoading: () => controller.markAgentDirectorySyncLoading(),
           markAgentReady: () => controller.markAgentDirectorySyncReady(),
           markAgentError: (error) => controller.markAgentDirectorySyncError(error),
+          onWorkspaceState: (state) => controller.markWorkspaceDirectoryState(state),
         },
         this.replicaCache,
       );
@@ -2720,10 +2739,13 @@ export class HostRuntimeStore {
     return directory.refreshAgents(input);
   }
 
-  async refreshWorkspaceDirectory(input: { serverId: string; subscribe?: boolean }): Promise<void> {
+  async refreshWorkspaceDirectory(input: {
+    serverId: string;
+    subscribe?: boolean;
+  }): Promise<WorkspaceDirectoryReady | null> {
     const directory = this.directorySyncByServer.get(input.serverId);
     if (!directory) throw new Error(`Unknown host runtime for serverId ${input.serverId}`);
-    await directory.refreshWorkspaces({ subscribe: input.subscribe });
+    return directory.refreshWorkspaces({ subscribe: input.subscribe });
   }
 
   async refreshDirectories(serverId: string): Promise<void> {

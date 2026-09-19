@@ -3,7 +3,16 @@ import { subscribeTimeline, type TimelineMessage } from "./timeline-subscription
 import { ProviderSnapshotUpdates } from "./provider-snapshots/index.js";
 import { TimelineRequestError } from "./timeline-request-error.js";
 export { TimelineRequestError, type TimelineRequestErrorCode } from "./timeline-request-error.js";
-import type { ProviderSubagentTarget } from "@getpaseo/protocol/messages";
+import type {
+  ProviderSubagentTarget,
+  ServicePreviewPrepareRequest,
+  ServicePreviewCloseRequest,
+  ServiceExternalRegisterRequest,
+  ServiceManagedEnableRequest,
+  ServiceManagedDisableRequest,
+  ServiceExternalConnectRequest,
+  ServiceExternalDisconnectRequest,
+} from "@getpaseo/protocol/messages";
 import {
   ConnectionSubscriptions,
   type OwnedSubscription,
@@ -1899,6 +1908,7 @@ export class DaemonClient {
     timeout?: number;
     select: (msg: SessionOutboundMessage) => T | null;
     options?: { skipQueue?: boolean };
+    sendPolicy?: "connected";
   }): Promise<T> {
     const wire = this.owned.prepareRequest(params.message);
     const timeout = params.timeout ?? DEFAULT_SESSION_RPC_TIMEOUT_MS;
@@ -1926,7 +1936,11 @@ export class DaemonClient {
     );
 
     try {
-      await this.sendSessionMessageOrThrow(wire.message);
+      if (params.sendPolicy === "connected") {
+        this.sendSessionMessageStrict(wire.message);
+      } else {
+        await this.sendSessionMessageOrThrow(wire.message);
+      }
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
       cancel(err);
@@ -1952,6 +1966,7 @@ export class DaemonClient {
     timeout?: number;
     responseType: TResponseType;
     options?: { skipQueue?: boolean };
+    sendPolicy?: "connected";
     selectPayload?: (payload: CorrelatedResponsePayload<TResponseType>) => TResult | null;
   }): Promise<TResult> {
     return this.sendRequest({
@@ -1959,6 +1974,7 @@ export class DaemonClient {
       message: params.message,
       timeout: params.timeout,
       options: params.options,
+      sendPolicy: params.sendPolicy,
       select: (msg) => {
         const correlated = msg as CorrelatedResponseMessage;
         if (correlated.type !== params.responseType) {
@@ -1984,6 +2000,7 @@ export class DaemonClient {
     message: { type: SessionInboundMessage["type"] } & Record<string, unknown>;
     responseType: TResponseType;
     timeout?: number;
+    sendPolicy?: "connected";
     selectPayload?: (payload: CorrelatedResponsePayload<TResponseType>) => TResult | null;
   }): Promise<TResult> {
     const resolvedRequestId = this.createRequestId(params.requestId);
@@ -1996,6 +2013,7 @@ export class DaemonClient {
       message,
       responseType: params.responseType,
       timeout: params.timeout,
+      sendPolicy: params.sendPolicy,
       options: { skipQueue: true },
       ...(params.selectPayload ? { selectPayload: params.selectPayload } : {}),
     });
@@ -2721,6 +2739,83 @@ export class DaemonClient {
       requestId,
       message: { type: "workspace.script.start.request", workspaceId, scriptName },
       responseType: "workspace.script.start.response",
+    });
+  }
+
+  async prepareServicePreview(
+    input: Omit<ServicePreviewPrepareRequest, "type" | "requestId"> & { requestId?: string },
+  ) {
+    return this.sendCorrelatedSessionRequest({
+      sendPolicy: "connected",
+      requestId: input.requestId,
+      message: { ...input, type: "service.preview.prepare.request" },
+      responseType: "service.preview.prepare.response",
+    });
+  }
+
+  async closeServicePreview(
+    input: Omit<ServicePreviewCloseRequest, "type" | "requestId"> & { requestId?: string },
+  ) {
+    return this.sendCorrelatedSessionRequest({
+      sendPolicy: "connected",
+      requestId: input.requestId,
+      message: { ...input, type: "service.preview.close.request" },
+      responseType: "service.preview.close.response",
+    });
+  }
+
+  async registerExternalService(
+    input: Omit<ServiceExternalRegisterRequest, "type" | "requestId"> & { requestId?: string },
+  ) {
+    return this.sendCorrelatedSessionRequest({
+      sendPolicy: "connected",
+      requestId: input.requestId,
+      message: { ...input, type: "service.external.register.request" },
+      responseType: "service.external.register.response",
+    });
+  }
+
+  async enableManagedServicePreview(
+    input: Omit<ServiceManagedEnableRequest, "type" | "requestId"> & { requestId?: string },
+  ) {
+    return this.sendCorrelatedSessionRequest({
+      sendPolicy: "connected",
+      requestId: input.requestId,
+      message: { ...input, type: "service.managed.enable.request" },
+      responseType: "service.managed.enable.response",
+    });
+  }
+
+  async disableManagedServicePreview(
+    input: Omit<ServiceManagedDisableRequest, "type" | "requestId"> & { requestId?: string },
+  ) {
+    return this.sendCorrelatedSessionRequest({
+      sendPolicy: "connected",
+      requestId: input.requestId,
+      message: { ...input, type: "service.managed.disable.request" },
+      responseType: "service.managed.disable.response",
+    });
+  }
+
+  async connectExternalService(
+    input: Omit<ServiceExternalConnectRequest, "type" | "requestId"> & { requestId?: string },
+  ) {
+    return this.sendCorrelatedSessionRequest({
+      sendPolicy: "connected",
+      requestId: input.requestId,
+      message: { ...input, type: "service.external.connect.request" },
+      responseType: "service.external.connect.response",
+    });
+  }
+
+  async disconnectExternalService(
+    input: Omit<ServiceExternalDisconnectRequest, "type" | "requestId"> & { requestId?: string },
+  ) {
+    return this.sendCorrelatedSessionRequest({
+      sendPolicy: "connected",
+      requestId: input.requestId,
+      message: { ...input, type: "service.external.disconnect.request" },
+      responseType: "service.external.disconnect.response",
     });
   }
 

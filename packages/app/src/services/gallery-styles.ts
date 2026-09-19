@@ -1,0 +1,55 @@
+import { StyleSheet } from "react-native-unistyles";
+
+export const serviceGalleryStyles = StyleSheet.create((theme) => ({
+  container: {
+    flex: 1,
+    minHeight: 0,
+    gap: theme.spacing[3],
+    padding: theme.spacing[4],
+    backgroundColor: theme.colors.surface0,
+  },
+  heading: { gap: theme.spacing[1] },
+  title: {
+    color: theme.colors.foreground,
+    fontSize: theme.fontSize.xl,
+    fontWeight: theme.fontWeight.semibold,
+  },
+  description: { color: theme.colors.foregroundMuted, fontSize: theme.fontSize.base },
+  toolbar: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: theme.spacing[2] },
+  list: { marginHorizontal: -theme.spacing[1] },
+  content: { paddingBottom: theme.spacing[4] },
+  card: {
+    margin: theme.spacing[1],
+    overflow: "hidden",
+    borderRadius: theme.borderRadius.lg,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: theme.colors.surface1,
+  },
+  preview: {
+    height: 140,
+    backgroundColor: theme.colors.surface2,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: theme.spacing[3],
+    borderBottomWidth: 1,
+    borderColor: theme.colors.border,
+  },
+  cardBody: { padding: theme.spacing[4], gap: theme.spacing[3] },
+  cardHeading: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: theme.spacing[2],
+  },
+  name: {
+    color: theme.colors.foreground,
+    fontSize: theme.fontSize.base,
+    fontWeight: theme.fontWeight.semibold,
+    flex: 1,
+  },
+  caption: { color: theme.colors.foregroundMuted, fontSize: theme.fontSize.sm },
+  metadata: { flexDirection: "row", alignItems: "center", gap: theme.spacing[2] },
+  actions: { flexDirection: "row", flexWrap: "wrap", gap: theme.spacing[2] },
+  empty: { padding: theme.spacing[6], color: theme.colors.foregroundMuted, textAlign: "center" },
+}));

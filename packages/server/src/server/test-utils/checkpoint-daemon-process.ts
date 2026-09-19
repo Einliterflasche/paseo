@@ -1,6 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import pino from "pino";
+import { resolveSkillTargets } from "../orchestration-skills/internal/paths.js";
 import { createPaseoDaemon } from "../bootstrap.js";
 import { createCheckpointAgentClient } from "./checkpoint-agent-client.js";
 
@@ -35,6 +36,7 @@ const daemon = await createPaseoDaemon(
     },
   },
   pino({ level: "silent" }),
+  { resolveSkillTargets: () => resolveSkillTargets(home) },
 );
 await daemon.start();
 const target = daemon.getListenTarget();

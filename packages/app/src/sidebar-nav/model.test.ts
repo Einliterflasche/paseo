@@ -31,6 +31,40 @@ function summarize(items: readonly SidebarNavItem[]): SidebarNavPreference[] {
 }
 
 describe("resolveSidebarNavItems", () => {
+  it("keeps Services unavailable by default even when preferences came from an enabled client", () => {
+    const input = {
+      section: "header" as const,
+      pluginGroups: [],
+      preferences: [{ key: "services", visible: true }],
+    };
+    expect(resolveSidebarNavItems(input).some((item) => item.key === "services")).toBe(false);
+    expect(resolveSidebarNavItems({ ...input, servicesEnabled: true })[0].key).toBe("services");
+  });
+
+  it("keeps Services in the header and Usage and plugin items in the footer", () => {
+    const preferences = [{ key: "services", visible: false }];
+    expect(
+      resolveSidebarNavItems({
+        section: "header",
+        servicesEnabled: true,
+        pluginGroups: [],
+        preferences,
+      })[0],
+    ).toMatchObject({ key: "services", visible: false });
+    expect(
+      summarize(
+        resolveSidebarNavItems({
+          section: "footer",
+          servicesEnabled: true,
+          pluginGroups: [notes],
+          preferences,
+        }),
+      ),
+    ).toEqual([
+      { key: "usage", visible: true },
+      { key: notesKey, visible: true },
+    ]);
+  });
   it("yields builtins then plugins, all visible, when nothing is stored", () => {
     const items = resolveSidebarNavItems({
       section: "header",

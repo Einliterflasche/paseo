@@ -15,6 +15,14 @@ interface RuntimeEntryKey {
 export class WorkspaceScriptRuntimeStore {
   private readonly entries = new Map<string, ScriptRuntimeEntry>();
   private readonly scriptsByWorkspace = new Map<string, Set<string>>();
+  private readonly listeners = new Set<(workspaceId: string) => void>();
+
+  subscribe(listener: (workspaceId: string) => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
 
   get(key: RuntimeEntryKey): ScriptRuntimeEntry | null {
     const entry = this.entries.get(this.toEntryKey(key));
@@ -31,6 +39,7 @@ export class WorkspaceScriptRuntimeStore {
 
     this.entries.set(entryKey, { ...entry });
     this.addScriptToWorkspaceIndex(workspaceKey, entry.scriptName);
+    this.publish(entry.workspaceId);
   }
 
   remove(key: RuntimeEntryKey): void {
@@ -42,6 +51,7 @@ export class WorkspaceScriptRuntimeStore {
 
     this.entries.delete(entryKey);
     this.removeScriptFromWorkspaceIndex(existing.workspaceId, existing.scriptName);
+    this.publish(existing.workspaceId);
   }
 
   listForWorkspace(workspaceId: string): ScriptRuntimeEntry[] {
@@ -70,10 +80,15 @@ export class WorkspaceScriptRuntimeStore {
       this.entries.delete(this.toEntryKey(entry));
     }
     this.scriptsByWorkspace.delete(this.toWorkspaceKey(workspaceId));
+    this.publish(workspaceId);
   }
 
   isRunning(key: RuntimeEntryKey): boolean {
     return this.get(key)?.lifecycle === "running";
+  }
+
+  private publish(workspaceId: string): void {
+    for (const listener of this.listeners) listener(workspaceId);
   }
 
   private addScriptToWorkspaceIndex(workspaceKey: string, scriptName: string): void {

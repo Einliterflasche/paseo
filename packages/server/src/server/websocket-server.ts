@@ -4,6 +4,7 @@ import { CreationService } from "./creation/index.js";
 import { MessageReceipts } from "./message-receipts/index.js";
 import { WebSocket, WebSocketServer } from "ws";
 import type { IncomingMessage, Server as HTTPServer } from "http";
+import type { Duplex } from "node:stream";
 import { join } from "path";
 import { hostname as getHostname } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -99,6 +100,19 @@ import {
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
+import type { PreviewSources } from "./service-preview/sources.js";
+import { PreviewBrokerError, type PreviewBroker } from "./service-preview/broker.js";
+import {
+  dispatchExternalPreview,
+  externalPreviewResponseType,
+  isExternalPreviewRequest,
+} from "./service-preview/external-dispatch.js";
+import { RestartInProgressError } from "./restart/restart-errors.js";
+import {
+  dispatchManagedPreview,
+  managedPreviewResponseType,
+  isManagedPreviewRequest,
+} from "./service-preview/managed-dispatch.js";
 import type { DaemonRuntimeConfig } from "./session/daemon/daemon-session.js";
 import { DirectorySyncService } from "./directory-sync/index.js";
 import { OWNER_PERMISSIONS, type DaemonPermission } from "./authorization/index.js";
@@ -155,6 +169,10 @@ interface WebSocketConnectionIdentity {
 }
 
 interface WebSocketServerConfig {
+  // No production bootstrap supplies this while preview admission is experimental.
+  previewBroker?: PreviewBroker;
+  /** The bootstrap ingress exclusively dispatches upgrades in this mode. */
+  externallyDispatched?: boolean;
   allowedOrigins?: Set<string>;
   hostnames?: HostnamesConfig;
   getAllowedOrigins?: () => Set<string>;
@@ -534,6 +552,12 @@ function requireWebSocketServices(params: {
 /**
  * WebSocket server that only accepts sockets + parses/forwards messages to the session layer.
  */
+function requireDaemonVersion(version: string | undefined): string {
+  if (typeof version !== "string" || version.trim().length === 0)
+    throw new MissingDaemonVersionError();
+  return version.trim();
+}
+
 export class VoiceAssistantWebSocketServer {
   private readonly logger: pino.Logger;
   private readonly wss: WebSocketServer;
@@ -612,6 +636,11 @@ export class VoiceAssistantWebSocketServer {
     this.broadcastCapabilitiesUpdate();
   }
   private readonly advertiseRelayConfig: boolean;
+  private readonly previewBroker: PreviewBroker | null;
+  private unsubscribePreviewCatalog: (() => void) | null = null;
+  private get previewSources(): PreviewSources | null {
+    return this.previewBroker?.sources ?? null;
+  }
   private readonly directorySync = new DirectorySyncService();
   private readonly pluginRuntime: SessionOptions["pluginRuntime"];
   private readonly orchestrationSkills: SessionOptions["orchestrationSkills"];
@@ -687,13 +716,11 @@ export class VoiceAssistantWebSocketServer {
     this.workspaceSetupRuntime = workspaceSetupRuntime;
     this.advertiseDaemonStatusRpc = wsConfig.daemonStatusRpc !== false;
     this.advertiseRelayConfig = wsConfig.relayConfig !== false;
+    this.previewBroker = wsConfig.previewBroker ?? null;
     this.getRestartStatus = wsConfig.getRestartStatus;
     this.connectionLifecycle = wsConfig.startPaused === true ? "starting" : "accepting";
     this.serverId = serverId;
-    if (typeof daemonVersion !== "string" || daemonVersion.trim().length === 0) {
-      throw new MissingDaemonVersionError();
-    }
-    this.daemonVersion = daemonVersion.trim();
+    this.daemonVersion = requireDaemonVersion(daemonVersion);
     this.credentialSource = auth;
     this.daemonRuntimeConfig = daemonRuntimeConfig;
     this.browserToolsBroker = browserToolsBroker ?? null;
@@ -779,6 +806,7 @@ export class VoiceAssistantWebSocketServer {
     });
 
     this.wss = this.createWebSocketServer(server, wsConfig, auth);
+    this.subscribeToPreviewCatalog();
     this.startRuntimeMetricsInterval();
     this.startApplicationSocketLeaseInterval();
 
@@ -844,7 +872,7 @@ export class VoiceAssistantWebSocketServer {
   ): WebSocketServer {
     const password = auth?.password;
     const wss = new WebSocketServer({
-      server,
+      ...(wsConfig.externallyDispatched ? { noServer: true as const } : { server }),
       path: "/ws",
       handleProtocols: (protocols) => selectWebSocketProtocol(protocols, password),
       verifyClient: ({ req }, callback) => {
@@ -860,6 +888,12 @@ export class VoiceAssistantWebSocketServer {
       void this.attachAuthenticatedSocket(ws, request, password);
     });
     return wss;
+  }
+
+  handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
+    this.wss.handleUpgrade(request, socket, head, (connection) => {
+      this.wss.emit("connection", connection, request);
+    });
   }
 
   private startRuntimeMetricsInterval(): void {
@@ -970,6 +1004,8 @@ export class VoiceAssistantWebSocketServer {
         undefined,
         false,
         hasHeaderCredential ? OWNER_SESSION_ADMISSION : null,
+        undefined,
+        password && hasHeaderCredential ? "verified-owner-password" : undefined,
       );
     } finally {
       ws.resume();
@@ -1056,6 +1092,7 @@ export class VoiceAssistantWebSocketServer {
     principalId: string,
     permissions: readonly DaemonPermission[],
   ): void {
+    this.previewSources?.replacePrincipalPermissions(principalId, permissions);
     for (const pending of this.pendingConnections.values()) {
       if (pending.admission?.principalId === principalId) {
         pending.admission = { ...pending.admission, permissions };
@@ -1066,10 +1103,18 @@ export class VoiceAssistantWebSocketServer {
         connection.session.setPermissions(permissions);
       }
     }
+    if (this.previewBroker) this.broadcastCapabilitiesUpdate();
   }
 
   public prepareForShutdown(): void {
+    this.unsubscribePreviewCatalog?.();
+    this.unsubscribePreviewCatalog = null;
     this.connectionLifecycle = "stopping";
+    try {
+      this.previewBroker?.close();
+    } finally {
+      this.previewSources?.close();
+    }
   }
 
   public beginAcceptingConnections(): void {
@@ -1079,7 +1124,13 @@ export class VoiceAssistantWebSocketServer {
   }
 
   public async close(): Promise<void> {
-    this.prepareForShutdown();
+    try {
+      this.prepareForShutdown();
+    } catch (error) {
+      this.logger.error({ err: error }, "Service preview retirement failed during transport close");
+    }
+    // The feature owner drains preview persistence and its worker. Transport
+    // cleanup must still finish when that optional drain fails or stays pending.
     this.unsubscribeSpeechReadiness?.();
     this.unsubscribeSpeechReadiness = null;
     this.unsubscribeDaemonConfigChange?.();
@@ -1161,6 +1212,20 @@ export class VoiceAssistantWebSocketServer {
 
   private sendToClient(ws: WebSocketLike, message: WSOutboundMessage): void {
     this.sendMessageToSockets([ws], message, true);
+  }
+
+  private async sendPreviewFrame(ws: WebSocketLike, frame: string): Promise<boolean> {
+    try {
+      return await sendBoundedPhysicalFrameAndWait({
+        socket: ws,
+        frame,
+        onHighWater: () => this.closeAtOutboundHighWater(ws),
+      });
+    } catch {
+      // Transport exceptions must not publish secret-bearing payloads or errors.
+      this.logger.warn("preview_source_reply_failed");
+      return false;
+    }
   }
 
   private sendMessageToSockets(
@@ -1282,6 +1347,7 @@ export class VoiceAssistantWebSocketServer {
 
   private closePhysicalSocket(params: ClosePhysicalSocketParams): void {
     const { ws, logMessage, logFields } = params;
+    this.previewSources?.detach(ws);
     this.applicationSocketLease.release(ws);
     if (ws.readyState !== 1) {
       return;
@@ -1327,6 +1393,7 @@ export class VoiceAssistantWebSocketServer {
     allowDuringStartup = false,
     admission: SessionAdmission | null = null,
     initialHello?: WSHelloMessage,
+    directAuthentication?: "verified-owner-password",
   ): Promise<void> {
     if (
       this.connectionLifecycle === "stopping" ||
@@ -1343,6 +1410,16 @@ export class VoiceAssistantWebSocketServer {
     const requestMetadata = extractSocketRequestMetadata(request);
     const identity = createWebSocketConnectionIdentity(requestMetadata, metadata);
     this.socketIdentities.set(ws, identity);
+    if (directAuthentication === "verified-owner-password" && admission) {
+      this.previewSources?.admitDirectOwner({
+        socket: ws,
+        connectionId: identity.connectionId,
+        principalId: admission.principalId,
+        permissions: admission.permissions,
+        origin: identity.origin,
+        send: (frame) => this.sendPreviewFrame(ws, frame),
+      });
+    }
     const connectionLogger = this.logger.child(toConnectionLogFields(identity));
 
     const pending: PendingConnection = {
@@ -1506,7 +1583,7 @@ export class VoiceAssistantWebSocketServer {
       onBinaryMessage: options.onBinaryMessage,
       onBinaryMessageToSource: options.onBinaryMessageToSource,
       getTransportBufferedAmount: options.getTransportBufferedAmount,
-      getServerInfo: (session) => this.buildServerInfoStatusPayload(session),
+      getServerInfo: (session, source) => this.buildServerInfoStatusPayload(session, source),
       getJsonResponseCapacity: options.getJsonResponseCapacity,
       onLifecycleIntent: options.onLifecycleIntent,
       logger: options.connectionLogger.child({ module: "session" }),
@@ -1639,16 +1716,7 @@ export class VoiceAssistantWebSocketServer {
     }
 
     const pluginId = this.pluginSocketIds.get(ws);
-    const expectedPluginClientId = pluginId ? createPluginClientId(pluginId) : null;
-    if (
-      (expectedPluginClientId !== null && clientId !== expectedPluginClientId) ||
-      (expectedPluginClientId === null && isPluginClientId(clientId))
-    ) {
-      this.clearPendingConnection(ws);
-      pending.connectionLogger.warn({ clientId }, "Rejected reserved plugin clientId");
-      ws.close(WS_CLOSE_INVALID_HELLO, "Invalid plugin clientId");
-      return;
-    }
+    if (!this.acceptsClientIdentity(ws, clientId, pluginId, pending)) return;
 
     this.clearPendingConnection(ws);
     const admitted = pending.admission;
@@ -1676,11 +1744,12 @@ export class VoiceAssistantWebSocketServer {
       admission: admitted,
     });
     this.sessions.set(ws, connection);
+    this.previewSources?.negotiate(ws, message.capabilities ?? null);
     if (connection.lifecycle === "reconnectable") {
       this.externalSessionsByKey.set(sessionKey, connection);
     }
     pending.identity.sessionId = connection.session.getSessionId();
-    this.sendToClient(ws, this.createServerInfoMessage(connection.session));
+    this.sendToClient(ws, this.createServerInfoMessage(connection.session, ws));
     connection.connectionLogger.info(
       {
         ...toConnectionLogFields(pending.identity),
@@ -1716,6 +1785,25 @@ export class VoiceAssistantWebSocketServer {
     });
   }
 
+  private acceptsClientIdentity(
+    ws: WebSocketLike,
+    clientId: string,
+    pluginId: string | undefined,
+    pending: PendingConnection,
+  ): boolean {
+    const expected = pluginId ? createPluginClientId(pluginId) : null;
+    if (
+      (expected !== null && clientId !== expected) ||
+      (expected === null && isPluginClientId(clientId))
+    ) {
+      this.clearPendingConnection(ws);
+      pending.connectionLogger.warn({ clientId }, "Rejected reserved plugin clientId");
+      ws.close(WS_CLOSE_INVALID_HELLO, "Invalid plugin clientId");
+      return false;
+    }
+    return true;
+  }
+
   private async admitPendingHello(
     ws: WebSocketLike,
     message: WSHelloMessage,
@@ -1736,6 +1824,22 @@ export class VoiceAssistantWebSocketServer {
         return false;
       }
       pending.admission = resolved.admission;
+      // The modern hello credential has now passed the daemon password owner.
+      // Local tokens, relays and unauthenticated hosts cannot mint preview grants.
+      if (
+        this.passwordHash &&
+        message.auth?.kind === "password" &&
+        pending.identity.transport === "direct"
+      ) {
+        this.previewSources?.admitDirectOwner({
+          socket: ws,
+          connectionId: pending.identity.connectionId,
+          principalId: resolved.admission.principalId,
+          permissions: resolved.admission.permissions,
+          origin: pending.identity.origin,
+          send: (frame) => this.sendPreviewFrame(ws, frame),
+        });
+      }
       return true;
     } catch (error) {
       pending.connectionLogger.error({ err: error }, "Failed to resolve hello credential");
@@ -1808,8 +1912,9 @@ export class VoiceAssistantWebSocketServer {
     }
     existing.sockets.add(ws);
     this.sessions.set(ws, existing);
+    this.previewSources?.negotiate(ws, message.capabilities ?? null);
     pending.identity.sessionId = existing.session.getSessionId();
-    this.sendToClient(ws, this.createServerInfoMessage(existing.session));
+    this.sendToClient(ws, this.createServerInfoMessage(existing.session, ws));
     pending.connectionLogger.info(
       {
         ...toConnectionLogFields(pending.identity),
@@ -1820,10 +1925,15 @@ export class VoiceAssistantWebSocketServer {
     );
   }
 
-  private buildServerInfoStatusPayload(session: Session): ServerInfoStatusPayload {
+  private buildServerInfoStatusPayload(session: Session, source?: object): ServerInfoStatusPayload {
+    const previews =
+      source && this.previewSources?.capture(source as WebSocketLike)
+        ? this.previewBroker?.describe()
+        : undefined;
     return {
       status: "server_info",
       protocolVersion: WS_PROTOCOL_VERSION,
+      ...(previews ? { servicePreviews: previews } : {}),
       ...(this.getRestartStatus
         ? {
             restartRecoveryState: this.getRestartStatus().state,
@@ -2004,14 +2114,12 @@ export class VoiceAssistantWebSocketServer {
     };
   }
 
-  private createServerInfoMessage(session: Session): WSOutboundMessage {
-    return {
-      type: "session",
-      message: {
-        type: "status",
-        payload: this.buildServerInfoStatusPayload(session),
-      },
-    };
+  private buildServerInfoStatusMessage(session: Session, source?: object): SessionOutboundMessage {
+    return { type: "status", payload: this.buildServerInfoStatusPayload(session, source) };
+  }
+
+  private createServerInfoMessage(session: Session, socket?: WebSocketLike): WSOutboundMessage {
+    return { type: "session", message: this.buildServerInfoStatusMessage(session, socket) };
   }
 
   private createDaemonConfigChangedMessage(config: MutableDaemonConfig): WSOutboundMessage {
@@ -2025,18 +2133,20 @@ export class VoiceAssistantWebSocketServer {
   }
 
   private broadcastCapabilitiesUpdate(): void {
-    for (const connection of new Set(this.sessions.values())) {
-      if (
-        ![...connection.sockets].some((socket) =>
-          connection.session.wantsSourceEvent(socket, "status.server_info"),
-        )
-      )
-        continue;
-      connection.session.publish({
-        type: "status",
-        payload: this.buildServerInfoStatusPayload(connection.session),
-      });
+    for (const [socket, connection] of this.sessions) {
+      if (!connection.session.wantsSourceEvent(socket, "status.server_info")) continue;
+      connection.session.publish(
+        this.buildServerInfoStatusMessage(connection.session, socket),
+        socket,
+      );
     }
+  }
+
+  private subscribeToPreviewCatalog(): void {
+    if (!this.previewBroker) return;
+    this.unsubscribePreviewCatalog = this.previewBroker.subscribeCatalog(() =>
+      this.broadcastCapabilitiesUpdate(),
+    );
   }
 
   private broadcastDaemonConfigChanged(config: MutableDaemonConfig): void {
@@ -2086,6 +2196,7 @@ export class VoiceAssistantWebSocketServer {
     },
   ): Promise<void> {
     this.applicationSocketLease.release(ws);
+    this.previewSources?.detach(ws);
     const identity = this.socketIdentities.get(ws);
     const identityFields = identity ? toConnectionLogFields(identity) : {};
     const pending = this.clearPendingConnection(ws);
@@ -2332,16 +2443,18 @@ export class VoiceAssistantWebSocketServer {
     }
   }
 
+  private acceptsSocketIngress(ws: WebSocketLike): boolean {
+    return (
+      this.connectionLifecycle !== "stopping" &&
+      (this.connectionLifecycle !== "starting" || this.pluginSocketIds.has(ws))
+    );
+  }
+
   private handleRawMessage(
     ws: WebSocketLike,
     data: Buffer | ArrayBuffer | Buffer[] | string,
   ): void {
-    if (
-      this.connectionLifecycle === "stopping" ||
-      (this.connectionLifecycle === "starting" && !this.pluginSocketIds.has(ws))
-    ) {
-      return;
-    }
+    if (!this.acceptsSocketIngress(ws)) return;
 
     this.applicationSocketLease.renew(ws);
 
@@ -2411,6 +2524,7 @@ export class VoiceAssistantWebSocketServer {
       if (message.type === "hello") {
         this.incrementRuntimeCounter("unexpectedHelloOnActiveConnection");
         activeConnection.connectionLogger.warn("Received hello on active connection");
+        this.previewSources?.detach(ws);
         try {
           ws.close(WS_CLOSE_INVALID_HELLO, "Unexpected hello");
         } catch {
@@ -2435,6 +2549,15 @@ export class VoiceAssistantWebSocketServer {
     message: Extract<WSInboundMessage, { type: "session" }>,
   ): Promise<void> {
     this.recordInboundSessionRequestType(message.message.type);
+    if (
+      message.message.type === "service.preview.prepare.request" ||
+      message.message.type === "service.preview.close.request" ||
+      isExternalPreviewRequest(message.message) ||
+      isManagedPreviewRequest(message.message)
+    ) {
+      await this.dispatchPreviewMessage(ws, message.message);
+      return;
+    }
     const controlRpc = getControlRpcLogInfo(message.message);
     if (controlRpc) {
       const identity = this.socketIdentities.get(ws);
@@ -2465,6 +2588,79 @@ export class VoiceAssistantWebSocketServer {
           inflightRequests: activeConnection.session.getRuntimeMetrics().inflightRequests,
         },
         "ws_slow_request",
+      );
+    }
+  }
+
+  private async dispatchPreviewMessage(
+    ws: WebSocketLike,
+    request: Extract<
+      Extract<WSInboundMessage, { type: "session" }>["message"],
+      {
+        type:
+          | "service.preview.prepare.request"
+          | "service.preview.close.request"
+          | "service.external.register.request"
+          | "service.external.connect.request"
+          | "service.external.disconnect.request"
+          | "service.managed.enable.request"
+          | "service.managed.disable.request";
+      }
+    >,
+  ): Promise<void> {
+    try {
+      if (!this.previewBroker) throw new PreviewBrokerError("unavailable");
+      const broker = this.previewBroker;
+      if (isManagedPreviewRequest(request)) {
+        await dispatchManagedPreview({
+          broker,
+          socket: ws,
+          request,
+          runAdmission: (operation) => this.agentManager.runRequestAdmission(operation),
+        });
+      } else if (isExternalPreviewRequest(request)) {
+        await dispatchExternalPreview({
+          broker,
+          socket: ws,
+          request,
+          runAdmission: (operation) => this.agentManager.runRequestAdmission(operation),
+        });
+      } else if (request.type === "service.preview.prepare.request") {
+        await this.agentManager.runRequestAdmission(() => broker.prepare({ socket: ws, request }));
+      } else {
+        await broker.closeAttempt({ socket: ws, request });
+      }
+      return;
+    } catch (error) {
+      if (!(error instanceof PreviewBrokerError) && !(error instanceof RestartInProgressError)) {
+        try {
+          this.previewBroker?.close();
+        } catch {
+          // All broker authority ends before observer notification. An observer
+          // failure must not escape into shared-session error delivery.
+        }
+        this.logger.warn("preview_dispatch_failed");
+      }
+      // Never pass preview failures to shared-session error handling: a sibling
+      // may have the same clientId. Neither raw errors nor request data are logged.
+      let type: string;
+      if (isManagedPreviewRequest(request)) type = managedPreviewResponseType(request);
+      else if (isExternalPreviewRequest(request)) type = externalPreviewResponseType(request);
+      else if (request.type === "service.preview.prepare.request")
+        type = "service.preview.prepare.response";
+      else type = "service.preview.close.response";
+      await this.sendPreviewFrame(
+        ws,
+        JSON.stringify({
+          type: "session",
+          message: {
+            type,
+            payload: {
+              requestId: request.requestId,
+              result: { status: "error", code: "unavailable" },
+            },
+          },
+        }),
       );
     }
   }
