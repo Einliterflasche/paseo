@@ -1,4 +1,6 @@
 import { validateProviderOptions } from "../../provider-options.js";
+import { raceProviderRefreshAbort } from "../../provider-refresh-deadline.js";
+import { ProviderInitializationCleanupError } from "../../provider-initialization-cleanup-error.js";
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -98,6 +100,7 @@ import {
   type AgentCapabilityFlags,
   type AgentClient,
   type AgentCreateSessionOptions,
+  type AgentProbeContext,
   type AgentFeature,
   type AgentLaunchContext,
   type AgentMetadata,
@@ -142,7 +145,7 @@ import {
   type ResolvedProviderLaunch,
 } from "../../provider-launch-config.js";
 import { withTimeout } from "../../../../utils/promise-timeout.js";
-import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
+import { terminateWithTreeKill, type ProcessTerminator } from "../../../../utils/tree-kill.js";
 import { execCommand } from "../../../../utils/spawn.js";
 import { composeSystemPromptParts } from "../../system-prompt.js";
 
@@ -407,12 +410,15 @@ interface ClaudeAgentClientOptions {
   logger: Logger;
   runtimeSettings?: ProviderRuntimeSettings;
   queryFactory?: ClaudeQueryFactory;
+  terminateProcess?: ProcessTerminator;
   resolveBinary?: () => Promise<string>;
-  resolveVersion?: (signal?: AbortSignal) => Promise<string>;
+  resolveVersion?: (signal?: AbortSignal, probe?: AgentProbeContext) => Promise<string>;
+  configDir?: string;
   rewindSdk?: ClaudeRewindSdk;
 }
 
 interface ClaudeAgentSessionOptions {
+  probe?: AgentProbeContext;
   defaults?: { agents?: Record<string, AgentDefinition> };
   runtimeSettings?: ProviderRuntimeSettings;
   handle?: AgentPersistenceHandle;
@@ -421,6 +427,7 @@ interface ClaudeAgentSessionOptions {
   persistSession?: boolean;
   logger: Logger;
   queryFactory?: ClaudeQueryFactory;
+  terminateProcess?: ProcessTerminator;
   resolveBinary: () => Promise<string>;
   rewindSdk?: ClaudeRewindSdk;
 }
@@ -1503,8 +1510,13 @@ export class ClaudeAgentClient implements AgentClient {
   private readonly logger: Logger;
   private readonly runtimeSettings?: ProviderRuntimeSettings;
   private readonly queryFactory?: ClaudeQueryFactory;
+  private readonly terminateProcess: ProcessTerminator;
   private readonly resolveBinary: () => Promise<string>;
-  private readonly resolveVersion: (signal?: AbortSignal) => Promise<string>;
+  private readonly resolveVersion: (
+    signal?: AbortSignal,
+    probe?: AgentProbeContext,
+  ) => Promise<string>;
+  private readonly configDir?: string;
   private readonly rewindSdk: ClaudeRewindSdk;
 
   constructor(options: ClaudeAgentClientOptions) {
@@ -1512,10 +1524,12 @@ export class ClaudeAgentClient implements AgentClient {
     this.logger = options.logger.child({ module: "agent", provider: "claude" });
     this.runtimeSettings = options.runtimeSettings;
     this.queryFactory = options.queryFactory;
+    this.terminateProcess = options.terminateProcess ?? terminateWithTreeKill;
     this.resolveBinary = options.resolveBinary ?? (() => resolveClaudeBinary(this.runtimeSettings));
     this.resolveVersion =
       options.resolveVersion ??
-      ((signal) => resolveClaudeCodeVersion(this.runtimeSettings, signal));
+      ((signal, probe) => resolveClaudeCodeVersion(this.runtimeSettings, signal, probe));
+    this.configDir = options.configDir;
     this.rewindSdk = options.rewindSdk ?? realClaudeRewindSdk;
   }
 
@@ -1528,18 +1542,23 @@ export class ClaudeAgentClient implements AgentClient {
     launchContext?: AgentLaunchContext,
     options?: AgentCreateSessionOptions,
   ): Promise<AgentSession> {
+    options?.probe?.signal.throwIfAborted();
     const claudeConfig = this.assertConfig(config);
-    return new ClaudeAgentSession(claudeConfig, {
+    const session = new ClaudeAgentSession(claudeConfig, {
       defaults: this.defaults,
       runtimeSettings: this.runtimeSettings,
       agentId: launchContext?.agentId,
       launchEnv: launchContext?.env,
       persistSession: options?.persistSession,
+      probe: options?.probe,
       logger: this.logger,
       queryFactory: this.queryFactory,
+      terminateProcess: this.terminateProcess,
       resolveBinary: this.resolveBinary,
       rewindSdk: this.rewindSdk,
     });
+    options?.probe?.own(session);
+    return session;
   }
 
   async resumeSession(
@@ -1566,6 +1585,7 @@ export class ClaudeAgentClient implements AgentClient {
       launchEnv: launchContext?.env,
       logger: this.logger,
       queryFactory: this.queryFactory,
+      terminateProcess: this.terminateProcess,
       resolveBinary: this.resolveBinary,
       rewindSdk: this.rewindSdk,
     });
@@ -1584,7 +1604,7 @@ export class ClaudeAgentClient implements AgentClient {
     let claudeCodeVersion: string | undefined;
     try {
       claudeCodeVersion = await runProviderRefreshActivity(context, "version", () =>
-        this.resolveVersion(context?.signal),
+        this.resolveVersion(context?.signal, context?.probe),
       );
     } catch (error) {
       this.logger.warn({ err: error }, "Failed to resolve Claude Code version for model catalog");
@@ -1623,7 +1643,7 @@ export class ClaudeAgentClient implements AgentClient {
   async listImportableSessions(
     options?: ListImportableSessionsOptions,
   ): Promise<ImportableProviderSession[]> {
-    const configDir = claudeConfigDir(this.buildProviderEnv());
+    const configDir = this.configDir ?? claudeConfigDir(this.buildProviderEnv());
     const sessionsRoot = options?.cwd
       ? claudeProjectDirSync(options.cwd, { configDir })
       : path.join(configDir, "projects");
@@ -1661,7 +1681,8 @@ export class ClaudeAgentClient implements AgentClient {
     return availability.available;
   }
 
-  async getDiagnostic(): Promise<{ diagnostic: string }> {
+  async getDiagnostic(probe?: AgentProbeContext): Promise<{ diagnostic: string }> {
+    probe?.signal.throwIfAborted();
     try {
       const launch = await resolveProviderLaunch({
         commandConfig: this.runtimeSettings?.command,
@@ -1669,19 +1690,22 @@ export class ClaudeAgentClient implements AgentClient {
       });
       const availability = await checkProviderLaunchAvailable(launch);
       const auth = availability.available
-        ? await resolveClaudeAuth(launch, availability, this.runtimeSettings)
+        ? await resolveClaudeAuth(launch, availability, this.runtimeSettings, probe)
         : null;
 
       return {
         diagnostic: formatProviderDiagnostic("Claude Code", [
           ...(await buildCommandResolutionDiagnosticRows(launch, {
             knownBinaryNames: ["claude"],
+            probe,
           })),
-          ...(await buildBinaryDiagnosticRows(launch, availability)),
+          ...(await buildBinaryDiagnosticRows(launch, availability, { probe })),
           ...(auth ? [{ label: "Auth", value: auth }] : []),
         ]),
       };
     } catch (error) {
+      probe?.signal.throwIfAborted();
+      if (error instanceof ProviderInitializationCleanupError) throw error;
       return {
         diagnostic: formatProviderDiagnosticError("Claude Code", error),
       };
@@ -1721,6 +1745,7 @@ async function resolveClaudeBinary(runtimeSettings?: ProviderRuntimeSettings): P
 export async function resolveClaudeCodeVersion(
   runtimeSettings?: ProviderRuntimeSettings,
   signal?: AbortSignal,
+  probe?: AgentProbeContext,
 ): Promise<string> {
   const launch = await resolveProviderLaunch({
     commandConfig: runtimeSettings?.command,
@@ -1735,6 +1760,7 @@ export async function resolveClaudeCodeVersion(
     ...createProviderEnvSpec({ runtimeSettings }),
     timeout: 5_000,
     signal,
+    probe,
   });
   const version = parseClaudeCodeVersion(`${stdout}\n${stderr}`);
   if (!version) {
@@ -1747,6 +1773,7 @@ async function resolveClaudeAuth(
   launch: ResolvedProviderLaunch,
   availability: { resolvedPath: string | null },
   runtimeSettings?: ProviderRuntimeSettings,
+  probe?: AgentProbeContext,
 ): Promise<string | null> {
   const run = async (
     executable: string,
@@ -1756,8 +1783,10 @@ async function resolveClaudeAuth(
       return await execCommand(executable, args, {
         ...createProviderEnvSpec({ runtimeSettings }),
         timeout: 5_000,
+        probe,
       });
     } catch (error) {
+      probe?.signal.throwIfAborted();
       const err = toObjectRecord(error);
       const stdout = typeof err?.stdout === "string" ? err.stdout : "";
       const stderr = typeof err?.stderr === "string" ? err.stderr : "";
@@ -1776,6 +1805,7 @@ async function resolveClaudeAuth(
       .join("\n");
     return combined || null;
   } catch {
+    probe?.signal.throwIfAborted();
     return null;
   }
 }
@@ -2051,6 +2081,8 @@ class ClaudeAgentSession implements AgentSession {
   private readonly persistSession?: boolean;
   private readonly logger: Logger;
   private readonly queryFactory?: ClaudeQueryFactory;
+  private readonly probe?: AgentProbeContext;
+  private readonly terminateProcess: ProcessTerminator;
   private readonly resolveBinary: () => Promise<string>;
   private query: Query | null = null;
   private childProcess: ChildProcess | null = null;
@@ -2101,7 +2133,13 @@ class ClaudeAgentSession implements AgentSession {
   private historyPending = false;
   private turnState: TurnState = "idle";
   private nextTurnOrdinal = 1;
-  private cancelCurrentTurn: (() => void) | null = null;
+  private cancelCurrentTurn: (() => Promise<void>) | null = null;
+  private interruptPromise: Promise<void> | null = null;
+  private interruptBoundary: {
+    turnId: string;
+    promise: Promise<void>;
+    resolve: () => void;
+  } | null = null;
   private cachedRuntimeInfo: AgentRuntimeInfo | null = null;
   private lastOptionsModel: string | null = null;
   private lastRuntimeModel: string | null = null;
@@ -2120,6 +2158,10 @@ class ClaudeAgentSession implements AgentSession {
   private pendingFreshSessionId: string | null = null;
   private recentStderr = "";
   private closed = false;
+  private closePromise: Promise<void> | null = null;
+  private closingQuery: Query | null = null;
+  private closingChild: ChildProcess | null = null;
+  private closingPump: Promise<void> | null = null;
 
   constructor(config: ClaudeAgentConfig, options: ClaudeAgentSessionOptions) {
     this.config = config;
@@ -2131,6 +2173,8 @@ class ClaudeAgentSession implements AgentSession {
     this.persistSession = options.persistSession;
     this.logger = options.logger.child({ agentId: this.agentId });
     this.queryFactory = options.queryFactory;
+    this.probe = options.probe;
+    this.terminateProcess = options.terminateProcess ?? terminateWithTreeKill;
     this.resolveBinary = options.resolveBinary;
     this.rewindSdk = options.rewindSdk ?? realClaudeRewindSdk;
     this.contextUsage = new ClaudeContextUsageState(
@@ -2227,6 +2271,7 @@ class ClaudeAgentSession implements AgentSession {
     if (this.closed) {
       throw new Error("Claude session is closed");
     }
+    if (this.interruptPromise) throw new Error("Claude is still stopping the previous turn");
     if (this.activeForegroundTurnId) {
       throw new Error("A foreground turn is already active");
     }
@@ -2236,7 +2281,10 @@ class ClaudeAgentSession implements AgentSession {
       const turnId = this.createTurnId("foreground");
       this.activeForegroundTurnId = turnId;
       this.transitionTurnState("foreground", "rewind command");
-      void this.executeRewindTurn(turnId, slashCommand);
+      const completion = this.executeRewindTurn(turnId, slashCommand);
+      // A rewind is a local operation with no provider abort. Its completion is
+      // the boundary proving it cannot mutate the conversation after cancel.
+      this.cancelCurrentTurn = () => withTimeout(completion, 3_000, "Claude rewind completion");
       return { turnId };
     }
 
@@ -2256,24 +2304,29 @@ class ClaudeAgentSession implements AgentSession {
     this.transitionTurnState("foreground", "foreground turn started");
     this.clearRecentStderr();
 
-    let cancelIssued = false;
-    const requestCancel = () => {
-      if (cancelIssued) {
+    let cancelRequested = false;
+    let dispatched = false;
+    let settleStartup!: () => void;
+    const startup = new Promise<void>((resolve) => {
+      settleStartup = resolve;
+    });
+    const requestCancel = async () => {
+      cancelRequested = true;
+      this.rejectAllPendingPermissions(new Error("Permission request canceled"));
+      if (!dispatched) {
+        // Binary/configuration discovery may still be pending. The guard below
+        // prevents that accepted start from submitting after cancellation.
+        await startup;
+        if (this.activeForegroundTurnId === turnId) {
+          this.finishForegroundTurn({
+            type: "turn_canceled",
+            provider: "claude",
+            reason: "Interrupted",
+          });
+        }
         return;
       }
-      cancelIssued = true;
-      if (this.cancelCurrentTurn === requestCancel) {
-        this.cancelCurrentTurn = null;
-      }
-      this.rejectAllPendingPermissions(new Error("Permission request canceled"));
-      this.finishForegroundTurn({
-        type: "turn_canceled",
-        provider: "claude",
-        reason: "Interrupted",
-      });
-      void this.interruptActiveTurn().catch((error) => {
-        this.logger.warn({ err: error }, "Failed to interrupt during cancel");
-      });
+      await this.interruptActiveTurn();
     };
     this.cancelCurrentTurn = requestCancel;
 
@@ -2281,12 +2334,15 @@ class ClaudeAgentSession implements AgentSession {
 
     try {
       await this.ensureQuery();
+      if (cancelRequested || this.closed || this.activeForegroundTurnId !== turnId)
+        return { turnId };
       if (!this.input) {
         throw new Error("Claude session input stream not initialized");
       }
       this.activeForegroundQuery = this.query;
       this.activeForegroundInput = this.input;
       this.startQueryPump();
+      dispatched = true;
       this.input.push(sdkMessage);
       setTimeout(() => {
         if (this.activeForegroundTurnId === turnId) {
@@ -2294,9 +2350,15 @@ class ClaudeAgentSession implements AgentSession {
         }
       }, 0);
     } catch (error) {
-      this.finishForegroundTurn(
-        this.buildTurnFailedEvent(error instanceof Error ? error.message : "Claude stream failed"),
-      );
+      if (!cancelRequested && this.activeForegroundTurnId === turnId) {
+        this.finishForegroundTurn(
+          this.buildTurnFailedEvent(
+            error instanceof Error ? error.message : "Claude stream failed",
+          ),
+        );
+      }
+    } finally {
+      settleStartup();
     }
 
     return { turnId };
@@ -2367,18 +2429,24 @@ class ClaudeAgentSession implements AgentSession {
     };
   }
 
-  async interrupt(): Promise<void> {
-    if (this.cancelCurrentTurn) {
-      this.cancelCurrentTurn();
-      return;
+  interrupt(): Promise<void> {
+    if (!this.interruptPromise) {
+      const attempt = this.cancelCurrentTurn
+        ? this.cancelCurrentTurn()
+        : this.interruptActiveTurn();
+      this.interruptPromise = attempt;
+      void attempt.then(
+        () => {
+          if (this.interruptPromise === attempt) this.interruptPromise = null;
+          return undefined;
+        },
+        () => {
+          if (this.interruptPromise === attempt) this.interruptPromise = null;
+          return undefined;
+        },
+      );
     }
-
-    if (this.autonomousTurn) {
-      this.flushPendingToolCalls();
-      this.completeAutonomousTurn();
-    }
-
-    await this.interruptActiveTurn();
+    return withTimeout(this.interruptPromise, 3_000, "Claude interrupt completion");
   }
 
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
@@ -2671,7 +2739,18 @@ class ClaudeAgentSession implements AgentSession {
     return this.persistence;
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    if (!this.closePromise) {
+      const attempt = this.closeSession();
+      this.closePromise = attempt;
+      void attempt.catch(() => {
+        if (this.closePromise === attempt) this.closePromise = null;
+      });
+    }
+    return this.closePromise;
+  }
+
+  private async closeSession(): Promise<void> {
     this.logger.trace(
       {
         agentId: this.agentId,
@@ -2686,12 +2765,20 @@ class ClaudeAgentSession implements AgentSession {
       "provider.claude.session_close.start",
     );
     this.closed = true;
+    this.closingQuery ??= this.query;
+    this.closingChild ??= this.childProcess;
+    this.closingPump ??= this.queryPumpPromise;
     this.rejectAllPendingPermissions(new Error("Claude session closed"));
-    this.cancelCurrentTurn?.();
-    // Subscribers and the query pump stay live through teardown below: the
-    // interrupt/return calls can still push final SDK messages through the
-    // pump, and clearing subscribers before that drains would silently
-    // discard them. Only clear once the pump has settled.
+    this.input?.end();
+    await this.stopClosingRuntime();
+    if (this.activeForegroundTurnId) {
+      this.finishForegroundTurn({
+        type: "turn_canceled",
+        provider: "claude",
+        reason: "Session closed",
+      });
+    }
+    this.failRunningRuntimeTasks();
     this.activeForegroundTurnId = null;
     this.activeForegroundQuery = null;
     this.activeForegroundInput = null;
@@ -2700,32 +2787,12 @@ class ClaudeAgentSession implements AgentSession {
     this.turnState = "idle";
     this.sidechainTracker.clear();
     this.taskProtocolSource.reset();
-    this.input?.end();
-    this.query?.close?.();
-    await this.awaitWithTimeout(this.query?.interrupt?.(), "close query interrupt");
-    await this.awaitWithTimeout(this.query?.return?.(), "close query return");
     this.query = null;
     this.input = null;
-    // Let the pump observe the teardown and finish delivering whatever it
-    // already had in flight before we stop notifying subscribers.
-    await this.awaitWithTimeout(this.queryPumpPromise ?? undefined, "close query pump drain");
+    this.closingQuery = null;
+    this.closingChild = null;
+    this.closingPump = null;
     this.subscribers.clear();
-    // Terminate the entire process tree (claude + MCP children) to prevent
-    // orphan accumulation. The SDK's internal cleanup may only kill the
-    // direct child process.
-    if (this.childProcess) {
-      const result = await terminateWithTreeKill(this.childProcess, {
-        gracefulTimeoutMs: 2_000,
-        forceTimeoutMs: 2_000,
-      });
-      if (result === "kill-timeout") {
-        this.logger.warn(
-          { pid: this.childProcess.pid, agentId: this.agentId },
-          "Claude process tree did not report exit after SIGKILL",
-        );
-      }
-      this.childProcess = null;
-    }
     if (this.persistSession === false && this.claudeSessionId) {
       // Claude Code currently ignores --no-session-persistence outside --print mode
       // (see `claude --help`), so the SDK's persistSession=false is silently dropped
@@ -2754,9 +2821,43 @@ class ClaudeAgentSession implements AgentSession {
     );
   }
 
+  private async stopClosingRuntime(): Promise<void> {
+    // Do not call SDK close/return while its stdout reader is live: the SDK
+    // marks its consumer queue done before the process has finished writing.
+    // Interrupt is advisory; physical exit plus reader drain certify close.
+    try {
+      await this.awaitWithTimeout(this.closingQuery?.interrupt?.(), "close query interrupt");
+      if (!this.closingChild) {
+        this.closingQuery?.close?.();
+        await this.awaitWithTimeout(this.closingQuery?.return?.(), "close query return");
+      }
+    } catch (error) {
+      this.logger.warn({ err: error }, "Claude graceful close failed; terminating runtime");
+    }
+    if (this.childProcess) {
+      const result = await this.terminateProcess(this.childProcess, {
+        gracefulTimeoutMs: 2_000,
+        forceTimeoutMs: 2_000,
+      });
+      if (result === "kill-timeout") {
+        throw new Error("Claude process tree did not report exit after SIGKILL");
+      }
+      this.childProcess = null;
+    }
+    // Keep the turn identity, tool trackers and subscribers alive while final
+    // SDK messages are drained. A timeout or rejected pump is not certification.
+    if (this.closingPump) {
+      await withTimeout(this.closingPump, 3_000, "Claude close query pump drain");
+    }
+    this.closingQuery?.close?.();
+    if (this.closingQuery?.return)
+      await withTimeout(this.closingQuery.return(), 3_000, "Claude query cleanup");
+  }
+
   async listCommands(): Promise<AgentSlashCommand[]> {
     const q = await this.ensureQuery();
-    const commands = await q.supportedCommands();
+    this.probe?.signal.throwIfAborted();
+    const commands = await raceProviderRefreshAbort(this.probe?.signal, q.supportedCommands());
     const commandMap = new Map<string, AgentSlashCommand>();
     for (const cmd of commands) {
       if (!commandMap.has(cmd.name)) {
@@ -3119,6 +3220,7 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   private async ensureQuery(): Promise<Query> {
+    if (this.closed) throw new Error("Claude session is closed");
     if (this.query && !this.queryRestartNeeded) {
       return this.query;
     }
@@ -3163,6 +3265,7 @@ class ClaudeAgentSession implements AgentSession {
 
     const input = createAsyncMessageInput<SDKUserMessage>();
     const options = await this.buildOptions();
+    if (this.closed) throw new Error("Claude session is closed");
     this.logger.debug({ options: summarizeClaudeOptionsForLog(options) }, "claude query");
     this.input = input;
     this.query = claudeQuery(
@@ -3281,7 +3384,8 @@ class ClaudeAgentSession implements AgentSession {
     const sdkEnv = this.buildSdkEnv();
     assertClaudeModeCanRun(this.currentMode, sdkEnv);
 
-    const claudeBinary = await this.resolveBinary();
+    this.probe?.signal.throwIfAborted();
+    const claudeBinary = await raceProviderRefreshAbort(this.probe?.signal, this.resolveBinary());
     this.logger.debug(
       {
         claudeBinary,
@@ -3480,8 +3584,20 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   private isAbortError(message: SDKMessage): boolean {
-    const errors = "errors" in message && Array.isArray(message.errors) ? message.errors : [];
-    return errors.some((e: string) => /\baborted\b/i.test(e));
+    if (message.type !== "result") return false;
+    if (message.terminal_reason) {
+      return (
+        message.terminal_reason === "aborted_streaming" ||
+        message.terminal_reason === "aborted_tools"
+      );
+    }
+    // COMPAT(claudeTerminalReason): added in v0.8.0, remove after 2027-03-19 once
+    // supported CLIs all emit the structured terminal reason.
+    return (
+      "errors" in message &&
+      message.errors.length > 0 &&
+      message.errors.every((error) => error === "Request was aborted.")
+    );
   }
 
   private buildTurnFailedEvent(
@@ -3698,7 +3814,8 @@ class ClaudeAgentSession implements AgentSession {
     if (this.closed || this.childProcess !== child) {
       return;
     }
-    this.childProcess = null;
+    // Retain the exited child while its SDK reader can still be draining stdout.
+    // Close needs that ownership to avoid ending the consumer queue prematurely.
     this.logger.warn(
       { agentId: this.agentId, pid: child.pid, code, signal },
       "Claude runtime exited unexpectedly",
@@ -3734,7 +3851,8 @@ class ClaudeAgentSession implements AgentSession {
       return;
     }
 
-    const pump = this.runQueryPump().catch((error) => {
+    const pump = this.runQueryPump();
+    void pump.catch((error) => {
       this.logger.trace(
         {
           agentId: this.agentId,
@@ -3748,11 +3866,16 @@ class ClaudeAgentSession implements AgentSession {
     });
 
     this.queryPumpPromise = pump;
-    void pump.finally(() => {
-      if (this.queryPumpPromise === pump) {
-        this.queryPumpPromise = null;
-      }
-    });
+    void pump.then(
+      () => {
+        if (this.queryPumpPromise === pump) this.queryPumpPromise = null;
+        return undefined;
+      },
+      () => {
+        if (this.queryPumpPromise === pump) this.queryPumpPromise = null;
+        return undefined;
+      },
+    );
   }
 
   private async runQueryPump(): Promise<void> {
@@ -3808,7 +3931,7 @@ class ClaudeAgentSession implements AgentSession {
       return false;
     };
     try {
-      while (!this.closed && this.query === activeQuery) {
+      while (this.query === activeQuery) {
         try {
           if (await drainActiveQuery()) {
             return;
@@ -3830,7 +3953,11 @@ class ClaudeAgentSession implements AgentSession {
             );
             continue;
           }
-          if (!this.closed && this.query === activeQuery) {
+          // ProcessTransport reports typed process-exit errors at EOF. Match
+          // the owned child's exit; decoder/transport errors still fail drain.
+          if (this.closed && this.isOwnedProcessExit(error)) return;
+          if (this.closed) throw error;
+          if (this.query === activeQuery) {
             await this.awaitRecentStderrAfterProcessExit(error);
             this.failActiveTurns(error instanceof Error ? error.message : "Claude stream failed");
           }
@@ -3845,6 +3972,22 @@ class ClaudeAgentSession implements AgentSession {
     }
   }
 
+  private isOwnedProcessExit(error: unknown): boolean {
+    return (
+      error instanceof Error &&
+      "errorClass" in error &&
+      ((error.errorClass === "process_killed_by_signal" &&
+        "signal" in error &&
+        typeof error.signal === "string" &&
+        this.closingChild?.signalCode === error.signal) ||
+        (error.errorClass === "process_exited_nonzero" &&
+          "exitCode" in error &&
+          typeof error.exitCode === "number" &&
+          error.exitCode !== 0 &&
+          this.closingChild?.exitCode === error.exitCode))
+    );
+  }
+
   private shouldSuppressStaleResult(message: SDKMessage): boolean {
     // Suppress stale results from interrupted requests. The cancel path already
     // emitted the terminal event; this result is leftover from the killed API
@@ -3856,7 +3999,16 @@ class ClaudeAgentSession implements AgentSession {
         return true;
       }
     }
-    if (message.type === "result" && message.subtype !== "success" && this.isAbortError(message)) {
+    // COMPAT(claudeTerminalReason): added in v0.8.0, remove after 2027-03-19.
+    if (
+      message.type === "result" &&
+      !message.terminal_reason &&
+      !this.interruptBoundary &&
+      !this.closed &&
+      this.isAbortError(message)
+    ) {
+      // Legacy CLIs can repeat an uncorrelated abort after a successor starts.
+      // Only an owned Stop/close may consume that legacy result as its terminal.
       this.logger.debug("Suppressing abort result by content");
       return true;
     }
@@ -3882,10 +4034,33 @@ class ClaudeAgentSession implements AgentSession {
     if (this.activeForegroundTurnId || this.pendingInterruptAbort) {
       return false;
     }
+    // A killed background task may report its stop after the foreground result.
+    // That lifecycle receipt cannot begin new autonomous execution.
+    if (
+      message.type === "system" &&
+      message.subtype === "task_notification" &&
+      message.status === "stopped"
+    )
+      return false;
     return this.isAssistantishMessage(message);
   }
 
   private async routeSdkMessageFromPump(message: SDKMessage): Promise<void> {
+    const interruption =
+      message.type === "result" && !readClaudeParentToolUseId(message)
+        ? this.interruptBoundary
+        : null;
+    if (interruption) this.pendingInterruptAbort = false;
+    // A root result proves cessation regardless of whether Stop won the race.
+    // Translate its actual outcome and final text/usage before releasing Stop.
+    await this.dispatchSdkMessageFromPump(message);
+    if (interruption && this.interruptBoundary === interruption) {
+      this.interruptBoundary = null;
+      interruption.resolve();
+    }
+  }
+
+  private async dispatchSdkMessageFromPump(message: SDKMessage): Promise<void> {
     if (this.shouldSuppressStaleResult(message)) {
       return;
     }
@@ -4047,16 +4222,22 @@ class ClaudeAgentSession implements AgentSession {
       );
       return;
     }
-    this.pendingInterruptAbort = true;
-    await this.discardQueuedSteers(queryToInterrupt);
-    try {
-      await this.awaitWithTimeout(
-        queryToInterrupt.interrupt(),
-        "interruptActiveTurn query.interrupt()",
-      );
-    } catch (error) {
-      this.logger.warn({ err: error }, "Failed to interrupt active turn");
+    const turnId = this.activeForegroundTurnId ?? this.autonomousTurn?.id;
+    let boundary = this.interruptBoundary;
+    if (turnId && boundary?.turnId !== turnId) {
+      let resolve!: () => void;
+      const promise = new Promise<void>((yes) => {
+        resolve = yes;
+      });
+      boundary = { turnId, promise, resolve };
+      this.interruptBoundary = boundary;
     }
+    this.pendingInterruptAbort = Boolean(boundary);
+    // An SDK interrupt receipt precedes the result. Preserve attribution until
+    // that result arrives; an acknowledgement or timeout alone proves no stop.
+    await this.discardQueuedSteers(queryToInterrupt);
+    await queryToInterrupt.interrupt();
+    if (boundary) await boundary.promise;
   }
 
   /**
@@ -4491,6 +4672,12 @@ class ClaudeAgentSession implements AgentSession {
     events: AgentStreamEvent[],
   ): void {
     const usage = this.convertUsage(message, message.modelUsage);
+    if (this.isAbortError(message)) {
+      events.push(...this.sidechainTracker.finishAll("canceled"));
+      if (usage) events.push({ type: "usage_updated", provider: "claude", usage });
+      events.push({ type: "turn_canceled", provider: "claude", reason: "Interrupted" });
+      return;
+    }
     if (message.subtype === "success") {
       events.push(...this.sidechainTracker.finishAll("completed"));
       // Built-in slash commands (e.g. /voice, /usage, "Unknown command: …")

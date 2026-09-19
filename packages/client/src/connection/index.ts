@@ -134,6 +134,7 @@ export const DEFAULT_CLIENT_CAPABILITIES = {
   [CLIENT_CAPS.terminalReflowableSnapshot]: true,
   [CLIENT_CAPS.providerSubagents]: true,
   [CLIENT_CAPS.projectedSubagentTimeline]: true,
+  [CLIENT_CAPS.projectedProviderSubagents]: true,
   [CLIENT_CAPS.projectUpdates]: true,
   [CLIENT_CAPS.compactProviderSnapshots]: true,
   [CLIENT_CAPS.providerSnapshotReferences]: true,
@@ -149,4 +150,7 @@ export type TimelineSubscription = (() => void) & {
   readonly ready: Promise<void>;
   readonly subscriptionId: string | null;
   release(): Promise<void>;
+};
+export type ProviderSubagentTimelineSubscription = TimelineSubscription & {
+  refresh(): Promise<void>;
 };

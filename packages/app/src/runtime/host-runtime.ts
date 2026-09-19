@@ -1,3 +1,7 @@
+import {
+  bindProviderSubagentHost,
+  clearProviderSubagentHost,
+} from "@/subagents/provider-transcripts";
 import { useSyncExternalStore, useMemo } from "react";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import equal from "fast-deep-equal/es6";
@@ -2460,9 +2464,11 @@ export class HostRuntimeStore {
     if (serverInfo) {
       sessionStore.updateSessionServerInfo(serverId, toDaemonServerInfo(serverInfo));
     }
+    bindProviderSubagentHost(serverId, snapshot.client, snapshot.clientGeneration);
   }
 
   private clearHostReplica(serverId: string): void {
+    clearProviderSubagentHost(serverId);
     useSessionStore.getState().clearSession(serverId);
     useWorkspaceSetupStore.getState().clearServer(serverId);
   }

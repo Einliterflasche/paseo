@@ -237,7 +237,7 @@ export class CreationService {
     const receipt = z
       .object({
         fingerprint: z.string(),
-        state: z.enum(["pending", "completed"]),
+        state: z.enum(["pending", "completed", "not_dispatched"]),
         agentId: z.string(),
       })
       .parse(JSON.parse(text));
@@ -247,6 +247,10 @@ export class CreationService {
     if (!agent && receipt.state === "completed")
       throw new Error("Previously created agent no longer exists");
     const record = initialRecord({ ...input, agentId: receipt.agentId }, fingerprint);
+    if (!agent && receipt.state === "not_dispatched") {
+      await this.write(identityFor(input.kind, input.key), record);
+      return record;
+    }
     record.snapshot = {
       ...record.snapshot,
       phase: agent ? "completed" : "failed",

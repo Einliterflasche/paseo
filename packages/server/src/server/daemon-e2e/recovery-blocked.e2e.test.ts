@@ -1,6 +1,6 @@
 import { fork, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, readFile, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, mkdir, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -119,6 +119,35 @@ test("a crash after completed restoration serves the blocked generation without 
     await Promise.all(preservedNames.map((name) => readFile(join(generationDir, name), "utf8"))),
   ).toEqual(filesBefore);
   expect(await readFile(join(home, "restart-checkpoints", "ready.json"), "utf8")).toBe(readyBefore);
+  const blockedPid = blocked.child.pid;
+  await expect(blocked.client.acknowledgeCrash("wrong-generation", true)).rejects.toThrow();
+  const acknowledged = await blocked.client.acknowledgeCrash(checkpoint.generationId!, true);
+  expect(acknowledged.generationId).not.toBe(checkpoint.generationId);
+  expect(blocked.child.pid).toBe(blockedPid);
+  expect(blocked.child.exitCode).toBeNull();
+  expect(await readFile(join(home, "provider-dispatches.jsonl"), "utf8")).toBe(dispatchesBefore);
+  expect((await blocked.client.scheduleInspect({ id: scheduleId })).schedule?.runs[0]?.status).toBe(
+    "failed",
+  );
+  expect(
+    await Promise.all(preservedNames.map((name) => readFile(join(generationDir, name), "utf8"))),
+  ).toEqual(filesBefore);
+  const auditNames = (await readdir(generationDir)).filter((name) =>
+    name.startsWith("operator-crash-acknowledgment-"),
+  );
+  expect(auditNames).toHaveLength(1);
+  expect(JSON.parse(await readFile(join(generationDir, auditNames[0]!), "utf8"))).toMatchObject({
+    generationId: checkpoint.generationId,
+    daemonPid: blockedPid,
+    requester: {
+      principalId: "owner",
+      clientId: expect.any(String),
+      sessionId: expect.any(String),
+    },
+  });
+  await expect(
+    blocked.client.createAgent({ provider: "codex", cwd: home }),
+  ).resolves.toHaveProperty("id");
 }, 30_000);
 
 test("a corrupt ready pointer leaves a reachable paused daemon and preserves the evidence", async () => {

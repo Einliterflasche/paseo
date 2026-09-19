@@ -1,17 +1,21 @@
 import { legacyUsageIcon } from "./legacy-usage-icons.js";
 import { subscribeTimeline, type TimelineMessage } from "./timeline-subscription/index.js";
 import { ProviderSnapshotUpdates } from "./provider-snapshots/index.js";
+import { TimelineRequestError } from "./timeline-request-error.js";
+export { TimelineRequestError, type TimelineRequestErrorCode } from "./timeline-request-error.js";
+import type { ProviderSubagentTarget } from "@getpaseo/protocol/messages";
 import {
   ConnectionSubscriptions,
   type OwnedSubscription,
   DEFAULT_CLIENT_CAPABILITIES,
   type TimelineSubscription,
+  type ProviderSubagentTimelineSubscription,
 } from "./connection/index.js";
 import { CreationClient } from "./creation/index.js";
 import type { CreationSnapshot } from "@getpaseo/protocol/messages";
 import type { z } from "zod";
 import type { SessionEventSubscription } from "@getpaseo/protocol/messages";
-import type { ClientCapability } from "@getpaseo/protocol/client-capabilities";
+import { CLIENT_CAPS, type ClientCapability } from "@getpaseo/protocol/client-capabilities";
 import type { AgentAttentionNotificationPayload } from "@getpaseo/protocol/agent-attention-notification";
 import {
   AgentCreateFailedStatusPayloadSchema,
@@ -693,6 +697,7 @@ export type ProviderSubagentTimelinePayload = Extract<
   { type: "agent.provider_subagents.timeline.get.response" }
 >["payload"];
 export interface FetchProviderSubagentTimelineOptions {
+  projection?: "projected" | "canonical";
   direction?: ProviderSubagentTimelinePayload["direction"];
   cursor?: FetchAgentTimelineCursor;
   limit?: number;
@@ -3261,7 +3266,7 @@ export class DaemonClient {
     });
 
     if (payload.error) {
-      throw new Error(payload.error);
+      throw new TimelineRequestError(payload.error, payload.errorCode, payload.epoch);
     }
 
     return payload;
@@ -3364,6 +3369,7 @@ export class DaemonClient {
       parentAgentId,
       subagentId,
       requestId,
+      ...(options.projection ? { projection: options.projection } : {}),
       ...(options.direction ? { direction: options.direction } : {}),
       ...(options.cursor ? { cursor: options.cursor } : {}),
       ...(typeof options.limit === "number" ? { limit: options.limit } : {}),
@@ -3380,7 +3386,7 @@ export class DaemonClient {
           : null,
     });
     if (payload.error) {
-      throw new Error(payload.error);
+      throw new TimelineRequestError(payload.error, payload.errorCode, payload.epoch);
     }
     return payload;
   }
@@ -3403,6 +3409,75 @@ export class DaemonClient {
     return subscribeTimeline(agentId, this.observeTimeline([agentId]), handler, (error) =>
       this.logger.error({ err: error }, "Timeline observation failed"),
     );
+  }
+
+  subscribeProviderSubagentTimeline(
+    target: ProviderSubagentTarget,
+    handler: (
+      message: Extract<SessionOutboundMessage, { type: "agent.provider_subagents.update" }>,
+    ) => void,
+    onReady?: () => void,
+    onError?: (error: unknown) => void,
+  ): ProviderSubagentTimelineSubscription {
+    let active = true;
+    let refreshing: Promise<void> | null = null;
+    let observation: OwnedSubscription<
+      CorrelatedResponsePayload<"agent.timeline.set_subscription.response">
+    >;
+    const start = () => {
+      const owner = this.observe("agent.timeline.set_subscription.response", {
+        type: "agent.timeline.set_subscription.request",
+        agentIds: [],
+        providerSubagents: [target],
+      });
+      observation = owner;
+      owner.subscribe({
+        snapshot: () => onReady?.(),
+        update: (message) => {
+          if (
+            message.type === "agent.provider_subagents.update" &&
+            message.payload.kind === "timeline" &&
+            message.payload.parentAgentId === target.parentAgentId &&
+            message.payload.subagentId === target.subagentId
+          )
+            handler(message);
+        },
+        error: onError,
+      });
+      return owner.ready.then(() => undefined);
+    };
+    const ready = start();
+    void ready.catch(() => {});
+    const release = async () => {
+      if (!active) return;
+      active = false;
+      await observation.release();
+    };
+    const stop = Object.assign(
+      () => {
+        void release().catch((error) =>
+          this.logger.error({ err: error }, "Child observation release failed"),
+        );
+      },
+      {
+        ready,
+        release,
+        refresh: () => {
+          if (!active) return Promise.resolve();
+          if (refreshing) return refreshing;
+          const pending = (async () => {
+            await observation.release();
+            if (active) await start();
+          })().finally(() => {
+            if (refreshing === pending) refreshing = null;
+          });
+          refreshing = pending;
+          return pending;
+        },
+      },
+    );
+    Object.defineProperty(stop, "subscriptionId", { get: () => observation.subscriptionId });
+    return stop as ProviderSubagentTimelineSubscription;
   }
 
   async buildAgentForkContext(
@@ -3519,38 +3594,68 @@ export class DaemonClient {
    * connection-state and server_info events, so it cannot spin.
    */
   private waitToRetrySendAgentMessage(): Promise<void> {
-    const isReady = () => {
-      if (!this.isConnected) {
-        return false;
-      }
-      const state = this.lastServerInfoMessage?.restartRecoveryState;
-      return state === undefined || state === "running";
-    };
     if (this.connectionState.status === "disposed") {
       return Promise.reject(new Error("Daemon client is disposed"));
     }
-    if (isReady()) {
-      return Promise.resolve();
-    }
     return new Promise((resolve, reject) => {
+      let settled = false;
+      let attached = false;
+      let freshStatus = false;
       let unsubscribeStatus = () => {};
       let unsubscribeConnection = () => {};
+      const owner = this.observeEvents(["status.server_info"]);
       const cleanup = () => {
         unsubscribeStatus();
         unsubscribeConnection();
+        void owner
+          .release()
+          .catch((error) =>
+            this.logger.error({ err: error }, "Recovery status observation release failed"),
+          );
       };
-      unsubscribeStatus = this.on("status", () => {
-        if (isReady()) {
-          cleanup();
-          resolve();
-        }
+      const finish = (error?: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (error) reject(error);
+        else resolve();
+      };
+      const check = () => {
+        if (!attached || !this.isConnected) return;
+        const info = this.lastServerInfoMessage;
+        // Owned hosts send a current server_info after the subscription ACK.
+        // Waiting for that event closes both stale-running and stale-restoring races.
+        const owned =
+          info?.features?.ownedSubscriptions === true &&
+          this.config.capabilities?.[CLIENT_CAPS.ownedSubscriptions] !== false;
+        const reportsRecovery =
+          info?.restartRecoveryState !== undefined || info?.features?.restartRecovery === true;
+        if (owned && reportsRecovery && !freshStatus) return;
+        if (info?.restartRecoveryState === undefined || info.restartRecoveryState === "running")
+          finish();
+      };
+      unsubscribeStatus = owner.subscribe({
+        snapshot: () => {
+          attached = true;
+          freshStatus = false;
+          check();
+        },
+        update: (message) => {
+          if (message.type !== "status" || !parseServerInfoStatusPayload(message.payload)) return;
+          freshStatus = true;
+          check();
+        },
+        error: finish,
       });
       unsubscribeConnection = this.subscribeConnectionStatus((state) => {
-        if (state.status === "disposed") {
-          cleanup();
-          reject(new Error("Daemon client is disposed"));
-        }
+        if (state.status === "disposed") finish(new Error("Daemon client is disposed"));
+        else if (state.status !== "connected") {
+          attached = false;
+          freshStatus = false;
+        } else check();
       });
+      // A legacy snapshot or an already-disposed source can settle synchronously.
+      if (settled) cleanup();
     });
   }
 
@@ -3815,6 +3920,53 @@ export class DaemonClient {
     requestId?: string,
   ): Promise<RestartRequestedStatusPayload> {
     return this.restartServer(reason, requestId, { prepareOnly: true });
+  }
+
+  async retryRecovery(reason?: string): Promise<RestartRequestedStatusPayload> {
+    // COMPAT(restartRecoveryRetry): added in fork v0.8.0; remove after 2027-03-19.
+    if (this.lastServerInfoMessage?.features?.restartRecoveryRetry !== true) {
+      throw new Error("Update the host to retry a paused recovery attempt.");
+    }
+    const requestId = this.createRequestId();
+    return this.sendRequest({
+      requestId,
+      message: SessionInboundMessageSchema.parse({
+        type: "restart_server_request",
+        requestId,
+        reason,
+        retryRecovery: true,
+      }),
+      options: { skipQueue: true },
+      select: (message) => {
+        if (message.type !== "status") return null;
+        const result = RestartRequestedStatusPayloadSchema.safeParse(message.payload);
+        return result.success && result.data.requestId === requestId ? result.data : null;
+      },
+    });
+  }
+
+  async acknowledgeCrash(
+    generationId: string,
+    orphanExecutionReconciled: true,
+  ): Promise<RestartRequestedStatusPayload> {
+    // COMPAT(restartCrashAcknowledgment): added in fork v0.8.0; remove gate after 2027-03-19.
+    if (this.lastServerInfoMessage?.features?.restartCrashAcknowledgment !== true)
+      throw new Error("Update the host to acknowledge an unexpected crash.");
+    const requestId = this.createRequestId();
+    return this.sendRequest({
+      requestId,
+      message: SessionInboundMessageSchema.parse({
+        type: "restart_server_request",
+        requestId,
+        acknowledgeCrash: { generationId, orphanExecutionReconciled },
+      }),
+      options: { skipQueue: true },
+      select: (message) => {
+        if (message.type !== "status") return null;
+        const result = RestartRequestedStatusPayloadSchema.safeParse(message.payload);
+        return result.success && result.data.requestId === requestId ? result.data : null;
+      },
+    });
   }
 
   async shutdownServer(options?: ShutdownServerOptions): Promise<ShutdownRequestedStatusPayload> {

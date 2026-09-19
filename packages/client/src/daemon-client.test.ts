@@ -5,6 +5,7 @@ import { z } from "zod";
 import {
   DaemonClient,
   supportsUsageReports,
+  TimelineRequestError,
   type DaemonClientTrace,
   type CreateAgentRequestOptions,
   type DaemonTransport,
@@ -1040,6 +1041,7 @@ test("advertises client capabilities in hello", async () => {
       project_updates: true,
       provider_subagents: true,
       projected_subagent_timeline: true,
+      projected_provider_subagents: true,
       reasoning_merge_enum: true,
       terminal_reflowable_snapshot: true,
       timeline_notifications: true,
@@ -1581,6 +1583,75 @@ test("preserves legacy fetchAgent id overload", async () => {
 
   await expect(responsePromise).rejects.toThrow("legacy fetch sentinel");
 });
+
+test.each(["TIMELINE_BUSY", "TIMELINE_ITEM_TOO_LARGE"] as const)(
+  "preserves typed %s errors for managed and provider-child pages",
+  async (errorCode) => {
+    const mock = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "timeline-errors",
+      reconnect: { enabled: false },
+      transportFactory: () => mock.transport,
+    });
+    clients.push(client);
+    const connected = client.connect();
+    mock.triggerOpen({ features: { ownedSubscriptions: true, projectedSubagentTimeline: true } });
+    await connected;
+    for (const child of [false, true]) {
+      const requestId = child ? "child-error" : "managed-error";
+      const response = child
+        ? client.fetchProviderSubagentTimeline("parent", "child", {
+            requestId,
+            projection: "projected",
+          })
+        : client.fetchAgentTimeline("parent", { requestId, projection: "projected" });
+      const error = response.catch((failure: unknown) => failure);
+      const common = {
+        requestId,
+        direction: "tail",
+        projection: "projected",
+        epoch: "epoch",
+        reset: false,
+        staleCursor: false,
+        gap: false,
+        window: { minSeq: 0, maxSeq: 0, nextSeq: 1 },
+        startCursor: null,
+        endCursor: null,
+        hasOlder: false,
+        hasNewer: false,
+        entries: [],
+        error: "timeline request refused",
+        errorCode,
+      };
+      mock.triggerMessage(
+        wrapSessionMessage(
+          child
+            ? {
+                type: "agent.provider_subagents.timeline.get.response",
+                payload: {
+                  ...common,
+                  parentAgentId: "parent",
+                  subagentId: "child",
+                  provider: "codex",
+                  rows: [],
+                },
+              }
+            : {
+                type: "fetch_agent_timeline_response",
+                payload: { ...common, agentId: "parent", agent: null },
+              },
+        ),
+      );
+      expect(await error).toBeInstanceOf(TimelineRequestError);
+      expect(await error).toMatchObject({
+        code: errorCode,
+        epoch: "epoch",
+        message: "timeline request refused",
+      });
+    }
+  },
+);
 
 test("honors explicit fetchAgentTimeline timeout below the session RPC default", async () => {
   useHeartbeatClock();
@@ -3871,7 +3942,7 @@ test("sendAgentMessage retries with the same client message ID after a lost ackn
     clients.push(client);
 
     const connectPromise = client.connect();
-    first.triggerOpen();
+    first.triggerOpen({ features: {} });
     await connectPromise;
 
     const options = {
@@ -3897,7 +3968,7 @@ test("sendAgentMessage retries with the same client message ID after a lost ackn
 
     await vi.advanceTimersByTimeAsync(10);
     expect(client.getConnectionState().status).toBe("connecting");
-    second.triggerOpen();
+    second.triggerOpen({ features: {} });
     expect(client.getConnectionState().status).toBe("connected");
 
     await flush();
@@ -3943,7 +4014,7 @@ test("sendAgentMessage does not retry while restart recovery is restoring, and r
   clients.push(client);
 
   const connectPromise = client.connect();
-  mock.triggerOpen();
+  mock.triggerOpen({ features: {} });
   await connectPromise;
 
   mock.triggerMessage(
@@ -4096,7 +4167,7 @@ test("sendAgentMessage stops retrying once the client is explicitly disposed", a
   clients.push(client);
 
   const connectPromise = client.connect();
-  mock.triggerOpen();
+  mock.triggerOpen({ features: {} });
   await connectPromise;
 
   mock.triggerMessage(
@@ -7708,4 +7779,225 @@ test("rejects usage requests when the host has neither capability", async () => 
   await connected;
   await expect(client.listUsageReports()).rejects.toThrow("Update the host to see usage.");
   expect(mock.sent).toEqual([]);
+});
+
+test.each([
+  ["running", "paused"],
+  ["restoring", "running"],
+] as const)(
+  "plain SDK retries using fresh owned status instead of stale %s",
+  async (cached, fresh) => {
+    const mock = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "owned-retry",
+      logger: createMockLogger(),
+      reconnect: { enabled: false },
+      transportFactory: () => mock.transport,
+    });
+    clients.push(client);
+    const connecting = client.connect();
+    mock.triggerOpen();
+    await connecting;
+    const status = (state: string, subscriptionId?: string) =>
+      mock.triggerMessage(
+        wrapSessionMessage({
+          type: "status",
+          payload: {
+            status: "server_info",
+            serverId: "owned-host",
+            hostname: null,
+            version: null,
+            features: { ownedSubscriptions: true },
+            restartRecoveryState: state,
+            ...(subscriptionId ? { subscriptionId } : {}),
+          },
+        }),
+      );
+    status(cached);
+    const sending = client.sendAgentMessage("agent", "hello", { messageId: "stable-input" });
+    await flush();
+    const initial = parseSentFrame(mock.sent[0]);
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: initial.requestId,
+          requestType: "send_agent_message_request",
+          code: "restart_in_progress",
+          error: "restart",
+        },
+      }),
+    );
+    await flush();
+    const demand = parseSentFrame(mock.sent[1]);
+    expect(demand).toMatchObject({
+      type: "session.events.set_subscription.request",
+      events: ["status.server_info"],
+    });
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "session.events.set_subscription.response",
+        payload: { requestId: demand.requestId, subscriptionId: "recovery-owner" },
+      }),
+    );
+    await flush();
+    expect(mock.sent).toHaveLength(2);
+    status(fresh, "recovery-owner");
+    await flush();
+    if (fresh === "paused") {
+      expect(mock.sent).toHaveLength(2);
+      status("running", "recovery-owner");
+      await flush();
+    }
+    const frames = mock.sent.map(parseSentFrame);
+    const release = frames.find((frame) => frame.type === "subscription.release.request")!;
+    expect(release.subscriptionId).toBe("recovery-owner");
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "subscription.release.response",
+        payload: { requestId: release.requestId, subscriptionId: release.subscriptionId },
+      }),
+    );
+    const retry = frames.findLast((frame) => frame.type === "send_agent_message_request")!;
+    expect(retry).toMatchObject({ agentId: "agent", text: "hello", messageId: "stable-input" });
+    expect(retry.requestId).not.toBe(initial.requestId);
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "send_agent_message_response",
+        payload: {
+          requestId: retry.requestId,
+          agentId: "agent",
+          accepted: true,
+          error: null,
+        },
+      }),
+    );
+    await expect(sending).resolves.toBeUndefined();
+    await flush();
+    expect(
+      mock.sent
+        .map(parseSentFrame)
+        .filter((frame) => frame.type === "subscription.release.request"),
+    ).toHaveLength(1);
+  },
+);
+
+test("closing a plain SDK while it owns recovery status releases the pending retry", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "owned-retry-close",
+    logger: createMockLogger(),
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  mock.triggerOpen({ features: { ownedSubscriptions: true, restartRecovery: true } });
+  await connecting;
+  const sending = client.sendAgentMessage("agent", "hello");
+  const rejected = expect(sending).rejects.toThrow(/disposed|closed/);
+  await flush();
+  const initial = parseSentFrame(mock.sent[0]);
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "rpc_error",
+      payload: {
+        requestId: initial.requestId,
+        requestType: "send_agent_message_request",
+        code: "restart_in_progress",
+        error: "restart",
+      },
+    }),
+  );
+  await flush();
+  const demand = parseSentFrame(mock.sent[1]);
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "session.events.set_subscription.response",
+      payload: {
+        requestId: demand.requestId,
+        subscriptionId: "recovery-close-owner",
+      },
+    }),
+  );
+  await flush();
+  await client.close();
+  await rejected;
+  expect(
+    mock.sent.map(parseSentFrame).filter((frame) => frame.type === "send_agent_message_request"),
+  ).toHaveLength(1);
+});
+
+test("owned hosts without recovery status retry when their temporary observation is ready", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "owned-no-recovery",
+    logger: createMockLogger(),
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  mock.triggerOpen();
+  await connecting;
+  const sending = client.sendAgentMessage("agent", "hello", { messageId: "no-recovery-input" });
+  await flush();
+  const initial = parseSentFrame(mock.sent[0]);
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "rpc_error",
+      payload: {
+        requestId: initial.requestId,
+        requestType: "send_agent_message_request",
+        code: "restart_in_progress",
+        error: "restart",
+      },
+    }),
+  );
+  await flush();
+  const demand = parseSentFrame(mock.sent[1]);
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "session.events.set_subscription.response",
+      payload: {
+        requestId: demand.requestId,
+        subscriptionId: "no-recovery-owner",
+      },
+    }),
+  );
+  await flush();
+  await vi.waitFor(() => {
+    const frames = mock.sent.map(parseSentFrame);
+    expect(frames.some((frame) => frame.type === "subscription.release.request")).toBe(true);
+    expect(frames.filter((frame) => frame.type === "send_agent_message_request")).toHaveLength(2);
+  });
+  const frames = mock.sent.map(parseSentFrame);
+  const release = frames.find((frame) => frame.type === "subscription.release.request")!;
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "subscription.release.response",
+      payload: {
+        requestId: release.requestId,
+        subscriptionId: release.subscriptionId,
+      },
+    }),
+  );
+  const retry = frames.findLast((frame) => frame.type === "send_agent_message_request")!;
+  expect(retry).toMatchObject({ messageId: "no-recovery-input" });
+  expect(retry.requestId).not.toBe(initial.requestId);
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "send_agent_message_response",
+      payload: {
+        requestId: retry.requestId,
+        agentId: "agent",
+        accepted: true,
+        error: null,
+      },
+    }),
+  );
+  await expect(sending).resolves.toBeUndefined();
 });

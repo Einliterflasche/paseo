@@ -12,8 +12,10 @@ async function fixture() {
   const closure = join(root, "closure");
   await mkdir(bin);
   await mkdir(join(closure, "bin"), { recursive: true });
+  await mkdir(join(closure, "sw/bin"), { recursive: true });
   const executable = (name, body) =>
     writeFile(name, `#!/usr/bin/env bash\nset -eu\n${body}\n`, { mode: 0o700 });
+  await executable(join(closure, "sw/bin/paseo"), "exit 0");
   await executable(
     join(closure, "bin/switch-to-configuration"),
     'echo switch >> "$TEST_ROOT/actions"; if [[ "${SWITCH_EXIT:-0}" != 0 ]]; then exit "$SWITCH_EXIT"; fi; if [[ "${SWITCH_REPLACES:-0}" == 1 ]]; then echo replacement > "$TEST_ROOT/invocation"; fi',
@@ -55,18 +57,20 @@ test("host configuration is built before exact activation argv is handed to chec
   assert.equal(result.status, 0, result.stderr);
   assert.equal(await readFile(join(f.root, "build-argv"), "utf8"), "build\n");
   const argv = (await readFile(join(f.root, "deploy-argv"), "utf8")).trimEnd().split("\n");
-  assert.deepEqual(argv.slice(0, 6), [
+  assert.deepEqual(argv.slice(0, 8), [
     "daemon",
     "deploy",
+    "--target-cli",
+    join(f.closure, "sw/bin/paseo"),
     "--reason",
     "update with spaces",
     "--",
     "/run/wrappers/bin/sudo",
   ]);
-  assert.equal(argv.length, 8);
-  assert.ok(argv[6].endsWith("/activate.sh"));
-  assert.equal(argv[7], f.closure);
-  await access(argv[6]);
+  assert.equal(argv.length, 10);
+  assert.ok(argv[8].endsWith("/activate.sh"));
+  assert.equal(argv[9], f.closure);
+  await access(argv[8]);
   await assert.rejects(access(join(f.root, "actions")), { code: "ENOENT" });
 });
 
@@ -152,7 +156,7 @@ for (const replaces of [false, true]) {
     const prepare = spawnSync(script, ["--worker"], { env: f.env, encoding: "utf8" });
     assert.equal(prepare.status, 0, prepare.stderr);
     const args = (await readFile(join(f.root, "deploy-argv"), "utf8")).trimEnd().split("\n");
-    const activation = spawnSync(args[6], [args[7]], {
+    const activation = spawnSync(args[8], [args[9]], {
       env: { ...f.env, SWITCH_REPLACES: replaces ? "1" : "0" },
       encoding: "utf8",
     });
@@ -170,7 +174,7 @@ test("a failed activation never attempts an additional restart", async () => {
   const prepare = spawnSync(script, ["--worker"], { env: f.env, encoding: "utf8" });
   assert.equal(prepare.status, 0, prepare.stderr);
   const args = (await readFile(join(f.root, "deploy-argv"), "utf8")).trimEnd().split("\n");
-  const activation = spawnSync(args[6], [args[7]], {
+  const activation = spawnSync(args[8], [args[9]], {
     env: { ...f.env, SWITCH_EXIT: "8" },
     encoding: "utf8",
   });

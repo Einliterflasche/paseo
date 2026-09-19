@@ -14,7 +14,6 @@ import {
 import type { StreamItem } from "@/types/stream";
 import { deriveAgentStreamTurnLiveness } from "@/timeline/session-stream-reducers";
 import { planTimelineTailFetch } from "@/timeline/timeline-sync-plan";
-import { requestTimelineReplacement } from "@/timeline/timeline-replacement";
 import { type ViewedTimelineOwner } from "@/timeline/viewed-timeline-sync";
 import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import { parseServerInfoStatusPayload } from "@getpaseo/protocol/messages";
@@ -26,6 +25,7 @@ import {
 } from "@getpaseo/protocol/agent-attention-notification";
 
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { TimelineRequestError } from "@getpaseo/client/internal/daemon-client";
 import type { AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { getHostRuntimeStore, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { useVoiceAudioEngineOptional, useVoiceRuntimeOptional } from "@/contexts/voice-context";
@@ -50,7 +50,7 @@ import { useToast } from "@/contexts/toast-context";
 import { toErrorMessage } from "@/utils/error-messages";
 import { showProviderNoticeToast } from "@/utils/provider-notice-toast";
 import { applyCheckoutStatusUpdateFromEvent } from "@/git/checkout-status-cache";
-import { useProviderSubagentStore } from "@/subagents/provider-store";
+import { applyProviderSubagentDescriptorUpdate } from "@/subagents/provider-transcripts";
 
 // Re-export types from session-store and draft-store for backward compatibility
 export type { DraftInput } from "@/stores/draft-store";
@@ -406,15 +406,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
     };
     const onReplacement = (message: SessionOutboundMessage) => {
       if (message.type !== "agent.timeline.replacement") return;
-      void requestTimelineReplacement(
-        {
-          fetchAgentTimeline: (agentId, request) =>
-            getHostRuntimeStore().fetchAgentTimeline(serverId, agentId, request),
-        },
-        message.payload.agentId,
-      ).catch((error: unknown) => {
-        console.warn("[Session] timeline replacement refresh failed", { serverId, error });
-      });
+      sync.replaceTimelineEpoch(message.payload.agentId, message.payload.epoch);
     };
     const sync = getHostRuntimeStore().createViewedTimelineOwner(serverId, {
       observe: (agentIds) => {
@@ -460,7 +452,10 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
           }
           return page;
         } catch (error) {
-          if (shouldInitialize) {
+          if (
+            shouldInitialize &&
+            !(error instanceof TimelineRequestError && error.code === "TIMELINE_BUSY")
+          ) {
             setAgentInitializing(agentId, false);
             rejectInitDeferred(initKey, error instanceof Error ? error : new Error(String(error)));
           }
@@ -534,7 +529,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
 
     const unsubProviderSubagentUpdate = onFeed("agent.provider_subagents.update", (message) => {
       if (message.type !== "agent.provider_subagents.update") return;
-      useProviderSubagentStore.getState().applyUpdate(serverId, message.payload);
+      applyProviderSubagentDescriptorUpdate(serverId, client, message.payload);
     });
 
     const unsubCheckoutStatusUpdate = onFeed("checkout_status_update", (message) => {

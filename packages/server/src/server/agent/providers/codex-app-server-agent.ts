@@ -1,10 +1,12 @@
 import { validateProviderOptions } from "../provider-options.js";
+import { ProviderInitializationCleanupError } from "../provider-initialization-cleanup-error.js";
 import {
   getAgentStreamEventTurnId,
   type AgentPermissionAction,
   type AgentCapabilityFlags,
   type AgentClient,
   type AgentCreateSessionOptions,
+  type AgentProbeContext,
   type AgentFeature,
   type AgentLaunchContext,
   type AgentResumeSessionOptions,
@@ -74,6 +76,7 @@ import {
 } from "../../../executable-resolution/executable-resolution.js";
 import { createPathEquivalenceMatcher } from "../../../utils/path.js";
 import { spawnProcess } from "../../../utils/spawn.js";
+import { withTimeout } from "../../../utils/promise-timeout.js";
 import { extractCodexTerminalSessionId, nonEmptyString } from "./tool-call-mapper-utils.js";
 import {
   buildCodexFeatures,
@@ -272,6 +275,7 @@ interface CodexAppServerClientLike {
 }
 
 interface CodexAppServerAgentDeps {
+  turnStartTimeoutMs?: number;
   workspaceGitService?: Pick<WorkspaceGitService, "resolveRepoRoot">;
   customProvider?: {
     id: string;
@@ -2531,6 +2535,7 @@ type ParsedCodexNotification =
   | { kind: "turn_started"; turnId: string; threadId: string | null }
   | {
       kind: "turn_completed";
+      turnId?: string;
       status: string;
       errorMessage: string | null;
       threadId: string | null;
@@ -2683,6 +2688,7 @@ const CodexNotificationSchema = z.union([
     .transform(
       ({ params }): ParsedCodexNotification => ({
         kind: "turn_completed",
+        turnId: params.turn.id,
         status: params.turn.status,
         errorMessage: params.turn.error?.message ?? null,
         threadId: params.threadId ?? null,
@@ -3431,6 +3437,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private resolvedSandboxPolicy: Record<string, unknown> | null = null;
   private currentThreadId: string | null = null;
   private currentTurnId: string | null = null;
+  private readonly turnStopWaiters = new Map<string, Set<() => void>>();
   private pendingForegroundTurnIdentification: {
     foregroundTurnId: string;
     promise: Promise<string | null>;
@@ -3498,6 +3505,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private connectionState: "disconnected" | "history-ready" | "connected" = "disconnected";
   private connectionPromise: Promise<void> | null = null;
   private closed = false;
+  private closePromise: Promise<void> | null = null;
   private collaborationModes: Array<{
     name: string;
     mode?: string | null;
@@ -3599,11 +3607,11 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
     const child = await this.spawnAppServer();
     const client = new CodexAppServerClient(child, this.logger, () => this.traceContext());
+    this.client = client;
     if (this.closed) {
-      await client.dispose();
+      await this.disposeClient();
       throw this.createClosedError();
     }
-    this.client = client;
     client.setUnexpectedTerminationHandler((error) => {
       this.handleUnexpectedTermination(error);
     });
@@ -4343,6 +4351,7 @@ export class CodexAppServerAgentSession implements AgentSession {
 
     this.dismissPendingPlanApprovals("Dismissed by a new prompt");
 
+    let dispatched = false;
     try {
       await this.connect();
       if (!this.client) {
@@ -4388,13 +4397,22 @@ export class CodexAppServerAgentSession implements AgentSession {
       if (pendingStart.cancelRequested) {
         throw new Error("Codex turn start was interrupted before reaching Codex");
       }
-      await this.client.request("turn/start", turnStart.params, TURN_START_TIMEOUT_MS);
+      dispatched = true;
+      await this.client.request(
+        "turn/start",
+        turnStart.params,
+        this.deps.turnStartTimeoutMs ?? TURN_START_TIMEOUT_MS,
+      );
       return { turnId };
     } catch (error) {
-      this.pendingForegroundTurnIdentification?.resolve(null);
-      this.pendingForegroundTurnIdentification = null;
-      this.activeForegroundTurnId = null;
-      this.activeClientMessageId = null;
+      // A written request can execute after its response wait fails. Keep its
+      // owner until native lifecycle evidence or certified close settles it.
+      if (!dispatched) {
+        this.pendingForegroundTurnIdentification?.resolve(null);
+        this.pendingForegroundTurnIdentification = null;
+        this.activeForegroundTurnId = null;
+        this.activeClientMessageId = null;
+      }
       throw error;
     } finally {
       if (this.pendingForegroundStart === pendingStart) {
@@ -4971,7 +4989,11 @@ export class CodexAppServerAgentSession implements AgentSession {
       foregroundTurnId &&
       pendingIdentification?.foregroundTurnId === foregroundTurnId
     ) {
-      turnId = await pendingIdentification.promise;
+      turnId = await withTimeout(
+        pendingIdentification.promise,
+        INTERRUPT_TIMEOUT_MS,
+        "Codex did not identify the dispatched turn for interruption",
+      );
     }
     if (!turnId && !this.activeForegroundTurnId && !this.currentTurnId) {
       return;
@@ -4979,14 +5001,36 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (!turnId || (foregroundTurnId && this.activeForegroundTurnId !== foregroundTurnId)) {
       throw new Error("Cannot interrupt Codex before turn/started identifies the active turn");
     }
+    await this.interruptNativeTurn(this.client, this.currentThreadId, turnId);
+  }
+
+  private async interruptNativeTurn(
+    client: CodexAppServerClient,
+    threadId: string,
+    turnId: string,
+  ): Promise<void> {
+    let resolveStopped!: () => void;
+    const stopped = new Promise<void>((resolve) => {
+      resolveStopped = resolve;
+    });
+    let waiters = this.turnStopWaiters.get(turnId);
+    if (!waiters) this.turnStopWaiters.set(turnId, (waiters = new Set()));
+    waiters.add(resolveStopped);
     try {
-      await this.client.request(
+      await client.request(
         "turn/interrupt",
         {
-          threadId: this.currentThreadId,
+          threadId,
           turnId,
         },
         INTERRUPT_TIMEOUT_MS,
+      );
+      // RPC acknowledgement only accepts the request. The ordered terminal
+      // notification certifies that this native turn finished producing output.
+      await withTimeout(
+        stopped,
+        INTERRUPT_TIMEOUT_MS,
+        "Codex did not confirm the interrupted turn stopped",
       );
     } catch (error) {
       if (!isCodexAlreadyIdleInterrupt(error)) {
@@ -4997,21 +5041,38 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.currentTurnId = null;
       this.pendingForegroundTurnIdentification?.resolve(null);
       this.pendingForegroundTurnIdentification = null;
+    } finally {
+      waiters.delete(resolveStopped);
+      if (!waiters.size) this.turnStopWaiters.delete(turnId);
     }
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    if (!this.closePromise) {
+      const attempt = this.closeSession();
+      this.closePromise = attempt;
+      void attempt.catch(() => {
+        if (this.closePromise === attempt) this.closePromise = null;
+      });
+    }
+    return this.closePromise;
+  }
+
+  private async closeSession(): Promise<void> {
     this.closed = true;
     this.clearPendingPermissions();
+    // Keep attribution and subscribers until the transport has delivered its
+    // final stdout frames. Also join a spawn already accepted before close.
+    await this.disposeClient();
+    await this.connectionPromise?.catch(() => undefined);
+    await this.disposeClient();
+    for (const waiters of this.turnStopWaiters.values()) for (const resolve of waiters) resolve();
+    this.turnStopWaiters.clear();
     this.pendingSubAgentNotificationsByThreadId.clear();
     this.activeForegroundTurnId = null;
     this.activeClientMessageId = null;
     this.pendingForegroundTurnIdentification?.resolve(null);
     this.pendingForegroundTurnIdentification = null;
-    // Disposing the app-server client can still deliver a final notification
-    // through the handler registered in establishConnection(); keep
-    // subscribers attached until dispose settles so that event isn't dropped.
-    await this.disposeClient();
     this.subscribers.clear();
     this.currentThreadId = null;
   }
@@ -5034,11 +5095,11 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   private async disposeClient(): Promise<void> {
     const client = this.client;
-    this.connectionState = "disconnected";
-    this.currentTurnId = null;
     if (client) {
       await client.dispose();
     }
+    this.connectionState = "disconnected";
+    this.currentTurnId = null;
     this.client = null;
   }
 
@@ -6121,6 +6182,8 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.emitSubAgentActivityUpdate(subAgentCallId, status);
       return;
     }
+    if (parsed.turnId && this.currentTurnId && parsed.turnId !== this.currentTurnId) return;
+    const stoppedTurnId = this.currentTurnId;
     this.completePendingRootCompactions();
     if (parsed.status === "failed") {
       this.emitEvent({
@@ -6148,6 +6211,8 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.pendingForegroundTurnIdentification = null;
     this.pendingSubAgentNotificationsByThreadId.clear();
     this.resetTurnTrackingState();
+    if (stoppedTurnId)
+      for (const resolve of this.turnStopWaiters.get(stoppedTurnId) ?? []) resolve();
   }
 
   private resetTurnTrackingState(): void {
@@ -7151,44 +7216,54 @@ export class CodexAppServerAgentClient implements AgentClient {
     return buildCodexCustomProviderConfig(this.runtimeSettings, this.deps.customProvider);
   }
 
-  private resolveGoalsEnabled(): Promise<boolean> {
-    if (!this.goalsEnabledPromise) {
-      this.goalsEnabledPromise = (async () => {
-        try {
-          const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings);
-          const versionOutput = await resolveBinaryVersion(launchPrefix.command);
-          const enabled = codexVersionAtLeast(versionOutput, CODEX_GOALS_MIN_VERSION);
-          this.logger.trace(
-            {
-              provider: CODEX_PROVIDER,
-              versionOutput,
-              enabled,
-            },
-            "provider.codex.config.goals_resolved",
-          );
-          return enabled;
-        } catch (error) {
-          this.logger.warn({ err: error }, "Failed to probe codex version for goals gate");
-          return false;
-        }
-      })();
-    }
+  private resolveGoalsEnabled(signal?: AbortSignal, probe?: AgentProbeContext): Promise<boolean> {
+    if (signal) return this.probeGoalsEnabled(signal, probe);
+    this.goalsEnabledPromise ??= this.probeGoalsEnabled();
     return this.goalsEnabledPromise;
   }
 
-  private resolveAutoReviewEnabled(signal?: AbortSignal): Promise<boolean> {
-    if (signal) return this.probeAutoReviewEnabled(signal);
+  private async probeGoalsEnabled(
+    signal?: AbortSignal,
+    probe?: AgentProbeContext,
+  ): Promise<boolean> {
+    try {
+      signal?.throwIfAborted();
+      const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings);
+      signal?.throwIfAborted();
+      const versionOutput = await resolveBinaryVersion(launchPrefix.command, signal, probe);
+      signal?.throwIfAborted();
+      const enabled = codexVersionAtLeast(versionOutput, CODEX_GOALS_MIN_VERSION);
+      this.logger.trace(
+        { provider: CODEX_PROVIDER, versionOutput, enabled },
+        "provider.codex.config.goals_resolved",
+      );
+      return enabled;
+    } catch (error) {
+      if (signal?.aborted) throw signal.reason;
+      this.logger.warn({ err: error }, "Failed to probe codex version for goals gate");
+      return false;
+    }
+  }
+
+  private resolveAutoReviewEnabled(
+    signal?: AbortSignal,
+    probe?: AgentProbeContext,
+  ): Promise<boolean> {
+    if (signal) return this.probeAutoReviewEnabled(signal, probe);
     if (!this.autoReviewEnabledPromise) {
       this.autoReviewEnabledPromise = this.probeAutoReviewEnabled();
     }
     return this.autoReviewEnabledPromise;
   }
 
-  private async probeAutoReviewEnabled(signal?: AbortSignal): Promise<boolean> {
+  private async probeAutoReviewEnabled(
+    signal?: AbortSignal,
+    probe?: AgentProbeContext,
+  ): Promise<boolean> {
     try {
       const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings);
       signal?.throwIfAborted();
-      const versionOutput = await resolveBinaryVersion(launchPrefix.command, signal);
+      const versionOutput = await resolveBinaryVersion(launchPrefix.command, signal, probe);
       signal?.throwIfAborted();
       const enabled = codexVersionAtLeast(versionOutput, CODEX_AUTO_REVIEW_MIN_VERSION);
       this.logger.trace(
@@ -7238,6 +7313,8 @@ export class CodexAppServerAgentClient implements AgentClient {
     launchContext?: AgentLaunchContext,
     options?: AgentCreateSessionOptions,
   ): Promise<AgentSession> {
+    const probe = options?.probe;
+    probe?.signal.throwIfAborted();
     if (options?.persistSession === false) {
       this.logger.debug(
         "Codex app-server does not expose an ephemeral-session option; persistSession=false is currently a no-op",
@@ -7246,8 +7323,9 @@ export class CodexAppServerAgentClient implements AgentClient {
       // utility generations through `codex exec --ephemeral` in a larger change.
     }
     const sessionConfig: AgentSessionConfig = { ...config, provider: CODEX_PROVIDER };
-    const goalsEnabled = await this.resolveGoalsEnabled();
-    const autoReviewEnabled = await this.resolveAutoReviewEnabled();
+    const goalsEnabled = await this.resolveGoalsEnabled(probe?.signal, probe);
+    const autoReviewEnabled = await this.resolveAutoReviewEnabled(probe?.signal, probe);
+    probe?.signal.throwIfAborted();
     const session = new CodexAppServerAgentSession(
       sessionConfig,
       null,
@@ -7261,8 +7339,19 @@ export class CodexAppServerAgentClient implements AgentClient {
       launchContext?.agentId,
       "interactive",
     );
-    await session.connect();
-    return session;
+    probe?.own(session);
+    try {
+      probe?.signal.throwIfAborted();
+      await session.connect();
+      return session;
+    } catch (error) {
+      try {
+        await session.close();
+      } catch (cleanupError) {
+        throw new ProviderInitializationCleanupError(session, error, cleanupError);
+      }
+      throw error;
+    }
   }
 
   async resumeSession(
@@ -7293,19 +7382,32 @@ export class CodexAppServerAgentClient implements AgentClient {
       launchContext?.agentId,
       options?.purpose ?? "interactive",
     );
-    await session.connect();
-    return session;
+    try {
+      await session.connect();
+      return session;
+    } catch (error) {
+      try {
+        await session.close();
+      } catch (cleanupError) {
+        throw new ProviderInitializationCleanupError(session, error, cleanupError);
+      }
+      throw error;
+    }
   }
 
   async listImportableSessions(
     options?: ListImportableSessionsOptions,
+    probe?: AgentProbeContext,
   ): Promise<ImportableProviderSession[]> {
+    probe?.signal.throwIfAborted();
     const child = await this.spawnAppServer();
     const client =
       this.deps._createCodexClient?.(child, this.logger, () => ({})) ??
       new CodexAppServerClient(child, this.logger);
+    probe?.own({ close: () => client.dispose() });
 
     try {
+      probe?.signal.throwIfAborted();
       await client.request("initialize", buildCodexAppServerInitializeParams());
       client.notify("initialized", {});
 
@@ -7370,7 +7472,7 @@ export class CodexAppServerAgentClient implements AgentClient {
     const [models, autoReviewEnabled] = await Promise.all([
       this.fetchModelsFromAppServer(context),
       runProviderRefreshActivity(context, "version", () =>
-        this.resolveAutoReviewEnabled(context?.signal),
+        this.resolveAutoReviewEnabled(context?.signal, context?.probe),
       ),
     ]);
     return {
@@ -7393,19 +7495,16 @@ export class CodexAppServerAgentClient implements AgentClient {
   ): Promise<AgentModelDefinition[]> {
     // Codex model/list is global to the app server in this flow; cwd/force are intentionally ignored.
     let client: CodexAppServerClient | undefined;
-    let disposePromise: Promise<void> | undefined;
-    const dispose = () => {
-      if (!client) return Promise.resolve();
-      disposePromise ??= client.dispose();
-      return disposePromise;
-    };
+    const dispose = () => client?.dispose() ?? Promise.resolve();
     const handleAbort = () => void dispose().catch(() => undefined);
     context?.signal.addEventListener("abort", handleAbort, { once: true });
 
     try {
       await runProviderRefreshActivity(context, "app-server.start", async () => {
+        context?.signal.throwIfAborted();
         const child = await this.spawnAppServer();
         client = new CodexAppServerClient(child, this.logger);
+        context?.probe?.own({ close: dispose });
         if (context?.signal.aborted) await dispose();
       });
       if (!client) throw new Error("Codex app-server did not start");
@@ -7487,21 +7586,25 @@ export class CodexAppServerAgentClient implements AgentClient {
     return availability.available;
   }
 
-  async getDiagnostic(): Promise<{ diagnostic: string }> {
+  async getDiagnostic(probe?: AgentProbeContext): Promise<{ diagnostic: string }> {
+    probe?.signal.throwIfAborted();
     try {
       const launch = await resolveCodexLaunch(this.runtimeSettings);
       const availability = await checkCodexLaunchAvailable(launch);
       const entries: Array<{ label: string; value: string }> = [
         ...(await buildCommandResolutionDiagnosticRows(launch, {
           knownBinaryNames: ["codex"],
+          probe,
         })),
-        ...(await buildBinaryDiagnosticRows(launch, availability)),
+        ...(await buildBinaryDiagnosticRows(launch, availability, { probe })),
       ];
 
       return {
         diagnostic: formatProviderDiagnostic("Codex", entries),
       };
     } catch (error) {
+      probe?.signal.throwIfAborted();
+      if (error instanceof ProviderInitializationCleanupError) throw error;
       return {
         diagnostic: formatProviderDiagnosticError("Codex", error),
       };

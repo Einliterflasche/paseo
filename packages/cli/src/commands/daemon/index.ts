@@ -3,6 +3,7 @@ import { startCommand, daemonRunCommand } from "./start.js";
 import { daemonStatusCommand } from "./status.js";
 import { daemonStopCommand } from "./stop.js";
 import { runDeployCommand } from "./deploy.js";
+import { runCheckpointCheckCommand } from "./checkpoint-check.js";
 import { daemonRestartCommand } from "./restart.js";
 import { runSetPasswordCommand } from "./set-password.js";
 import { pairCommand } from "./pair.js";
@@ -36,6 +37,10 @@ export function createDaemonCommand(): Command {
         .description(
           "Prepare a checkpoint, activate a replacement and verify its exact restored generation",
         )
+        .requiredOption(
+          "--target-cli <path>",
+          "Immutable replacement CLI for offline checkpoint validation",
+        )
         .argument("<argv...>", "Activation argv after --"),
     ),
   )
@@ -48,5 +53,14 @@ export function createDaemonCommand(): Command {
         return runDeployCommand(argv, options, command);
       }),
     );
+  addJsonOption(
+    daemon
+      .command("checkpoint-check")
+      .description("Validate a checkpoint offline without claiming or restoring it"),
+  )
+    .option("--formats", "Print formats readable by this package")
+    .option("--home <path>", "Isolated Paseo home containing the checkpoint")
+    .option("--generation <id>", "Expected ready generation to validate")
+    .action(withOutput(runCheckpointCheckCommand));
   return daemon;
 }

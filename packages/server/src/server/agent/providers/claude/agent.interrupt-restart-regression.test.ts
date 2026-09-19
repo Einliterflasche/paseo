@@ -130,7 +130,9 @@ function createScriptedQuery(params: {
 
   const scriptedQuery = {
     next: vi.fn(() => output.next()),
-    interrupt: vi.fn(async () => undefined),
+    interrupt: vi.fn(async () => {
+      output.push(buildAbortedResult(params.sessionId));
+    }),
     return: vi.fn(async () => {
       output.end();
     }),
@@ -652,6 +654,7 @@ test("recovers when the query pump sees a single interrupt abort before the next
   const output = createAsyncQueue<Record<string, unknown>>();
   const prompts: PromptRecord[] = [];
   let throwAbortOnNext = false;
+  let interrupted = false;
 
   queryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
     const scriptedQuery = {
@@ -663,7 +666,12 @@ test("recovers when the query pump sees a single interrupt abort before the next
         return output.next();
       }),
       interrupt: vi.fn(async () => {
+        // Inject the single active-turn abort this regression exercises. The
+        // later idle close has no active request to abort.
+        if (interrupted) return;
+        interrupted = true;
         throwAbortOnNext = true;
+        output.push(buildAbortedResult("interrupt-abort-recovery-session"));
       }),
       return: vi.fn(async () => {
         output.end();
@@ -730,6 +738,7 @@ test("recovers when the query pump sees a single interrupt abort before the next
 
   const firstTurn = streamSession(session, "first prompt");
   await firstTurn.next();
+  await waitFor(() => prompts.length === 1);
   await session.interrupt();
   await collectUntilTerminal(firstTurn);
 

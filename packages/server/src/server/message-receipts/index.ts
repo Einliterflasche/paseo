@@ -63,8 +63,9 @@ export class MessageReceipts {
     const file = path.join(this.directory, `${key}.json`);
     const fingerprint = digest(input.request);
     const existing = await readReceipt(file);
+    if (existing && existing.fingerprint !== fingerprint)
+      throw new Error("agent_request_key_conflict");
     if (existing && existing.state !== "not_dispatched") {
-      if (existing.fingerprint !== fingerprint) throw new Error("agent_request_key_conflict");
       if (existing.state === "completed") return;
       // A provider may have accepted the message before its receipt was committed.
       throw new Error("agent_request_outcome_unknown");

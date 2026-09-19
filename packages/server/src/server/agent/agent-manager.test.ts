@@ -7059,10 +7059,12 @@ test("cancelAgentRun waits for an acknowledged autonomous interrupt to settle", 
   class LiveInterruptSession extends TestAgentSession {
     public interruptCount = 0;
     readonly interruptCalled = deferred<void>();
+    readonly interruptionSettled = deferred<void>();
 
     override async interrupt(): Promise<void> {
       this.interruptCount += 1;
       this.interruptCalled.resolve(undefined);
+      await this.interruptionSettled.promise;
     }
   }
 
@@ -7141,6 +7143,7 @@ test("cancelAgentRun waits for an acknowledged autonomous interrupt to settle", 
     turnId: "autonomous-cancel-1",
     reason: "interrupted",
   });
+  capturedSession.interruptionSettled.resolve(undefined);
 
   await expect(cancelPromise).resolves.toEqual({ status: "settled" });
   expect(manager.getAgent(snapshot.id)?.lifecycle).toBe("idle");
@@ -10202,14 +10205,18 @@ test("concurrent explicit closes tear down the runtime once", async () => {
   }
 });
 
-test("provider close failure retains the runtime for cleanup instead of allowing another writer", async () => {
+test("provider close failure retains ownership until a certified retry emits closed", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-close-failure-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
+  let canClose = false;
+  let creates = 0;
   const client = new (class extends TestAgentClient {
     override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      creates++;
       return new (class extends TestAgentSession {
         override async close(): Promise<void> {
-          throw new Error("provider cleanup failed");
+          if (!canClose) throw new Error("provider cleanup failed");
+          await super.close();
         }
       })(config);
     }
@@ -10222,8 +10229,18 @@ test("provider close failure retains the runtime for cleanup instead of allowing
       "00000000-0000-4000-8000-000000000217",
       { workspaceId: undefined },
     );
+    let closedCount = 0;
+    const unsubscribe = manager.subscribe(
+      (event) => {
+        if (event.type === "agent_state" && event.agent.lifecycle === "closed") closedCount++;
+      },
+      { agentId: created.id, replayState: false },
+    );
+
     await expect(manager.closeAgent(created.id)).rejects.toThrow("provider cleanup failed");
-    expect(manager.getAgent(created.id)?.session).toBe(created.session);
+    expect(closedCount).toBe(0);
+    expect(manager.getAgent(created.id)).not.toBeNull();
+    expect(manager.recoveryBlockedAgents()).toContain(created.id);
     const stored = await storage.get(created.id);
     expect(stored).toMatchObject({ lastStatus: "idle" });
     expect(stored?.archivedAt).toBeFalsy();
@@ -10231,7 +10248,16 @@ test("provider close failure retains the runtime for cleanup instead of allowing
     await expect(
       ensureAgentLoaded(created.id, { agentManager: manager, agentStorage: storage, logger }),
     ).resolves.toMatchObject({ id: created.id, lifecycle: "idle" });
+    expect(creates).toBe(1);
+    canClose = true;
+    await manager.closeAgent(created.id);
+    expect(closedCount).toBe(1);
+    expect(manager.getAgent(created.id)).toBeNull();
+    expect(manager.recoveryBlockedAgents()).toEqual([]);
+    expect(await storage.get(created.id)).toMatchObject({ lastStatus: "closed" });
+    unsubscribe();
   } finally {
+    canClose = true;
     await manager.closeAgent("00000000-0000-4000-8000-000000000217").catch(() => undefined);
     await storage.flush().catch(() => undefined);
     rmSync(workdir, { recursive: true, force: true });

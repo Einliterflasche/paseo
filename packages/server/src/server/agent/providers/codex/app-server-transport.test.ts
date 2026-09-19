@@ -47,12 +47,36 @@ describe("Codex app-server transport", () => {
       }
       child.exitCode = 0;
       child.emit("exit", 0, null);
+      child.stdout.end();
+      child.stderr.end();
       await expect(client.dispose()).resolves.toBeUndefined();
     } finally {
       vi.useRealTimers();
       child.stdout.end();
       child.stderr.end();
     }
+  });
+
+  test("keeps final notifications through exit and stdout drain", async () => {
+    const child = createCodexAppServerChildProcess();
+    const client = new CodexAppServerClient(child, createTestLogger());
+    const notifications: unknown[] = [];
+    client.setNotificationHandler((method, params) => notifications.push({ method, params }));
+    child.kill = () => {
+      queueMicrotask(() => {
+        child.signalCode = "SIGTERM";
+        child.emit("exit", null, "SIGTERM");
+        child.stdout.write('{"method":"final/output","params":{"text":"last words"}}\n');
+        child.stdout.end();
+        child.stderr.end();
+      });
+      return true;
+    };
+    const close = client.dispose();
+    expect(client.dispose()).toBe(close);
+    await close;
+    expect(notifications).toEqual([{ method: "final/output", params: { text: "last words" } }]);
+    await client.dispose();
   });
 
   test.each([

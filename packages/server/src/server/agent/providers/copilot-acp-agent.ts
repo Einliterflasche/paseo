@@ -1,7 +1,8 @@
 import type { Logger } from "pino";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
 
-import type { AgentCapabilityFlags, AgentMode } from "../agent-sdk-types.js";
+import type { AgentCapabilityFlags, AgentMode, AgentProbeContext } from "../agent-sdk-types.js";
+import { ProviderInitializationCleanupError } from "../provider-initialization-cleanup-error.js";
 import {
   checkProviderLaunchAvailable,
   resolveProviderLaunch,
@@ -100,7 +101,8 @@ export class CopilotACPAgentClient extends ACPAgentClient {
     return super.isAvailable();
   }
 
-  async getDiagnostic(): Promise<{ diagnostic: string }> {
+  async getDiagnostic(probe?: AgentProbeContext): Promise<{ diagnostic: string }> {
+    probe?.signal.throwIfAborted();
     try {
       const launch = await resolveProviderLaunch({
         commandConfig: this.runtimeSettings?.command,
@@ -112,11 +114,14 @@ export class CopilotACPAgentClient extends ACPAgentClient {
         diagnostic: formatProviderDiagnostic("Copilot", [
           ...(await buildCommandResolutionDiagnosticRows(launch, {
             knownBinaryNames: ["copilot"],
+            probe,
           })),
-          ...(await buildBinaryDiagnosticRows(launch, availability)),
+          ...(await buildBinaryDiagnosticRows(launch, availability, { probe })),
         ]),
       };
     } catch (error) {
+      if (error instanceof ProviderInitializationCleanupError) throw error;
+      probe?.signal.throwIfAborted();
       return {
         diagnostic: formatProviderDiagnosticError("Copilot", error),
       };

@@ -50,8 +50,13 @@ cd "$WORK_DIR"
 nixos-rebuild "${BUILD_ARGS[@]}" > >(tee build.log) 2> >(tee build-errors.log >&2)
 CLOSURE_DIR="$(readlink -f result)"
 SWITCH_BIN="$CLOSURE_DIR/bin/switch-to-configuration"
+TARGET_CLI="$CLOSURE_DIR/sw/bin/paseo"
 if [[ ! -x "$SWITCH_BIN" ]]; then
   echo "Built closure has no executable switch-to-configuration: $CLOSURE_DIR" >&2
+  exit 1
+fi
+if [[ ! -x "$TARGET_CLI" ]]; then
+  echo "Built closure has no Paseo executable for checkpoint preflight: $TARGET_CLI" >&2
   exit 1
 fi
 
@@ -76,5 +81,5 @@ fi
 ACTIVATE
 chmod 700 "$ACTIVATION_SCRIPT"
 exec "${PASEO_CLI:-$ROOT_DIR/packages/cli/bin/paseo}" daemon deploy \
-  --reason "$REASON" "${EXTRA_DEPLOY_ARGS[@]}" -- \
+  --target-cli "$TARGET_CLI" --reason "$REASON" "${EXTRA_DEPLOY_ARGS[@]}" -- \
   /run/wrappers/bin/sudo "$ACTIVATION_SCRIPT" "$CLOSURE_DIR"

@@ -3,7 +3,8 @@ import { usePendingArchiveAgentIds } from "@/hooks/use-archive-agent";
 import equal from "fast-deep-equal";
 import { useStoreWithEqualityFn } from "zustand/traditional";
 import { useSessionStore, type Agent } from "@/stores/session-store";
-import { refreshProviderSubagents, useProviderSubagentStore } from "./provider-store";
+import { useProviderSubagentStore } from "./provider-store";
+import { refreshProviderSubagents } from "./provider-transcripts";
 import type { ProviderSubagentDescriptorPayload } from "@getpaseo/protocol/messages";
 
 export interface PaseoSubagentRow {
@@ -152,13 +153,16 @@ export function useSubagentsForParent(params: SelectSubagentsParams): SubagentRo
     equal,
   );
   const client = useSessionStore((state) => state.sessions[params.serverId]?.client ?? null);
+  const clientGeneration = useSessionStore(
+    (state) => state.sessions[params.serverId]?.clientGeneration,
+  );
 
   useEffect(() => {
     if (!client || !supported) return;
     void refreshProviderSubagents(client, params.serverId, params.parentAgentId).catch(
       () => undefined,
     );
-  }, [client, params.parentAgentId, params.serverId, supported]);
+  }, [client, clientGeneration, params.parentAgentId, params.serverId, supported]);
 
   return useMemo(() => {
     if (params.providerParentSubagentId) return providerRows;

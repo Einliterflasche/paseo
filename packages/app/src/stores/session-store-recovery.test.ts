@@ -1,6 +1,6 @@
 import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { afterEach, describe, expect, it } from "vitest";
-import { selectRecoveryPausedHostIds, toDaemonServerInfo, useSessionStore } from "./session-store";
+import { selectRecoveryFailedHostIds, toDaemonServerInfo, useSessionStore } from "./session-store";
 
 const serverId = "recovery-test-host";
 const client = new DaemonClient({ url: "ws://localhost:1", clientId: "recovery-store-test" });
@@ -21,18 +21,24 @@ describe("host recovery status", () => {
         restartRecoveryState: "paused",
         restartRecoveryGeneration: "generation-one",
         restartRecoveryError: "The checkpoint could not be restored",
+        restartRecoveryStage: "blocked",
+        restartRecoveryPreviousGeneration: "generation-zero",
+        restartRecoveryAffectedAgents: ["agent-one"],
       }),
     );
-    expect(selectRecoveryPausedHostIds(useSessionStore.getState())).toEqual([serverId]);
+    expect(selectRecoveryFailedHostIds(useSessionStore.getState())).toEqual([serverId]);
     expect(useSessionStore.getState().sessions[serverId]?.serverInfo).toMatchObject({
       restartRecoveryGeneration: "generation-one",
       restartRecoveryError: "The checkpoint could not be restored",
+      restartRecoveryStage: "blocked",
+      restartRecoveryPreviousGeneration: "generation-zero",
+      restartRecoveryAffectedAgents: ["agent-one"],
     });
     store.updateSessionServerInfo(
       serverId,
       toDaemonServerInfo({ ...base, restartRecoveryState: "running" }),
     );
-    expect(selectRecoveryPausedHostIds(useSessionStore.getState())).toEqual([]);
+    expect(selectRecoveryFailedHostIds(useSessionStore.getState())).toEqual([]);
     expect(useSessionStore.getState().sessions[serverId]?.serverInfo).toEqual({
       serverId,
       hostname: "Host",
@@ -51,16 +57,16 @@ describe("host recovery status", () => {
         restartRecoveryState,
         restartRecoveryError: "Prior failure",
       });
-      expect(selectRecoveryPausedHostIds(useSessionStore.getState())).toEqual([]);
+      expect(selectRecoveryFailedHostIds(useSessionStore.getState())).toEqual([]);
     }
     store.updateSessionServerInfo(serverId, { ...base, restartRecoveryState: "paused" });
-    expect(selectRecoveryPausedHostIds(useSessionStore.getState())).toEqual([]);
+    expect(selectRecoveryFailedHostIds(useSessionStore.getState())).toEqual([]);
     store.updateSessionServerInfo(serverId, {
       ...base,
       restartRecoveryState: "paused",
       restartRecoveryError: "The checkpoint is incomplete",
     });
-    expect(selectRecoveryPausedHostIds(useSessionStore.getState())).toEqual([serverId]);
+    expect(selectRecoveryFailedHostIds(useSessionStore.getState())).toEqual([serverId]);
   });
 
   it("publishes changed recovery errors and generations while the host remains paused", () => {
@@ -126,4 +132,48 @@ describe("host recovery status", () => {
     store.updateSessionServerInfo(serverId, base);
     expect(useSessionStore.getState().sessions[serverId]?.serverInfo).toEqual(base);
   });
+});
+
+it("shows stopping and unconfirmed stop failures without claiming paused, and clears successor details", () => {
+  const store = useSessionStore.getState();
+  store.initializeSession(serverId, client);
+  const base = {
+    serverId,
+    hostname: "Host",
+    version: "0.8.0",
+    restartRecoveryState: "restoring" as const,
+    restartRecoveryError: "Stop failed",
+    restartRecoveryGeneration: "successor",
+    restartRecoveryPreviousGeneration: "original",
+  };
+  for (const restartRecoveryStage of ["stopping", "blocked"] as const) {
+    store.updateSessionServerInfo(serverId, {
+      ...base,
+      restartRecoveryStage,
+      restartRecoveryAffectedAgents: ["agent-a"],
+    });
+    expect(selectRecoveryFailedHostIds(useSessionStore.getState())).toEqual([serverId]);
+    expect(useSessionStore.getState().sessions[serverId]?.serverInfo).toMatchObject({
+      restartRecoveryState: "restoring",
+      restartRecoveryStage,
+      restartRecoveryAffectedAgents: ["agent-a"],
+      restartRecoveryPreviousGeneration: "original",
+    });
+  }
+  store.updateSessionServerInfo(serverId, {
+    serverId,
+    hostname: "Host",
+    version: "0.8.0",
+    restartRecoveryState: "running",
+  });
+  expect(selectRecoveryFailedHostIds(useSessionStore.getState())).toEqual([]);
+  expect(useSessionStore.getState().sessions[serverId]?.serverInfo).not.toHaveProperty(
+    "restartRecoveryStage",
+  );
+  expect(useSessionStore.getState().sessions[serverId]?.serverInfo).not.toHaveProperty(
+    "restartRecoveryAffectedAgents",
+  );
+  expect(useSessionStore.getState().sessions[serverId]?.serverInfo).not.toHaveProperty(
+    "restartRecoveryPreviousGeneration",
+  );
 });

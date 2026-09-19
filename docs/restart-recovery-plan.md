@@ -27,9 +27,9 @@ shutdown; measure it rather than promise a fixed downtime.
 
 ## Ownership
 
-Add `packages/server/src/server/restart/checkpoint-store.ts` and a small
-`restart-controller.ts`. The store owns validation and durable file writes; the
-controller owns preparation through replacement. Keep agent execution state in
+`packages/server/src/server/restart/checkpoint-store.ts` owns validation and durable
+file writes. `restart-controller.ts` owns lifecycle state, admission, preparation,
+restoration failure, retry, and replacement. Keep agent execution state in
 `AgentManager`, notification state with its driver, and schedules with their service.
 
 User-facing operations are **restart** and **deploy**. Callers do not manually pair
@@ -43,10 +43,21 @@ running -> preparing -> ready(generation) -> replacing
 boot -> validate ready generation -> claim -> restoring -> running
 ```
 
-A failed checkpoint leaves the daemon paused with its state intact, serving
-status/history and rejecting new execution with a typed retryable error. Internal
+A failure closes admission and stops every session opened by the attempt while
+retaining listeners for late output and settlement. The daemon reports paused only
+after execution is confirmed stopped. Failed or uncertain teardown stays visibly
+blocked, with affected agents identified. An operator retry first rechecks stopping;
+it cannot capture or resume work until teardown and event drain are confirmed.
+History reads use installed canonical state without starting provider sessions. Internal
 helpers return typed results; only the checkpoint store can produce readiness.
 Never report success after a failed save or silently force replacement.
+
+A retry operates on the current stopped inventory, including late output and agents
+that were never opened. `paseo daemon restart --retry-recovery` commits and claims
+a successor generation before continuing; it does not reinstall an older snapshot.
+Cancellation stays available during restoration and stopping, but is rejected once
+the immutable handoff is checkpointing, ready, or replacing. External effects of
+already executed tools cannot be undone by recovery.
 
 ## 1. Retain inputs and freeze admissions
 
@@ -69,8 +80,9 @@ pending run synchronously, so a check only inside its generator is too late.
 Use private execution helpers rather than caller-managed begin/end calls or
 special recovery flags that every caller must remember.
 
-Apply the same phase check to create/resume, stop, rewind, and configuration
-mutations affecting the snapshot. Resolve admitted operations; reject later ones
+Apply the same phase check to create/resume, rewind, and configuration
+mutations affecting the snapshot. Explicit stop uses the controller's cancellation
+path. Resolve admitted operations; reject later ones
 before side effects. Schedule and agent-to-agent execution already reaches these
 manager paths. Ephemeral internal response-loop helpers are not user tasks to revive.
 
@@ -87,13 +99,14 @@ Add manager-owned `quiesceForRestart`, used only by the controller:
 3. Drain session-event tails, staged admission events, coalescers, and other
    tracked writers. Snapshot stable stores before discarding runtime objects.
 
-In `agent-manager.ts`, move unsubscribe/reset after provider teardown and event
-drain. Its current `prepareAgentForClosure` removes the agent before `session.close`;
-restart must not reuse the permanent-close semantics. In Claude's
-`providers/claude/agent.ts` and Codex's `providers/codex-app-server-agent.ts`, retain
-subscribers and event translation through awaited teardown. Check early `closed`
-guards as well as subscriber clearing. Verify Pi with the same late-event contract.
+Provider close must confirm execution stopped and drain final output before
+releasing its subscribers or resources. Keep that ownership after a failed attempt
+so retry can obtain fresh evidence; a second no-op close is not confirmation.
+SDK iterator cleanup can discard queued messages, so its ordering belongs in the
+provider adapter's shutdown contract tests.
 
+Bind completion obligations to the logical run, including across native-session
+replacement. Subscribe before dispatch so immediate completion cannot be missed.
 Record cancellation at the explicit stop initiator. Do not infer it from the final
 `idle` status or a free-text cancellation reason. Preserve whether a terminal event
 was genuine completion, explicit cancellation, or restart-induced interruption.
@@ -131,11 +144,11 @@ timelines, unsettled inputs, notification obligations, and schedule ownership.
 A single file keeps the commit boundary small. Existing Zod schemas validate the
 whole generation before it can replace live state; incompatible versions fail closed.
 
-Checkpoint format 2 preserves shared cumulative log text instead of expanding every
-historical version into JSON. Format 1 remains readable only with its original
-inline strings. Older daemons reject format 2, so a rollback must understand the
-current checkpoint before activation; stripping unknown fields would otherwise
-turn shared references into empty logs. The public timeline wire format is unchanged.
+Checkpoint format 3 preserves owned text backings and range references, including
+rolling logs and edits within imported text. Formats 1 (inline strings) and 2
+(shared leaves) retain their original readers. Older binaries must reject newer
+formats rather than restore empty placeholders. The deployment preflight and
+rollback requirements belong in [fork maintenance](fork-maintenance.md).
 
 Image bytes and inline attachments are part of the snapshot. Completed file uploads
 already live under `PASEO_HOME/uploads` without expiry; checkpoint creation verifies
@@ -149,9 +162,9 @@ directory, then atomically replaces and flushes `ready.json` and its parent dire
 propagate; preserve prior generations. Flush required registry, receipt, and schedule
 writes and verify native handles before readiness. Do not swallow flush failures.
 
-Carry forward restored histories even when their agents were not reopened, using
-immutable file references or current snapshots. Rewind invalidates the inherited
-reference for that agent. Add no retention, expiry, or automatic deletion.
+Carry forward restored histories even when their agents were not reopened. Use
+current registry state for their lifecycle; an old checkpoint must not resurrect a
+deleted agent or undo an archive. Add no retention, expiry, or automatic deletion.
 
 At boot, validate then write/flush `claimed.json` before executing any recovered
 or new work. Write/flush `restored.json` before reopening ordinary admissions.
@@ -160,7 +173,8 @@ snapshot unsafe to replay after an unrelated crash. A consumed, incomplete, corr
 or incompatible generation leaves the listener reachable with execution and schedule
 recovery paused. The app shows the host, error, and generation on startup and workspace
 screens. Do not silently substitute native history or clear the pointer to bypass the
-failure. Preserve the files and reconcile later work before deliberate recovery.
+failure. Preserve the files and reconcile later work before
+[deliberate crash recovery](fork-maintenance.md#deliberate-recovery-after-an-unexpected-crash).
 A crash during restoration remains outside the controlled-restart guarantee.
 
 ## 4. Restore work and its completion obligations
@@ -239,13 +253,14 @@ automatic forced stop on timeout. A running old daemon without the capability
 reports unsupported; an unreachable running daemon is not automatically killed.
 Explicit force remains outside the guarantee. A stopped daemon can start normally.
 
-Add one local CLI-owned `daemon deploy -- <activation argv>` operation and a thin
+Use the CLI-owned `daemon deploy --target-cli <replacement-paseo> -- <activation argv>` operation and the
 `scripts/deploy-nixos.sh` wrapper:
 
 1. Build/validate the immutable fork package and system closure while agents run.
-2. Request checkpoint preparation from the old daemon and verify its ready
-   generation. Keep that daemon paused.
-3. Only after success, run the built closure's `switch-to-configuration switch`
+2. Check the immutable target's readable formats before preparation. Prepare the
+   old daemon's checkpoint, then have the target validate that exact ready
+   generation offline, without claiming it. Keep the old daemon paused.
+3. Only after validation, run the built closure's `switch-to-configuration switch`
    with the operator's normal sudo access. Execute an argument array, not a shell
    string. The daemon never runs privileged commands.
 4. Wait for the replacement daemon to report restoration of that generation.
@@ -259,14 +274,10 @@ Raw signals, `systemctl restart`, and uncoordinated `nixos-rebuild switch` there
 are not the safe deployment entrypoint. The command owns preparation plus activation;
 the user never performs a two-command handoff.
 
-The deployed upstream binary cannot prepare a checkpoint. First installation needs
-an idle handover and export through existing history read APIs, validated into the
-new checkpoint format before replacement. Pause producers and settle accepted sends
-for that handover. Test it against an isolated old-version instance first; if a
-complete stable export cannot be established, block rollout and preserve the old
-daemon. Keep Slack active and preserve the packaging overrides in
-[fork-maintenance.md](fork-maintenance.md). Updating fork maintenance with the
-actual deploy command is part of implementation.
+The initial handover from upstream is complete. Subsequent updates use the running
+fork's checkpoint path and preserve the packaging overrides in
+[fork-maintenance.md](fork-maintenance.md). A package without checkpoint support
+cannot participate in this update path.
 
 ## Validation and rollout
 
@@ -274,7 +285,7 @@ Keep the changes as `fork patch:` commits above the upstream base: snapshot stor
 client/protocol support, daemon recovery, and restart/deployment operations. Their tests belong
 with the behavior they verify.
 
-Local validation covers these boundaries:
+The focused validation gates cover these boundaries:
 
 | Test                                         | Evidence                                                                                                                                                                                                                                                         |
 | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -302,12 +313,11 @@ operator's configured model; the shared provider-test helper's automatic default
 select the configured backend. Native provider tests require the normal operator setup
 and fail visibly when it is unavailable.
 
-These checks do not claim a production NixOS switch or first installation onto the old
-upstream daemon. The isolated activation subprocess is a process-replacement test, not
-Nix evaluation. Before production rollout, validate the immutable Nix package and the
-old-version idle export/handover described in [fork-maintenance.md](fork-maintenance.md),
-then test a separate Nix/systemd service with isolated state and port. Benchmark large
-histories before promising a preparation time. Permission prompts retain their provider
+The isolated activation subprocess tests process replacement; it does not validate
+the Nix package. Before production rollout, build the immutable Nix package and
+validate the source-format handoff using isolated state and a separate port. Follow
+[fork-maintenance.md](fork-maintenance.md) for activation and generation verification.
+Benchmark large histories before promising a preparation time. Permission prompts retain their provider
 policy and must be reissued by the native provider; the real-provider tests above use
 unattended permission modes and do not verify an interactive approval across restart.
 

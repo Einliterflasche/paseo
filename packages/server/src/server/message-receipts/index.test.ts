@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, expect, test } from "vitest";
 import { MessageReceipts } from "./index.js";
+import { RestartInProgressError } from "../restart/restart-errors.js";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -74,4 +75,29 @@ test("failed local message preparation does not leave an ambiguous receipt", asy
   available = false;
   await requests.send(input);
   expect(sends).toBe(1);
+});
+
+test("a known undispatched receipt retries its exact input and rejects a changed input", async () => {
+  const { requests, directory } = await fixture();
+  let accepting = false;
+  let deliveries = 0;
+  const input = {
+    agentId: "agent",
+    messageId: "accepted-id",
+    request: { text: "preserve this identity" },
+    send: async () => {
+      if (!accepting) throw new RestartInProgressError();
+      deliveries++;
+    },
+  };
+  await expect(requests.send(input)).rejects.toBeInstanceOf(RestartInProgressError);
+  await requests.drain();
+  const replacement = new MessageReceipts(directory);
+  await expect(replacement.send({ ...input, request: { text: "changed" } })).rejects.toThrow(
+    "agent_request_key_conflict",
+  );
+  accepting = true;
+  await replacement.send(input);
+  await replacement.send(input);
+  expect(deliveries).toBe(1);
 });

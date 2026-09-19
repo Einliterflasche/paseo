@@ -1,4 +1,5 @@
 import { validateProviderOptions } from "../provider-options.js";
+import { ProviderInitializationCleanupError } from "../provider-initialization-cleanup-error.js";
 import {
   createOpencodeClient,
   type AssistantMessage as OpenCodeAssistantMessage,
@@ -33,6 +34,7 @@ import {
   type AgentPermissionRequest,
   type AgentPermissionResponse,
   type AgentPersistenceHandle,
+  type AgentProbeContext,
   type AgentPromptInput,
   type AgentRunOptions,
   type AgentRunResult,
@@ -540,31 +542,14 @@ async function abortOpenCodeSession(params: {
   client: Pick<OpencodeClient, "session">;
   sessionId: string;
   directory: string;
-  logger: Logger;
 }): Promise<void> {
-  const { client, sessionId, directory, logger } = params;
-
-  try {
-    const response = await client.session.abort({
-      sessionID: sessionId,
-      directory,
-    });
-    if (response.error && !isOpenCodeNotFoundError(response.error)) {
-      logger.warn(
-        {
-          sessionId,
-          error: toDiagnosticErrorMessage(response.error),
-        },
-        "Failed to abort OpenCode session during close",
-      );
-    }
-  } catch (error) {
-    logger.warn(
-      {
-        sessionId,
-        error: toDiagnosticErrorMessage(error),
-      },
-      "Failed to abort OpenCode session during close",
+  const response = await params.client.session.abort({
+    sessionID: params.sessionId,
+    directory: params.directory,
+  });
+  if (response.error && !isOpenCodeNotFoundError(response.error)) {
+    throw new Error(
+      `Failed to abort OpenCode session: ${toDiagnosticErrorMessage(response.error)}`,
     );
   }
 }
@@ -1055,6 +1040,7 @@ function isOpenCodeDefinitiveSteerRejection(error: unknown, status?: number): bo
 async function collectOpenCodeImportableSessionsFromSdk(
   client: Pick<OpencodeClient, "experimental">,
   options?: ListImportableSessionsOptions,
+  signal?: AbortSignal,
 ): Promise<ImportableProviderSession[]> {
   const limit = options?.limit ?? OPENCODE_PERSISTED_SESSION_LIMIT;
   const scanLimit = Math.min(options?.scanLimit ?? limit, 500);
@@ -1062,12 +1048,15 @@ async function collectOpenCodeImportableSessionsFromSdk(
     options?.cwd ? Math.max(scanLimit, OPENCODE_PERSISTED_SESSION_LIMIT) : scanLimit,
     500,
   );
-  const response = await client.experimental.session.list({
-    archived: true,
-    roots: true,
-    limit: sessionListLimit,
-    ...(options?.cwd ? { directory: options.cwd } : {}),
-  });
+  const response = await client.experimental.session.list(
+    {
+      archived: true,
+      roots: true,
+      limit: sessionListLimit,
+      ...(options?.cwd ? { directory: options.cwd } : {}),
+    },
+    signal ? { signal } : undefined,
+  );
 
   if (response.error) {
     throw new Error(`Failed to list OpenCode sessions: ${JSON.stringify(response.error)}`);
@@ -1397,6 +1386,113 @@ function createSdkOpenCodeClient(options: { baseUrl: string; directory: string }
   return createOpencodeClient(options satisfies OpencodeClientConfig & { directory: string });
 }
 
+function ownTemporaryOpenCodeServer(
+  acquisition: OpenCodeServerAcquisition | Promise<OpenCodeServerAcquisition>,
+  context?: AgentProbeContext,
+) {
+  const acquired = Promise.resolve(acquisition).then(
+    (value) => ({ value }),
+    (error: unknown) => ({ error }),
+  );
+  // Own pending startup before awaiting it. Aborting only the readiness wait
+  // would leave the shared server free to finish spawning without a lease.
+  let releasePromise: Promise<void> | null = null;
+  const cleanup = {
+    close: () => {
+      if (releasePromise) return releasePromise;
+      const attempt = (async () => {
+        const result = await acquired;
+        if ("value" in result) {
+          await result.value.release();
+        } else if (result.error instanceof ProviderInitializationCleanupError) {
+          await result.error.cleanup.close();
+        }
+      })();
+      releasePromise = attempt;
+      void attempt.catch(() => {
+        if (releasePromise === attempt) releasePromise = null;
+      });
+      return attempt;
+    },
+  };
+  const disown = context?.own(cleanup);
+  return {
+    async get() {
+      const result = await acquired;
+      if ("error" in result) throw result.error;
+      context?.signal.throwIfAborted();
+      return result.value;
+    },
+    async release(operationFailure: { error: unknown } | undefined) {
+      const result = await acquired;
+      if ("value" in result) {
+        await releaseTemporaryOpenCodeServer({ release: cleanup.close }, operationFailure);
+        disown?.();
+      } else if (!(result.error instanceof ProviderInitializationCleanupError)) {
+        disown?.();
+      }
+    },
+  };
+}
+
+async function withTemporaryOpenCodeServer<T>(
+  acquisition: OpenCodeServerAcquisition | Promise<OpenCodeServerAcquisition>,
+  operation: (acquisition: OpenCodeServerAcquisition) => Promise<T>,
+  context?: AgentProbeContext,
+): Promise<T> {
+  const ownership = ownTemporaryOpenCodeServer(acquisition, context);
+  let operationFailure: { error: unknown } | undefined;
+  try {
+    return await operation(await ownership.get());
+  } catch (error) {
+    operationFailure = { error };
+    throw error;
+  } finally {
+    await ownership.release(operationFailure);
+  }
+}
+
+async function releaseTemporaryOpenCodeServer(
+  acquisition: Pick<OpenCodeServerAcquisition, "release">,
+  operationFailure: { error: unknown } | undefined,
+): Promise<void> {
+  try {
+    await acquisition.release();
+  } catch (cleanupError) {
+    const operationError = operationFailure?.error;
+    const previousCleanup =
+      operationError instanceof ProviderInitializationCleanupError
+        ? operationError.cleanup
+        : undefined;
+    const cleanup = {
+      close: () => retryOpenCodeAcquisitionCleanup(acquisition, previousCleanup),
+    };
+    throw new ProviderInitializationCleanupError(
+      cleanup,
+      operationFailure
+        ? operationError
+        : new Error("OpenCode operation completed but its temporary server could not be released"),
+      cleanupError,
+    );
+  }
+}
+
+async function retryOpenCodeAcquisitionCleanup(
+  acquisition: Pick<OpenCodeServerAcquisition, "release">,
+  previousCleanup: { close(): Promise<void> } | undefined,
+): Promise<void> {
+  // Import/resume may already have an unresolved owner. Releasing this
+  // temporary acquisition must not replace that owner's cleanup handle.
+  const results = await Promise.allSettled([
+    acquisition.release(),
+    ...(previousCleanup ? [previousCleanup.close()] : []),
+  ]);
+  const errors = results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
+  if (errors.length > 0) {
+    throw new AggregateError(errors, "OpenCode cleanup failed", { cause: errors[0] });
+  }
+}
+
 export class OpenCodeAgentClient implements AgentClient {
   readonly provider = "opencode" as const;
   readonly capabilities: AgentCapabilityFlags;
@@ -1460,6 +1556,14 @@ export class OpenCodeAgentClient implements AgentClient {
       openCodeConfig.toolPolicy,
     );
 
+    let unbindBridge: (() => void) | undefined;
+    const cleanup = {
+      close: async () => {
+        await connection.release();
+        unbindBridge?.();
+        unbindBridge = undefined;
+      },
+    };
     try {
       // Creating the first session for a directory is part of OpenCode coming up, so it
       // shares the server startup budget instead of a shorter one that fails agent
@@ -1485,7 +1589,7 @@ export class OpenCodeAgentClient implements AgentClient {
       }
 
       await this.populateModelContextWindowCache(client, openCodeConfig.cwd);
-      const unbindBridge = this.bindBridgeSession(session.id, launchContext);
+      unbindBridge = this.bindBridgeSession(session.id, launchContext);
 
       return new OpenCodeAgentSession(
         openCodeConfig,
@@ -1503,7 +1607,11 @@ export class OpenCodeAgentClient implements AgentClient {
         connectServer,
       );
     } catch (error) {
-      await connection.release();
+      try {
+        await cleanup.close();
+      } catch (cleanupError) {
+        throw new ProviderInitializationCleanupError(cleanup, error, cleanupError);
+      }
       throw error;
     }
   }
@@ -1536,10 +1644,18 @@ export class OpenCodeAgentClient implements AgentClient {
       : await connectServer();
     const { client } = connection;
 
+    let unbindBridge: (() => void) | undefined;
+    const cleanup = {
+      close: async () => {
+        await connection.release();
+        unbindBridge?.();
+        unbindBridge = undefined;
+      },
+    };
     try {
       await this.applySessionPermissionRules(client, openCodeConfig, handle.sessionId);
       await this.populateModelContextWindowCache(client, openCodeConfig.cwd);
-      const unbindBridge = this.bindBridgeSession(handle.sessionId, launchContext);
+      unbindBridge = this.bindBridgeSession(handle.sessionId, launchContext);
 
       return new OpenCodeAgentSession(
         openCodeConfig,
@@ -1557,7 +1673,11 @@ export class OpenCodeAgentClient implements AgentClient {
         connectServer,
       );
     } catch (error) {
-      await connection.release();
+      try {
+        await cleanup.close();
+      } catch (cleanupError) {
+        throw new ProviderInitializationCleanupError(cleanup, error, cleanupError);
+      }
       throw error;
     }
   }
@@ -1627,16 +1747,20 @@ export class OpenCodeAgentClient implements AgentClient {
     options: FetchCatalogOptions,
     context?: ProviderRefreshContext,
   ): Promise<ProviderCatalog> {
-    let acquisition: OpenCodeServerAcquisition | undefined;
+    let ownership: ReturnType<typeof ownTemporaryOpenCodeServer> | undefined;
+    let operationFailure: { error: unknown } | undefined;
     try {
       await runProviderRefreshActivity(context, "server.acquire", async () => {
-        acquisition = options.force
-          ? await this.serverManager.acquireNew(context?.signal)
-          : await this.serverManager.acquireCurrent(context?.signal);
+        context?.signal.throwIfAborted();
+        ownership = ownTemporaryOpenCodeServer(
+          options.force ? this.serverManager.acquireNew() : this.serverManager.acquireCurrent(),
+          context?.probe,
+        );
+        return await ownership.get();
       });
-      if (!acquisition) throw new Error("OpenCode server acquisition did not complete");
+      if (!ownership) throw new Error("OpenCode server acquisition did not complete");
       context?.signal.throwIfAborted();
-      const { url } = acquisition.server;
+      const { url } = (await ownership.get()).server;
       const catalogDirectory = openCodeCatalogDirectory(options, this.resolveHomeDir);
       const { directory } = catalogDirectory;
 
@@ -1654,25 +1778,31 @@ export class OpenCodeAgentClient implements AgentClient {
         this.fetchModesFromClient(client, directory, context),
       ]);
       return { models, modes };
+    } catch (error) {
+      operationFailure = { error };
+      throw error;
     } finally {
-      await acquisition?.release();
+      await ownership?.release(operationFailure);
     }
   }
 
-  async listCommands(config: AgentSessionConfig): Promise<AgentSlashCommand[]> {
+  async listCommands(
+    config: AgentSessionConfig,
+    context?: AgentProbeContext,
+  ): Promise<AgentSlashCommand[]> {
     const openCodeConfig = this.assertConfig(config);
-    const acquisition = await this.serverManager.acquireCurrent();
-    const { url } = acquisition.server;
-    const client = this.createOpenCodeClient({
-      baseUrl: url,
-      directory: openCodeConfig.cwd,
-    });
-
-    try {
-      return await listOpenCodeCommandsFromSdk(client, openCodeConfig.cwd);
-    } finally {
-      await acquisition.release();
-    }
+    context?.signal.throwIfAborted();
+    return withTemporaryOpenCodeServer(
+      this.serverManager.acquireCurrent(),
+      async (acquisition) => {
+        const client = this.createOpenCodeClient({
+          baseUrl: acquisition.server.url,
+          directory: openCodeConfig.cwd,
+        });
+        return await listOpenCodeCommandsFromSdk(client, openCodeConfig.cwd, context?.signal);
+      },
+      context,
+    );
   }
 
   async listFeatures(config: AgentSessionConfig): Promise<AgentFeature[]> {
@@ -1681,30 +1811,29 @@ export class OpenCodeAgentClient implements AgentClient {
 
   async listImportableSessions(
     options?: ListImportableSessionsOptions,
+    probe?: AgentProbeContext,
   ): Promise<ImportableProviderSession[]> {
-    const acquisition = await this.serverManager.acquireCurrent();
-    const { url } = acquisition.server;
-    const client = this.createOpenCodeClient({
-      baseUrl: url,
-      directory: options?.cwd ?? "",
-    });
-
-    try {
-      return await collectOpenCodeImportableSessionsFromSdk(client, options);
-    } finally {
-      await acquisition.release();
-    }
+    probe?.signal.throwIfAborted();
+    return withTemporaryOpenCodeServer(
+      this.serverManager.acquireCurrent(),
+      async (acquisition) => {
+        const client = this.createOpenCodeClient({
+          baseUrl: acquisition.server.url,
+          directory: options?.cwd ?? "",
+        });
+        return await collectOpenCodeImportableSessionsFromSdk(client, options, probe?.signal);
+      },
+      probe,
+    );
   }
 
   async importSession(input: ImportProviderSessionInput, context: ImportProviderSessionContext) {
     const acquisition = await this.serverManager.acquireCurrent();
-    const { url } = acquisition.server;
-    const client = this.createOpenCodeClient({
-      baseUrl: url,
-      directory: input.cwd,
-    });
-
-    try {
+    return withTemporaryOpenCodeServer(acquisition, async () => {
+      const client = this.createOpenCodeClient({
+        baseUrl: acquisition.server.url,
+        directory: input.cwd,
+      });
       const sessionResponse = await client.session.get({
         sessionID: input.providerHandleId,
         directory: input.cwd,
@@ -1727,9 +1856,7 @@ export class OpenCodeAgentClient implements AgentClient {
           ...(model ? { model } : {}),
         },
       });
-    } finally {
-      await acquisition.release();
-    }
+    });
   }
 
   async archiveNativeSession(handle: AgentPersistenceHandle): Promise<void> {
@@ -1749,20 +1876,21 @@ export class OpenCodeAgentClient implements AgentClient {
     if (!metadata.cwd) {
       throw new Error("OpenCode native archive update requires the original working directory");
     }
+    const directory = metadata.cwd;
 
     const registeredServerUrl = getOpenCodeChildSessionServerUrl(handle.sessionId);
     const acquisition =
       (registeredServerUrl ? this.serverManager.acquireExisting(registeredServerUrl) : null) ??
       (await this.serverManager.acquireCurrent());
-    const client = this.createOpenCodeClient({
-      baseUrl: acquisition.server.url,
-      directory: metadata.cwd,
-    });
-    try {
+    await withTemporaryOpenCodeServer(acquisition, async () => {
+      const client = this.createOpenCodeClient({
+        baseUrl: acquisition.server.url,
+        directory,
+      });
       const response = readOpenCodeRecord(
         await client.session.update({
           sessionID: handle.sessionId,
-          directory: metadata.cwd,
+          directory,
           time: { archived: archivedAt },
         }),
       );
@@ -1771,9 +1899,7 @@ export class OpenCodeAgentClient implements AgentClient {
           `Failed to ${archivedAt === 0 ? "unarchive" : "archive"} OpenCode session: ${toDiagnosticErrorMessage(response.error)}`,
         );
       }
-    } finally {
-      await acquisition.release();
-    }
+    });
   }
 
   async isAvailable(): Promise<boolean> {
@@ -1789,13 +1915,15 @@ export class OpenCodeAgentClient implements AgentClient {
     await this.serverManager.shutdown();
   }
 
-  async getDiagnostic(): Promise<{ diagnostic: string }> {
+  async getDiagnostic(probe?: AgentProbeContext): Promise<{ diagnostic: string }> {
+    probe?.signal.throwIfAborted();
     try {
       const launch = await resolveProviderLaunch({
         commandConfig: this.runtimeSettings?.command,
         defaultBinary: "opencode",
       });
       const availability = await checkProviderLaunchAvailable(launch);
+      probe?.signal.throwIfAborted();
 
       let authValue = "Not checked";
       const authCommand = availability.available
@@ -1809,11 +1937,15 @@ export class OpenCodeAgentClient implements AgentClient {
             {
               ...createProviderEnvSpec(),
               timeout: 5_000,
+              signal: probe?.signal,
+              probe,
             },
           );
           const text = (stdout.trim() || stderr.trim()).trim();
           authValue = text ? `\n    ${text.replace(/\n/g, "\n    ")}` : "(empty)";
         } catch (error) {
+          if (error instanceof ProviderInitializationCleanupError || probe?.signal.aborted)
+            throw error;
           authValue = `Error - ${toDiagnosticErrorMessage(error)}`;
         }
       }
@@ -1822,12 +1954,14 @@ export class OpenCodeAgentClient implements AgentClient {
         diagnostic: formatProviderDiagnostic("OpenCode", [
           ...(await buildCommandResolutionDiagnosticRows(launch, {
             knownBinaryNames: ["opencode"],
+            probe,
           })),
-          ...(await buildBinaryDiagnosticRows(launch, availability)),
+          ...(await buildBinaryDiagnosticRows(launch, availability, { probe })),
           { label: "Auth", value: authValue },
         ]),
       };
     } catch (error) {
+      if (error instanceof ProviderInitializationCleanupError || probe?.signal.aborted) throw error;
       return {
         diagnostic: formatProviderDiagnosticError("OpenCode", error),
       };
@@ -2051,8 +2185,9 @@ function stringifyStructuredAssistantMessage(value: unknown): string | null {
 async function listOpenCodeCommandsFromSdk(
   client: Pick<OpencodeClient, "command">,
   directory: string,
+  signal?: AbortSignal,
 ): Promise<AgentSlashCommand[]> {
-  const result = await client.command.list({ directory });
+  const result = await client.command.list({ directory }, signal ? { signal } : undefined);
   const commandsByName = new Map(
     OPENCODE_HANDLED_BUILTIN_SLASH_COMMANDS.map((command) => [command.name, command]),
   );
@@ -3408,7 +3543,7 @@ class OpenCodeAgentSession implements AgentSession {
    * run, and a rejection means we never proved the runner stopped.
    */
   private abortSettlement: Promise<void> = Promise.resolve();
-  private externalStatusReconciliationStarted = false;
+  private externalStatusReconciliation: Promise<void> | null = null;
   private runnerStatusRevision = 0;
   private readonly runningToolCalls = new Map<string, ToolCallTimelineItem>();
   private subAgentsByCallId = new Map<string, OpenCodeSubAgentActivityState>();
@@ -3435,6 +3570,12 @@ class OpenCodeAgentSession implements AgentSession {
   private recoveryAbortController = new AbortController();
   private unsubscribeEvents: (() => void) | null = null;
   private closed = false;
+  private cancellationGeneration = 0;
+  private interruptionBarrier: Promise<void> | null = null;
+  private dispatchSettlement: Promise<void> = Promise.resolve();
+  private outputClosed = false;
+  private closePromise: Promise<void> | null = null;
+  private closeIngressError: unknown = null;
   private readonly persistSession: boolean;
   private deletedFromProvider = false;
   constructor(
@@ -3479,12 +3620,13 @@ class OpenCodeAgentSession implements AgentSession {
   private subscribeServerEvents(): void {
     this.unsubscribeEvents = this.events.subscribe((input) => {
       if ("type" in input && input.type === "server-exited") {
-        this.recoveryAbortController.abort(input.error);
         this.serverExited = true;
+        this.recoveryAbortController.abort(input.error);
       }
       this.ingress = this.ingress
         .then(() => this.consumeEventSourceInput(input))
         .catch((error) => {
+          if (this.closed) this.closeIngressError = error;
           this.logger.warn(
             { err: error, sessionId: this.sessionId },
             "OpenCode event ingress failed",
@@ -3600,34 +3742,40 @@ class OpenCodeAgentSession implements AgentSession {
     });
   }
 
-  async interrupt(): Promise<void> {
-    const turnId = this.activeForegroundTurnId;
+  interrupt(): Promise<void> {
+    ++this.cancellationGeneration;
     this.abortController?.abort();
-    const abort = this.issueStop(turnId);
-    // COMPAT(opencodeSlowAbort): OpenCode 1.14.42+ blocks session.abort until
-    // the running tool actually stops, which can be tens of seconds for
-    // long-running tools. Cap the wait so the user-visible cancel lands
-    // quickly while still giving OpenCode a chance to confirm the abort
-    // cleanly. Drop the timeout once upstream returns abort acknowledgement
-    // before tool teardown.
-    const settledAbort = abort.then(
-      () => undefined,
-      (error: unknown) => error,
-    );
-    // Only the cap is tolerated. A settled failure means the runner may still be
-    // going, and the caller must hear about it.
-    const abortFailure = await withTimeout(settledAbort, 2_000, "OpenCode session.abort").catch(
-      (error) => {
-        this.logger.warn(
-          { err: error, sessionId: this.sessionId, turnId },
-          "OpenCode session.abort did not settle within the cancel cap",
-        );
+    const dispatch = this.dispatchSettlement;
+    const previous = this.interruptionBarrier;
+    const attempt = (async () => {
+      // A request already written to the SDK must reach its dispatch boundary
+      // before the session-wide abort; otherwise it could arrive after abort.
+      await dispatch;
+      const turnId = this.activeForegroundTurnId;
+      const abort = this.issueStop(turnId);
+      await abort;
+      await this.waitUntilProviderIdle();
+      await this.ingress;
+    })();
+    const barrier = Promise.all([previous?.catch(() => undefined), attempt]).then(() => undefined);
+    this.interruptionBarrier = barrier;
+    void barrier.then(
+      () => {
+        if (this.interruptionBarrier === barrier) this.interruptionBarrier = null;
+        return undefined;
+      },
+      () => {
+        if (this.interruptionBarrier === barrier) this.interruptionBarrier = null;
         return undefined;
       },
     );
-    if (abortFailure !== undefined) {
-      throw abortFailure;
-    }
+    // Timeout is uncertainty, never an acknowledgement. Keep the actual barrier
+    // installed until the outstanding dispatch/abort settles, including retries.
+    return withTimeout(
+      barrier,
+      OPENCODE_PENDING_ABORT_START_TIMEOUT_MS,
+      "OpenCode interrupt completion",
+    );
   }
 
   async steerActiveTurn(
@@ -3809,11 +3957,10 @@ class OpenCodeAgentSession implements AgentSession {
     }
   }
 
-  private async readProviderRunnerStatus(): Promise<OpenCodeRunnerStatus> {
-    const response = await this.client.session.status(
-      { directory: this.config.cwd },
-      { signal: this.recoveryAbortController.signal },
-    );
+  private async readProviderRunnerStatus(
+    signal = this.recoveryAbortController.signal,
+  ): Promise<OpenCodeRunnerStatus> {
+    const response = await this.client.session.status({ directory: this.config.cwd }, { signal });
     if (response.error) {
       throw new Error(
         `Failed to confirm OpenCode session status: ${toDiagnosticErrorMessage(response.error)}`,
@@ -3846,14 +3993,19 @@ class OpenCodeAgentSession implements AgentSession {
       throw new Error("A foreground turn is already active");
     }
     await this.reconnectIfServerExited();
+    const generation = this.cancellationGeneration;
+    const assertStartCurrent = () => {
+      if (this.closed || generation !== this.cancellationGeneration) {
+        throw new Error("OpenCode turn canceled before dispatch");
+      }
+    };
     try {
+      await this.interruptionBarrier;
       await this.awaitRunnerQuiescence();
     } catch (error) {
       this.rethrowRunnerWaitError(error);
     }
-    if (this.closed) {
-      throw new Error("OpenCode session is closed");
-    }
+    assertStartCurrent();
     if (this.turnState.status !== "idle") {
       throw new Error("OpenCode is still stopping the previous turn");
     }
@@ -3864,6 +4016,7 @@ class OpenCodeAgentSession implements AgentSession {
     const turnAbortController = new AbortController();
     this.abortController = turnAbortController;
     await this.ensureMcpServersConfigured();
+    assertStartCurrent();
     const contextWindowMaxTokens = this.resolveSelectedModelContextWindowMaxTokens();
     this.accumulatedUsage = contextWindowMaxTokens !== undefined ? { contextWindowMaxTokens } : {};
 
@@ -3877,6 +4030,7 @@ class OpenCodeAgentSession implements AgentSession {
     const effectiveMode = resolveOpenCodeRuntimeAgentId(this.currentMode);
 
     await this.awaitEventStreamReady(turnAbortController);
+    assertStartCurrent();
 
     const turnId = this.createTurnId();
     this.materializedParts.clear();
@@ -3884,11 +4038,12 @@ class OpenCodeAgentSession implements AgentSession {
     this.notifySubscribers({ type: "turn_started", provider: "opencode" }, turnId);
 
     const slashCommand = await this.resolveSlashCommandInvocation(prompt);
+    assertStartCurrent();
     if (slashCommand) {
       if (slashCommand.commandName === "compact" || slashCommand.commandName === "summarize") {
         this.activeDispatchMessageId = null;
         this.suppressAssistantMessagesUntilIdle.active = true;
-        void this.client.session
+        this.dispatchSettlement = this.client.session
           .summarize({
             sessionID: this.sessionId,
             directory: this.config.cwd,
@@ -3925,7 +4080,7 @@ class OpenCodeAgentSession implements AgentSession {
       // command() is only dispatch acknowledgement. OpenCode session events are
       // the source of truth for when the command turn becomes idle or fails.
       this.activeDispatchMessageId = createOpenCodeMessageId();
-      void this.client.session
+      this.dispatchSettlement = this.client.session
         .command({
           sessionID: this.sessionId,
           directory: this.config.cwd,
@@ -3980,7 +4135,7 @@ class OpenCodeAgentSession implements AgentSession {
       // Wrap in an async IIFE so a synchronous throw from promptAsync (e.g.
       // SDK input validation) is caught alongside async rejections. A plain
       // `.then().catch()` chain would let a sync throw escape unhandled.
-      void (async () => {
+      this.dispatchSettlement = (async () => {
         this.traceOpenCode("provider.opencode.prompt_async.start", {
           turnId,
           sessionId: this.sessionId,
@@ -4077,20 +4232,24 @@ class OpenCodeAgentSession implements AgentSession {
     throw error;
   }
   subscribe(callback: (event: AgentStreamEvent) => void): () => void {
+    if (this.outputClosed) return () => undefined;
     this.subscribers.add(callback);
-    this.startExternalStatusReconciliation();
-    this.startChildSessionHydration();
+    if (!this.closed) {
+      this.startExternalStatusReconciliation();
+      this.startChildSessionHydration();
+    }
     return () => {
       this.subscribers.delete(callback);
     };
   }
 
   private startExternalStatusReconciliation(): void {
-    if (!this.externallyDriven || this.externalStatusReconciliationStarted || this.closed) {
+    if (!this.externallyDriven || this.externalStatusReconciliation || this.closed) {
       return;
     }
-    this.externalStatusReconciliationStarted = true;
-    void this.reconcileExternalRunnerStatus().catch((error) => {
+    const reconciliation = this.reconcileExternalRunnerStatus();
+    this.externalStatusReconciliation = reconciliation;
+    void reconciliation.catch((error) => {
       this.logger.warn(
         { err: error, sessionId: this.sessionId },
         "Failed to reconcile externally driven OpenCode session status",
@@ -4841,7 +5000,7 @@ class OpenCodeAgentSession implements AgentSession {
   }
 
   private notifySubscribers(event: AgentStreamEvent, turnIdOverride?: string | null): void {
-    if (this.closed) {
+    if (this.outputClosed) {
       return;
     }
     if (event.type === "provider_subagent" && event.event.type === "upsert" && event.event.status) {
@@ -5032,28 +5191,86 @@ class OpenCodeAgentSession implements AgentSession {
     };
   }
 
-  async close(): Promise<void> {
-    try {
-      this.closed = true;
-      this.abortController?.abort();
-      this.recoveryAbortController.abort();
-      this.unsubscribeEvents?.();
-      this.unsubscribeEvents = null;
-      await this.ingress.catch(() => undefined);
-      this.subscribers.clear();
-      await abortOpenCodeSession({
-        client: this.client,
-        sessionId: this.sessionId,
-        directory: this.config.cwd,
-        logger: this.logger,
+  close(): Promise<void> {
+    if (!this.closePromise) {
+      const attempt = this.closeSession();
+      this.closePromise = attempt;
+      void attempt.catch(() => {
+        if (this.closePromise === attempt) this.closePromise = null;
       });
-      await this.deleteProviderSessionIfEphemeral();
-      this.turnState = { status: "idle" };
-    } finally {
-      this.releaseBridge?.();
-      this.releaseBridge = null;
-      await this.server.release();
     }
+    return this.closePromise;
+  }
+
+  private async closeSession(): Promise<void> {
+    this.closed = true;
+    ++this.cancellationGeneration;
+    this.abortController?.abort();
+    // Cancel owned snapshot/probe requests so ingress can finish. The shared
+    // event subscription remains live until stop and output drain are proven.
+    this.recoveryAbortController.abort();
+    // Closing command admission is separate from closing output. Both the
+    // event subscription and its turn attribution survive until stop is proven.
+    if (!this.serverExited) {
+      const stopAbort = new AbortController();
+      try {
+        await withTimeout(
+          (async () => {
+            await this.dispatchSettlement;
+            await abortOpenCodeSession({
+              client: this.client,
+              sessionId: this.sessionId,
+              directory: this.config.cwd,
+            });
+            while (
+              !this.serverExited &&
+              (await this.readProviderRunnerStatus(stopAbort.signal)) !== "idle"
+            ) {
+              await waitForOpenCodeStopProbe(100, stopAbort.signal);
+            }
+          })(),
+          OPENCODE_PENDING_ABORT_START_TIMEOUT_MS,
+          "OpenCode session close",
+        );
+      } finally {
+        stopAbort.abort();
+      }
+    }
+    await withTimeout(
+      this.ingress,
+      OPENCODE_PENDING_ABORT_START_TIMEOUT_MS,
+      "OpenCode output drain",
+    );
+    if (this.closeIngressError !== null) throw this.closeIngressError;
+    await this.deleteProviderSessionIfEphemeral();
+    // A final acquisition release can still fail to kill the owned server.
+    // Preserve output and bridge ownership through that attempt and any retry.
+    await this.server.release();
+    // Native stop and acquisition release are now certified. Close ingress
+    // synchronously before capturing its final tail: another event must not
+    // append work while that tail is being drained and then lose its output.
+    this.unsubscribeEvents?.();
+    this.unsubscribeEvents = null;
+    await withTimeout(
+      this.ingress,
+      OPENCODE_PENDING_ABORT_START_TIMEOUT_MS,
+      "OpenCode final output drain",
+    );
+    if (this.closeIngressError !== null) throw this.closeIngressError;
+    // Subscription-started snapshots and status reads can publish independently
+    // of ingress. Their abort was requested above; join their settlement rather
+    // than clearing subscribers while accepted results can still arrive.
+    await withTimeout(
+      Promise.allSettled([this.childHydrationPromise, this.externalStatusReconciliation]),
+      OPENCODE_PENDING_ABORT_START_TIMEOUT_MS,
+      "OpenCode snapshot output drain",
+    );
+    this.recoveryAbortController.abort();
+    this.outputClosed = true;
+    this.subscribers.clear();
+    this.turnState = { status: "idle" };
+    this.releaseBridge?.();
+    this.releaseBridge = null;
   }
 
   private async deleteProviderSessionIfEphemeral(): Promise<void> {

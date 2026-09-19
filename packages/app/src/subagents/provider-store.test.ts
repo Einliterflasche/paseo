@@ -1,14 +1,14 @@
-import { DaemonConnectionError } from "@getpaseo/client/internal/daemon-client";
+import type { ProviderSubagentTimelinePayload } from "@getpaseo/client/internal/daemon-client";
 import { afterEach, describe, expect, test } from "vitest";
-import {
-  observeProviderSubagentTimeline,
-  providerSubagentKey,
-  useProviderSubagentStore,
-} from "./provider-store";
+import { providerSubagentKey, useProviderSubagentStore } from "./provider-store";
 
 const SERVER_ID = "server-1";
 const PARENT_ID = "parent-1";
 const SUBAGENT_ID = "child-1";
+
+function replaceTimeline(serverId: string, payload: ProviderSubagentTimelinePayload): boolean {
+  return useProviderSubagentStore.getState().replaceTimeline(serverId, payload);
+}
 
 afterEach(() => {
   useProviderSubagentStore.setState({
@@ -45,8 +45,7 @@ describe("provider subagent client store", () => {
       timestamp: "2026-07-12T10:00:02.000Z",
       item: { type: "assistant_message", text: "New live output." },
     });
-    subagents.replaceTimeline(SERVER_ID, {
-      projection: "projected",
+    replaceTimeline(SERVER_ID, {
       requestId: "history-1",
       parentAgentId: PARENT_ID,
       subagentId: SUBAGENT_ID,
@@ -90,6 +89,28 @@ describe("provider subagent client store", () => {
         .getState()
         .timelines.get(providerSubagentKey(SERVER_ID, PARENT_ID, SUBAGENT_ID)),
     ).toBe(liveTimeline);
+    replaceTimeline(SERVER_ID, {
+      requestId: "history-catch-up",
+      parentAgentId: PARENT_ID,
+      subagentId: SUBAGENT_ID,
+      provider: "codex",
+      direction: "after",
+      epoch: "epoch-1",
+      reset: false,
+      staleCursor: false,
+      gap: false,
+      window: { minSeq: 1, maxSeq: 2, nextSeq: 3 },
+      hasOlder: true,
+      hasNewer: false,
+      rows: [
+        {
+          seq: 2,
+          timestamp: "2026-07-12T10:00:02.000Z",
+          item: { type: "assistant_message", text: "New live output." },
+        },
+      ],
+      error: null,
+    });
     subagents.applyUpdate(SERVER_ID, {
       kind: "upsert",
       subagent: {
@@ -329,9 +350,7 @@ describe("provider subagent client store", () => {
   });
 
   test("merges bounded older pages and tracks whether more history remains", () => {
-    const store = useProviderSubagentStore.getState();
-    store.replaceTimeline(SERVER_ID, {
-      projection: "projected",
+    replaceTimeline(SERVER_ID, {
       requestId: "tail-page",
       parentAgentId: PARENT_ID,
       subagentId: SUBAGENT_ID,
@@ -353,8 +372,7 @@ describe("provider subagent client store", () => {
       ],
       error: null,
     });
-    store.replaceTimeline(SERVER_ID, {
-      projection: "projected",
+    replaceTimeline(SERVER_ID, {
       requestId: "older-page",
       parentAgentId: PARENT_ID,
       subagentId: SUBAGENT_ID,
@@ -389,8 +407,7 @@ describe("provider subagent client store", () => {
 
   test("ignores delayed live updates from a stale timeline epoch", () => {
     const store = useProviderSubagentStore.getState();
-    store.replaceTimeline(SERVER_ID, {
-      projection: "projected",
+    replaceTimeline(SERVER_ID, {
       requestId: "current-page",
       parentAgentId: PARENT_ID,
       subagentId: SUBAGENT_ID,
@@ -427,7 +444,7 @@ describe("provider subagent client store", () => {
     const timeline = useProviderSubagentStore
       .getState()
       .timelines.get(providerSubagentKey(SERVER_ID, PARENT_ID, SUBAGENT_ID));
-    expect(timeline?.epoch).toBe("epoch-current");
+    expect(timeline?.cursor?.epoch).toBe("epoch-current");
     expect(timeline?.cursor).toMatchObject({ startSeq: 2, endSeq: 2 });
     expect([...(timeline?.tail ?? []), ...(timeline?.head ?? [])]).toEqual([
       expect.objectContaining({ kind: "assistant_message", text: "Current output." }),
@@ -435,9 +452,7 @@ describe("provider subagent client store", () => {
   });
 
   test("replaces cached rows with an authoritative tail page after a reconnect gap", () => {
-    const store = useProviderSubagentStore.getState();
-    store.replaceTimeline(SERVER_ID, {
-      projection: "projected",
+    replaceTimeline(SERVER_ID, {
       requestId: "old-tail",
       parentAgentId: PARENT_ID,
       subagentId: SUBAGENT_ID,
@@ -459,8 +474,7 @@ describe("provider subagent client store", () => {
       ],
       error: null,
     });
-    store.replaceTimeline(SERVER_ID, {
-      projection: "projected",
+    replaceTimeline(SERVER_ID, {
       requestId: "reconnect-tail",
       parentAgentId: PARENT_ID,
       subagentId: SUBAGENT_ID,
@@ -576,95 +590,7 @@ describe("projected child history", () => {
     page("AB", 1, 2);
     page("ABC", 1, 3);
     expect(text()).toBe("ABC");
-    expect(current().needsRefresh).toBe(false);
-  });
-  test("recovers a live sequence gap while observed and stops fetching when closed", async () => {
-    let calls = 0;
-    const client = {
-      async fetchProviderSubagentTimeline() {
-        calls++;
-        return calls === 1 ? response("A", 1, 1) : response("ABC", 1, 3);
-      },
-    };
-    const errors: unknown[] = [];
-    const stop = observeProviderSubagentTimeline({
-      client,
-      serverId: SERVER_ID,
-      parentAgentId: PARENT_ID,
-      subagentId: SUBAGENT_ID,
-      limit: 100,
-      reportError: (error) => {
-        errors.push(error);
-      },
-    });
-    try {
-      await expect.poll(() => current()?.cursor?.endSeq).toBe(1);
-      stream(3, "C");
-      await expect.poll(text).toBe("ABC");
-      expect(calls).toBe(2);
-      expect(current().needsRefresh).toBe(false);
-    } finally {
-      stop();
-    }
-    stream(5, "E");
-    await Promise.resolve();
-    expect(calls).toBe(2);
-    expect(errors).toEqual([]);
-  });
-  test("retries a disconnected history read on the next stream update", async () => {
-    let calls = 0;
-    const errors: unknown[] = [];
-    const stop = observeProviderSubagentTimeline({
-      client: {
-        async fetchProviderSubagentTimeline() {
-          calls++;
-          if (calls === 2) throw new DaemonConnectionError("Connection lost");
-          return calls === 1 ? response("A", 1, 1) : response("ABCD", 1, 4);
-        },
-      },
-      serverId: SERVER_ID,
-      parentAgentId: PARENT_ID,
-      subagentId: SUBAGENT_ID,
-      limit: 100,
-      reportError: (error) => {
-        errors.push(error);
-      },
-    });
-    try {
-      await expect.poll(() => current()?.cursor?.endSeq).toBe(1);
-      stream(3, "C");
-      await expect.poll(() => calls).toBe(2);
-      expect(current().needsRefresh).toBe(true);
-      stream(4, "D");
-      await expect.poll(text).toBe("ABCD");
-      expect(current().needsRefresh).toBe(false);
-      expect(errors).toEqual([]);
-    } finally {
-      stop();
-    }
-  });
-  test("reports unexpected child history failures", async () => {
-    const failure = new TypeError("Invalid child timeline response");
-    const errors: unknown[] = [];
-    const stop = observeProviderSubagentTimeline({
-      client: {
-        async fetchProviderSubagentTimeline() {
-          throw failure;
-        },
-      },
-      serverId: SERVER_ID,
-      parentAgentId: PARENT_ID,
-      subagentId: SUBAGENT_ID,
-      limit: 100,
-      reportError: (error) => {
-        errors.push(error);
-      },
-    });
-    try {
-      await expect.poll(() => errors).toEqual([failure]);
-    } finally {
-      stop();
-    }
+    expect(current().hasAuthoritativeBaseline).toBe(true);
   });
   test("keeps a completed tool at its original position after fetching its latest update", () => {
     const payload = response("Answer", 1, 5);
@@ -724,6 +650,119 @@ describe("projected child history", () => {
     }
     expect([...current().tail, ...current().head]).toHaveLength(1);
     expect(JSON.stringify(current()).length).toBeLessThan(1_000_000);
-    expect(current().lastSeq).toBe(2000);
+    // Provisional live paint cannot claim a history cursor before a snapshot.
+    expect(current().cursor).toBeUndefined();
+    expect(current().hasAuthoritativeBaseline).toBe(false);
+    expect([...current().tail, ...current().head][0]).toMatchObject({
+      kind: "tool_call",
+      payload: { data: { detail: { log: "x".repeat(2000 * 128) } } },
+    });
+  });
+});
+
+test("cumulative child tool updates retain one projected card rather than historical wire rows", () => {
+  const store = useProviderSubagentStore.getState();
+  const log = (version: number) => "line\n".repeat(version);
+  replaceTimeline(SERVER_ID, {
+    requestId: "initial",
+    parentAgentId: PARENT_ID,
+    subagentId: SUBAGENT_ID,
+    provider: "codex",
+    direction: "tail",
+    epoch: "epoch",
+    reset: false,
+    staleCursor: false,
+    gap: false,
+    window: { minSeq: 1, maxSeq: 1, nextSeq: 2 },
+    hasOlder: false,
+    hasNewer: false,
+    error: null,
+    rows: [
+      {
+        seq: 1,
+        timestamp: "2026-09-19T00:00:00.000Z",
+        item: {
+          type: "tool_call",
+          callId: "child-tool",
+          name: "Task",
+          status: "running",
+          error: null,
+          detail: { type: "sub_agent", log: log(1) },
+        },
+      },
+    ],
+  });
+  for (let seq = 2; seq <= 400; seq++) {
+    store.applyUpdate(SERVER_ID, {
+      kind: "timeline",
+      parentAgentId: PARENT_ID,
+      subagentId: SUBAGENT_ID,
+      provider: "codex",
+      epoch: "epoch",
+      seq,
+      timestamp: "2026-09-19T00:00:00.000Z",
+      item: {
+        type: "tool_call",
+        callId: "child-tool",
+        name: "Task",
+        status: seq === 400 ? "completed" : "running",
+        error: null,
+        detail: { type: "sub_agent", log: log(seq) },
+      },
+    });
+  }
+  const current = useProviderSubagentStore
+    .getState()
+    .timelines.get(providerSubagentKey(SERVER_ID, PARENT_ID, SUBAGENT_ID))!;
+  expect([...current.tail, ...current.head]).toEqual([
+    expect.objectContaining({
+      kind: "tool_call",
+      payload: expect.objectContaining({
+        data: expect.objectContaining({
+          status: "completed",
+          detail: { type: "sub_agent", log: log(400) },
+        }),
+      }),
+    }),
+  ]);
+  expect(current.cursor).toMatchObject({ startSeq: 1, endSeq: 400 });
+  expect(current).not.toHaveProperty("rows");
+});
+
+test("an empty authoritative child page is ready before the first live row", () => {
+  replaceTimeline(SERVER_ID, {
+    requestId: "empty",
+    parentAgentId: PARENT_ID,
+    subagentId: SUBAGENT_ID,
+    provider: "codex",
+    direction: "tail",
+    epoch: "empty-epoch",
+    reset: false,
+    staleCursor: false,
+    gap: false,
+    window: { minSeq: 0, maxSeq: 0, nextSeq: 1 },
+    hasOlder: false,
+    hasNewer: false,
+    error: null,
+    rows: [],
+  });
+  const key = providerSubagentKey(SERVER_ID, PARENT_ID, SUBAGENT_ID);
+  expect(useProviderSubagentStore.getState().timelines.get(key)?.hasAuthoritativeBaseline).toBe(
+    true,
+  );
+  useProviderSubagentStore.getState().applyUpdate(SERVER_ID, {
+    kind: "timeline",
+    parentAgentId: PARENT_ID,
+    subagentId: SUBAGENT_ID,
+    provider: "codex",
+    epoch: "empty-epoch",
+    seq: 1,
+    timestamp: "2026-09-19T00:00:00.000Z",
+    item: { type: "assistant_message", text: "first output" },
+  });
+  expect(useProviderSubagentStore.getState().timelines.get(key)?.cursor).toMatchObject({
+    epoch: "empty-epoch",
+    startSeq: 1,
+    endSeq: 1,
   });
 });

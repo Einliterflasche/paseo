@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { expect, test } from "vitest";
+import { base64EncryptedWireByteLength, RELAY_MAX_FRAME_BYTES } from "@getpaseo/relay";
 import { MAX_PHYSICAL_SOCKET_BUFFERED_BYTES } from "./physical-socket.js";
 import {
   createEncryptedRelaySocket,
@@ -36,6 +37,41 @@ class BlockingChannel implements EncryptedRelayChannel {
     this.resolveSend?.();
   }
 }
+
+test("JSON response capacity fits the relay frame after encryption and base64 encoding", () => {
+  const socket = createEncryptedRelaySocket({
+    channel: new BlockingChannel(),
+    emitter: new EventEmitter(),
+    getTransportBufferedAmount: () => 0,
+    terminateTransport: () => undefined,
+  });
+  const maximum = socket.getJsonResponseCapacity().maximumBytes;
+  expect(base64EncryptedWireByteLength(maximum)).toBeLessThanOrEqual(RELAY_MAX_FRAME_BYTES);
+  expect(base64EncryptedWireByteLength(maximum + 1)).toBeGreaterThan(RELAY_MAX_FRAME_BYTES);
+  expect(base64EncryptedWireByteLength(maximum)).toBeLessThanOrEqual(
+    MAX_PHYSICAL_SOCKET_BUFFERED_BYTES,
+  );
+});
+
+test("relay page capacity accounts for encoded transport backlog", () => {
+  let buffered = 60 * 1024 * 1024;
+  const socket = createEncryptedRelaySocket({
+    channel: new BlockingChannel(),
+    emitter: new EventEmitter(),
+    getTransportBufferedAmount: () => buffered,
+    terminateTransport: () => undefined,
+  });
+  const { maximumBytes, availableBytes } = socket.getJsonResponseCapacity();
+  expect(availableBytes).toBeLessThan(maximumBytes);
+  expect(base64EncryptedWireByteLength(availableBytes) + buffered).toBeLessThanOrEqual(
+    MAX_PHYSICAL_SOCKET_BUFFERED_BYTES,
+  );
+  expect(base64EncryptedWireByteLength(availableBytes + 1) + buffered).toBeGreaterThan(
+    MAX_PHYSICAL_SOCKET_BUFFERED_BYTES,
+  );
+  buffered = 0;
+  expect(socket.getJsonResponseCapacity()).toEqual({ maximumBytes, availableBytes: maximumBytes });
+});
 
 test("negotiated binary ciphertext accepts the exact hard bound and rejects one byte over", async () => {
   const channel = new BlockingChannel();

@@ -52,6 +52,10 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
     return this.liveAgents.get(agentId) ?? null;
   }
 
+  getAgentLifecycle(agentId: string): LifecycleAgentSnapshot | null {
+    return this.getAgent(agentId);
+  }
+
   hasInFlightRun(agentId: string): boolean {
     return this.inFlightAgentIds.has(agentId);
   }

@@ -5,7 +5,22 @@ import {
   MAX_PHYSICAL_SOCKET_BUFFERED_BYTES,
   sendBoundedPhysicalFrame,
   sendBoundedPhysicalFrameAndWait,
+  physicalJsonResponseCapacity,
 } from "./physical-socket.js";
+
+test("direct JSON page capacity uses current backlog and degrades to the static limit without a signal", () => {
+  expect(physicalJsonResponseCapacity({})).toEqual({
+    maximumBytes: MAX_PHYSICAL_SOCKET_BUFFERED_BYTES,
+    availableBytes: MAX_PHYSICAL_SOCKET_BUFFERED_BYTES,
+  });
+  expect(
+    physicalJsonResponseCapacity({ bufferedAmount: MAX_PHYSICAL_SOCKET_BUFFERED_BYTES - 100 }),
+  ).toEqual({ maximumBytes: MAX_PHYSICAL_SOCKET_BUFFERED_BYTES, availableBytes: 100 });
+  expect(
+    physicalJsonResponseCapacity({ bufferedAmount: MAX_PHYSICAL_SOCKET_BUFFERED_BYTES + 1 })
+      .availableBytes,
+  ).toBe(0);
+});
 
 test("sockets remain exempt until they send an application ping", () => {
   let now = 0;

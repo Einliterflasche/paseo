@@ -93,6 +93,41 @@ test("SDK creates a command terminal and sends literal input and key tokens", as
   expect((await sdk.terminals.list({ workspaceId })).entries).toEqual([]);
 });
 
+test("binary terminal input observes the same restart admission as JSON commands", async () => {
+  const workspaceId = await createWorkspace("Restart admission");
+  const terminal = await sdk.terminals.create({
+    workspaceId,
+    command: process.execPath,
+    args: [
+      "-e",
+      "process.stdin.setRawMode(true); process.stdin.resume(); console.log('READY'); process.stdin.on('data', data => console.log('HEX:' + data.toString('hex')));",
+    ],
+  });
+  const screen = async () => (await terminal.capture({ stripAnsi: true })).lines.join("\n");
+  await expect.poll(screen).toContain("READY");
+  const subscription = await client.subscribeTerminal(terminal.id);
+  expect(subscription.error).toBeNull();
+  expect(typeof subscription.slot).toBe("number");
+  client.sendTerminalInput(terminal.id, { type: "input", data: "before" });
+  await expect.poll(screen).toContain("HEX:6265666f7265");
+  await daemon.daemon.agentManager.freezeRestartAdmissions();
+  const refused = new Promise<string>((resolve) => {
+    const unsubscribe = client.on("status", (message) => {
+      if (message.payload.status === "error") {
+        unsubscribe();
+        resolve(message.payload.message ?? "");
+      }
+    });
+  });
+  client.sendTerminalInput(terminal.id, { type: "input", data: "blocked" });
+  expect(await refused).toContain("preparing or recovering a restart");
+  expect(await screen()).not.toContain("HEX:626c6f636b6564");
+  daemon.daemon.agentManager.openRestartAdmissions();
+  client.sendTerminalInput(terminal.id, { type: "input", data: "after" });
+  await expect.poll(screen).toContain("HEX:6166746572");
+  await terminal.kill();
+});
+
 test("terminal creation rejects unknown and archived owners, including explicit cwd overrides", async () => {
   const workspaceId = await createWorkspace("Archived");
   await sdk.workspaces.ref(workspaceId).archive();

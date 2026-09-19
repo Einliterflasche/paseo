@@ -1,3 +1,4 @@
+import type { AgentProbeContext } from "../../agent-sdk-types.js";
 import type {
   PiAgentMessage,
   PiModel,
@@ -27,6 +28,7 @@ export interface PiRuntimeLaunch {
 export interface PiStartSessionInput {
   cwd: string;
   signal?: AbortSignal;
+  probe?: AgentProbeContext;
   env?: Record<string, string>;
   protocolMode?: "rpc" | "rpc-ui";
   model?: string;

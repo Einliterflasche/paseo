@@ -1,5 +1,7 @@
 import type { Logger } from "pino";
 
+import type { AgentProbeContext } from "../agent-sdk-types.js";
+import { ProviderInitializationCleanupError } from "../provider-initialization-cleanup-error.js";
 import { checkProviderLaunchAvailable, resolveProviderLaunch } from "../provider-launch-config.js";
 import {
   ACPAgentClient,
@@ -77,7 +79,8 @@ export class GenericACPAgentClient extends ACPAgentClient {
     return availability.available;
   }
 
-  async getDiagnostic(): Promise<{ diagnostic: string }> {
+  async getDiagnostic(probe?: AgentProbeContext): Promise<{ diagnostic: string }> {
+    probe?.signal.throwIfAborted();
     const providerName = formatProviderName(this.label, this.providerId);
     const entries: DiagnosticEntry[] = [
       { label: "Provider ID", value: this.providerId ?? "unknown" },
@@ -90,6 +93,7 @@ export class GenericACPAgentClient extends ACPAgentClient {
       const availability = await checkProviderLaunchAvailable(launch);
       entries.push(
         ...(await buildBinaryDiagnosticRows(launch, availability, {
+          probe,
           binaryLabel: "Launcher binary",
           versionCommand: {
             command: versionProbe.command,
@@ -99,6 +103,8 @@ export class GenericACPAgentClient extends ACPAgentClient {
         })),
       );
     } catch (error) {
+      if (error instanceof ProviderInitializationCleanupError) throw error;
+      probe?.signal.throwIfAborted();
       entries.push({
         label: "Launcher binary",
         value: `error: ${toDiagnosticErrorMessage(error)}`,
@@ -110,7 +116,7 @@ export class GenericACPAgentClient extends ACPAgentClient {
         label: "Version command",
         value: formatCommand(versionProbe.command, versionProbe.args),
       },
-      ...(await this.getACPProbeRowsForDiagnostic()),
+      ...(await this.getACPProbeRowsForDiagnostic(probe)),
     );
 
     return {
@@ -125,12 +131,15 @@ export class GenericACPAgentClient extends ACPAgentClient {
     });
   }
 
-  private async getACPProbeRowsForDiagnostic() {
+  private async getACPProbeRowsForDiagnostic(probe?: AgentProbeContext) {
     try {
       return await this.buildACPProbeDiagnosticRows({
         phaseTimeoutMs: this.diagnosticPhaseTimeoutMs,
+        probe,
       });
     } catch (error) {
+      if (error instanceof ProviderInitializationCleanupError) throw error;
+      probe?.signal.throwIfAborted();
       return [
         {
           label: "ACP probe",

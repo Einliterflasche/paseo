@@ -1,19 +1,23 @@
 import { fork, type ChildProcess } from "node:child_process";
-import { mkdtemp, readFile, mkdir } from "node:fs/promises";
+import { mkdtemp, readFile, mkdir, rmdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { once } from "node:events";
 import { expect, onTestFinished, test } from "vitest";
 import { DaemonClient } from "../test-utils/daemon-client.js";
+import { createDaemonTestContext } from "../test-utils/daemon-test-context.js";
+import { projectTimelineRows } from "../agent/timeline-projection.js";
+import type { AgentTimelineRow } from "../agent/agent-timeline-store-types.js";
 
 async function launch(
   home: string,
   port?: number,
+  behavior?: string,
 ): Promise<{ child: ChildProcess; client: DaemonClient; port: number }> {
   const child = fork(
     fileURLToPath(new URL("../test-utils/checkpoint-daemon-process.ts", import.meta.url)),
-    [home, String(port ?? 0)],
+    [home, String(port ?? 0), ...(behavior ? [behavior] : [])],
     {
       execArgv: ["--import", "tsx"],
       stdio: ["ignore", "pipe", "pipe", "ipc"],
@@ -39,6 +43,7 @@ async function launch(
   });
   onTestFinished(() => client.close());
   await client.connect();
+  await client.observeEvents(["status.server_info"]).ready;
   return { child, client, port: ready.port };
 }
 
@@ -115,22 +120,39 @@ test("two real process replacements preserve the prefix and never duplicate or r
     projection: "canonical",
   });
   expect(timeline.epoch).toBe(prefix.epoch);
+  const projectedPrefix = projectTimelineRows({
+    rows: prefix.rows as AgentTimelineRow[],
+    mode: "projected",
+  });
   expect(
-    timeline.entries.slice(0, prefix.rows.length).map((row) => ({
-      seq: row.seqStart,
+    timeline.entries.slice(0, projectedPrefix.length).map((row) => ({
+      seqStart: row.seqStart,
+      seqEnd: row.seqEnd,
       item: row.item,
+      sourceSeqRanges: row.sourceSeqRanges,
       timestamp: row.timestamp,
       turnId: row.turnId,
     })),
   ).toEqual(
-    prefix.rows.map((row: { seq: number; item: unknown; timestamp: string; turnId?: string }) => ({
-      seq: row.seq,
+    projectedPrefix.map((row) => ({
+      seqStart: row.seqStart,
+      seqEnd: row.seqEnd,
       item: row.item,
+      sourceSeqRanges: row.sourceSeqRanges,
       timestamp: row.timestamp,
       turnId: row.turnId,
     })),
   );
-  expect(timeline.entries.every((row) => row.seqStart === row.seqEnd)).toBe(true);
+  const thirdCheckpoint = await third.client.prepareRestart();
+  const thirdSaved = JSON.parse(
+    await readFile(
+      join(home, "restart-checkpoints", thirdCheckpoint.generationId!, "snapshot.json"),
+      "utf8",
+    ),
+  );
+  expect(thirdSaved.agents.timelines[active.id].rows.slice(0, prefix.rows.length)).toEqual(
+    prefix.rows,
+  );
   expect(timeline.entries.filter((row) => row.item.type === "user_message")).toHaveLength(1);
   expect(JSON.stringify(timeline.entries)).not.toContain("<paseo-system>");
   expect(await dispatches(home)).toEqual(calls);
@@ -156,7 +178,99 @@ test("failed checkpoint keeps the real daemon alive and never produces a ready g
   });
   expect(timeline.entries.filter((row) => row.item.type === "user_message")).toHaveLength(1);
   expect(
-    timeline.entries.map((row) => (row.item.type === "assistant_message" ? row.item.text : "")),
+    timeline.entries
+      .map((row) => (row.item.type === "assistant_message" ? row.item.text : ""))
+      .join(""),
   ).toContain("late-close-output");
   expect(await dispatches(home)).toHaveLength(1);
 }, 30_000);
+
+test("an active restoration stops before reporting a marker failure and retries current history", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-marker-failure-"));
+  const old = await launch(home);
+  const agent = await old.client.createAgent({
+    provider: "codex",
+    cwd: home,
+    modeId: "full-access",
+  });
+  await old.client.sendAgentMessage(agent.id, "keep this input", { messageId: "marker-input" });
+  const checkpoint = await old.client.prepareRestart();
+  const generationId = checkpoint.generationId!;
+  const marker = join(home, "restart-checkpoints", generationId, "restored.json");
+  // Actual filesystem failure after resume, without replacing a persistence function.
+  await mkdir(marker);
+  const exited = once(old.child, "exit");
+  await old.client.restartServer();
+  await exited;
+  await old.client.close();
+  const next = await launch(home, old.port, "keep-resumed-active");
+  await expect
+    .poll(() => next.client.getLastServerInfoMessage()?.restartRecoveryState)
+    .toBe("paused");
+  expect(next.client.getLastServerInfoMessage()?.restartRecoveryGeneration).toBe(generationId);
+  expect(next.client.getLastServerInfoMessage()?.restartRecoveryError).toContain("restored.json");
+  const stoppedHistory = await next.client.fetchAgentTimeline(agent.id, {
+    projection: "canonical",
+    limit: 0,
+  });
+  expect(stoppedHistory.error).toBe(null);
+  const stoppedText = stoppedHistory.entries.map((entry) =>
+    entry.item.type === "assistant_message" ? entry.item.text : "",
+  );
+  expect(stoppedText.join("").match(/late-close-output/g)).toHaveLength(2);
+  expect((await dispatches(home)).filter((call) => call.resumed)).toHaveLength(1);
+  // Remove only the deliberately created empty directory blocking this isolated fixture.
+  await rmdir(marker);
+  const retried = await next.client.retryRecovery();
+  expect(retried.generationId).not.toBe(generationId);
+  expect(next.client.getLastServerInfoMessage()?.restartRecoveryState).toBe("running");
+  const after = await next.client.fetchAgentTimeline(agent.id, {
+    projection: "canonical",
+    limit: 0,
+  });
+  expect(after.entries.slice(0, stoppedHistory.entries.length)).toEqual(stoppedHistory.entries);
+  expect(
+    after.entries.filter(
+      (entry) =>
+        entry.item.type === "user_message" && entry.item.clientMessageId === "marker-input",
+    ),
+  ).toHaveLength(1);
+  expect((await dispatches(home)).filter((call) => call.resumed)).toHaveLength(2);
+  await next.client.cancelAgent(agent.id);
+});
+
+test("fork context retains the upstream changed-checkpoint guard while canonical history preserves prior tool state", async () => {
+  const ctx = await createDaemonTestContext();
+  onTestFinished(() => ctx.cleanup());
+  const agent = await ctx.client.createAgent({ provider: "codex", cwd: ctx.daemon.paseoHome });
+  const manager = ctx.daemon.daemon.agentManager;
+  const tool = {
+    type: "tool_call" as const,
+    callId: "interleaved",
+    name: "Sub-agent",
+    status: "running" as const,
+    error: null,
+    detail: { type: "sub_agent" as const, log: "BEFORE_BOUNDARY", description: "work" },
+  };
+  await manager.appendTimelineItem(agent.id, tool);
+  const boundary = await manager.appendTimelineItem(agent.id, {
+    type: "assistant_message",
+    text: "Boundary message",
+  });
+  await manager.appendTimelineItem(agent.id, {
+    ...tool,
+    status: "completed",
+    detail: { ...tool.detail, log: "AFTER_BOUNDARY_SECRET" },
+  });
+  const displayed = await ctx.client.fetchAgentTimeline(agent.id, { limit: 0 });
+  expect(JSON.stringify(displayed.entries)).toContain("AFTER_BOUNDARY_SECRET");
+  const canonical = await manager.getCanonicalTimelineRows(agent.id);
+  expect(canonical.filter((row) => row.seq <= boundary.seq).map((row) => row.item)).toContainEqual(
+    tool,
+  );
+  await expect(
+    ctx.client.buildAgentForkContext(agent.id, {
+      boundaryCursor: { epoch: boundary.epoch, seq: boundary.seq },
+    }),
+  ).rejects.toThrow("This checkpoint changed after it was created");
+}, 30000);

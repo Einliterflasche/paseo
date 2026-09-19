@@ -22,6 +22,7 @@ function connection(
       agentIds?: string[];
       events?: string[];
       subscriptionId?: string;
+      providerSubagents?: Array<{ parentAgentId: string; subagentId: string }>;
     };
   }> = [];
   let receive = (_data: unknown) => {};
@@ -1023,6 +1024,85 @@ test("subscribeFile returns its initial version without calling the change callb
     h.receive({ type: "fs.file.update", payload: { subscriptionId: "file-owner", version } });
     expect(changes).toEqual([version]);
     await file.unsubscribe();
+  } finally {
+    await h.client.close();
+  }
+});
+
+test("child transcripts route updates through their source owner and release without parent demand", async () => {
+  const h = connection();
+  try {
+    const connected = h.client.connect();
+    h.open();
+    await connected;
+    const target = { parentAgentId: "parent", subagentId: "child" };
+    const updates: unknown[] = [];
+    const owner = h.client.subscribeProviderSubagentTimeline(target, (message) =>
+      updates.push(message),
+    );
+    const request = h.sent.at(-1)!.message!;
+    const childSourceId = `server-${h.sent.length}`;
+    expect(request).toMatchObject({
+      type: "agent.timeline.set_subscription.request",
+      agentIds: [],
+      providerSubagents: [target],
+    });
+    await owner.ready;
+    const payload = {
+      kind: "timeline",
+      ...target,
+      provider: "codex",
+      epoch: "child-epoch",
+      seq: 1,
+      timestamp: "2026-09-30T00:00:00.000Z",
+      item: { type: "assistant_message", text: "child update" },
+    };
+    h.receive({ type: "agent.provider_subagents.update", payload });
+    expect(updates).toHaveLength(0);
+    h.receive({
+      type: "agent.provider_subagents.update",
+      payload: { ...payload, subscriptionId: childSourceId },
+    });
+    expect(updates).toHaveLength(1);
+    await owner.release();
+    expect(h.sent.at(-1)?.message).toMatchObject({
+      type: "subscription.release.request",
+      subscriptionId: childSourceId,
+    });
+    h.receive({
+      type: "agent.provider_subagents.update",
+      payload: { ...payload, subscriptionId: childSourceId, seq: 2 },
+    });
+    expect(updates).toHaveLength(1);
+  } finally {
+    await h.client.close();
+  }
+});
+
+test("concurrent child membership retries share one fresh owner", async () => {
+  const h = connection();
+  try {
+    const connected = h.client.connect();
+    h.open();
+    await connected;
+    const owner = h.client.subscribeProviderSubagentTimeline(
+      { parentAgentId: "parent", subagentId: "child" },
+      () => {},
+    );
+    await owner.ready;
+    const firstId = owner.subscriptionId;
+    await Promise.all([owner.refresh(), owner.refresh()]);
+    expect(owner.subscriptionId).not.toBe(firstId);
+    expect(
+      h.sent.filter((frame) => frame.message?.type === "agent.timeline.set_subscription.request"),
+    ).toHaveLength(2);
+    expect(
+      h.sent.filter((frame) => frame.message?.type === "subscription.release.request"),
+    ).toHaveLength(1);
+    await owner.release();
+    expect(
+      h.sent.filter((frame) => frame.message?.type === "subscription.release.request"),
+    ).toHaveLength(2);
   } finally {
     await h.client.close();
   }

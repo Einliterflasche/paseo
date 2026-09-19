@@ -27,6 +27,8 @@ export const CLIENT_CAPS = {
   providerSubagents: "provider_subagents",
   // COMPAT(projectedSubagentTimeline): added after v0.8.0, remove gates after 2027-03-14; retain wire capability.
   projectedSubagentTimeline: "projected_subagent_timeline",
+  // COMPAT(projectedProviderSubagents): added in v0.8.0, remove legacy child delivery after 2027-03-19.
+  projectedProviderSubagents: "projected_provider_subagents",
   // COMPAT(projectUpdates): added in v0.1.109, remove gate after 2027-01-15.
   projectUpdates: "project_updates",
   // COMPAT(compactProviderSnapshots): added in v0.2.X. Capable clients receive

@@ -196,6 +196,7 @@ async function connect(input: {
     capabilities: {
       [CLIENT_CAPS.ownedSubscriptions]: false,
       [CLIENT_CAPS.selectiveAgentTimeline]: input.selective,
+      [CLIENT_CAPS.projectedProviderSubagents]: false,
       [CLIENT_CAPS.pluginTimelineItems]: input.pluginTimelineItems ?? false,
       [CLIENT_CAPS.workspaceSetupBlocked]: input.workspaceSetupBlocked ?? false,
       ...(input.timelineNotifications === undefined

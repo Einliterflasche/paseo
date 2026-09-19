@@ -1,3 +1,4 @@
+import type { AgentProbeContext } from "../../agent-sdk-types.js";
 import type {
   OmpAgentMessage,
   OmpModel,
@@ -31,6 +32,7 @@ export interface OmpRuntimeLaunch {
 export interface OmpStartSessionInput {
   cwd: string;
   signal?: AbortSignal;
+  probe?: AgentProbeContext;
   env?: Record<string, string>;
   protocolMode?: "rpc" | "rpc-ui";
   model?: string;

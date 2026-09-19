@@ -107,6 +107,8 @@ import {
   APPLICATION_SOCKET_LEASE_CHECK_INTERVAL_MS,
   ApplicationSocketLease,
   MAX_PHYSICAL_SOCKET_BUFFERED_BYTES,
+  physicalJsonResponseCapacity,
+  type JsonResponseCapacity,
   outboundFrameByteLength,
   physicalSocketHasCapacity,
   sendBoundedPhysicalFrame,
@@ -164,6 +166,9 @@ interface WebSocketServerConfig {
     state: "running" | "preparing" | "paused" | "restoring";
     generationId?: string;
     error?: string;
+    stage?: import("./restart/restart-controller.js").RestartStage;
+    previousGenerationId?: string;
+    affectedAgentIds?: string[];
   };
 }
 
@@ -428,6 +433,7 @@ function bufferFromWsData(data: Buffer | ArrayBuffer | Buffer[] | string): Buffe
 
 export interface WebSocketLike {
   readyState: number;
+  getJsonResponseCapacity?: () => JsonResponseCapacity;
   bufferedAmount?: number;
   send: (
     data: string | Uint8Array | ArrayBuffer,
@@ -473,6 +479,7 @@ interface SocketSessionOptions {
   onBinaryMessage?: (frame: Uint8Array) => void;
   onBinaryMessageToSource?: (source: object, frame: Uint8Array) => Promise<void>;
   getTransportBufferedAmount?: (source?: object) => number | null;
+  getJsonResponseCapacity?: (source?: object) => JsonResponseCapacity;
   onLifecycleIntent?: SessionLifecycleHandler;
   hubExecutionAgents?: HubExecutionAgents;
   hubRelationships?: HubRelationshipManagement;
@@ -602,8 +609,7 @@ export class VoiceAssistantWebSocketServer {
   }
 
   broadcastRestartStatus(): void {
-    for (const [socket, connection] of this.sessions)
-      this.sendToClient(socket, this.createServerInfoMessage(connection.session));
+    this.broadcastCapabilitiesUpdate();
   }
   private readonly advertiseRelayConfig: boolean;
   private readonly directorySync = new DirectorySyncService();
@@ -1422,6 +1428,20 @@ export class VoiceAssistantWebSocketServer {
         }
         await this.sendBinaryToClientAndWait(source as WebSocketLike, frame);
       },
+      getJsonResponseCapacity: (source) => {
+        const capacity = (socket: WebSocketLike) =>
+          socket.getJsonResponseCapacity?.() ?? physicalJsonResponseCapacity(socket);
+        if (source) return capacity(source as WebSocketLike);
+        let result = physicalJsonResponseCapacity({});
+        for (const socket of connection?.sockets ?? []) {
+          const current = capacity(socket);
+          result = {
+            maximumBytes: Math.min(result.maximumBytes, current.maximumBytes),
+            availableBytes: Math.min(result.availableBytes, current.availableBytes),
+          };
+        }
+        return result;
+      },
       getTransportBufferedAmount: (source) => {
         if (!connection) {
           return null;
@@ -1439,7 +1459,19 @@ export class VoiceAssistantWebSocketServer {
         }
         return maxBuffered;
       },
-      onLifecycleIntent: (intent) => this.onLifecycleIntent?.(intent),
+      onLifecycleIntent: (intent) =>
+        this.onLifecycleIntent?.(
+          intent.type === "restart" && intent.acknowledgeCrash
+            ? {
+                ...intent,
+                acknowledgmentRequester: {
+                  principalId: admission.principalId,
+                  clientId,
+                  sessionId: session.getSessionId(),
+                },
+              }
+            : intent,
+        ),
       hubExecutionAgents: admission.hubExecutionAgents,
       hubRelationships: this.hubRelationships ?? undefined,
     });
@@ -1474,6 +1506,8 @@ export class VoiceAssistantWebSocketServer {
       onBinaryMessage: options.onBinaryMessage,
       onBinaryMessageToSource: options.onBinaryMessageToSource,
       getTransportBufferedAmount: options.getTransportBufferedAmount,
+      getServerInfo: (session) => this.buildServerInfoStatusPayload(session),
+      getJsonResponseCapacity: options.getJsonResponseCapacity,
       onLifecycleIntent: options.onLifecycleIntent,
       logger: options.connectionLogger.child({ module: "session" }),
       onWorkspaceRecovered: async (workspace) => {
@@ -1795,6 +1829,10 @@ export class VoiceAssistantWebSocketServer {
             restartRecoveryState: this.getRestartStatus().state,
             restartRecoveryGeneration: this.getRestartStatus().generationId,
             restartRecoveryError: this.getRestartStatus().error,
+            restartRecoveryStage: this.getRestartStatus().stage,
+            restartRecoveryPreviousGeneration: this.getRestartStatus().previousGenerationId,
+            restartRecoveryAffectedAgents: this.getRestartStatus().affectedAgentIds,
+            restartCheckpointFormat: 3,
           }
         : {}),
       serverId: this.serverId,
@@ -1810,7 +1848,9 @@ export class VoiceAssistantWebSocketServer {
         agentRequestReceipts: true,
         workspaceRequestReceipts: true,
         creationLifecycle: true,
-        ...(this.getRestartStatus ? { restartRecovery: true } : {}),
+        ...(this.getRestartStatus
+          ? { restartRecovery: true, restartRecoveryRetry: true, restartCrashAcknowledgment: true }
+          : {}),
         hubAgentRpc: true,
         // COMPAT(directorySync): added in v0.3.x, remove gate after 2027-02-12.
         directorySync: true,
@@ -1911,6 +1951,7 @@ export class VoiceAssistantWebSocketServer {
         providerSubagents: true,
         // COMPAT(projectedSubagentTimeline): added after v0.8.0, remove gates after 2027-03-14; retain advertisement.
         projectedSubagentTimeline: true,
+        projectedProviderSubagents: true,
         // COMPAT(providerSubagentNesting): added in v0.7, remove gate after 2027-03-04.
         providerSubagentNesting: true,
         // COMPAT(workspacePinning): added in v0.1.107, remove gate after 2027-01-12.

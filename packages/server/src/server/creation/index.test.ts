@@ -253,7 +253,7 @@ test("partial provisioning without a registered workspace is not repeated", asyn
   expect(provisions).toBe(1);
 });
 
-test.each(["pending", "completed"])(
+test.each(["pending", "completed", "not_dispatched"])(
   "imports a %s legacy agent receipt without creating another agent",
   async (state) => {
     const f = await fixture();
@@ -321,4 +321,44 @@ test("observer failures are logged without failing creation", async () => {
       err: expect.objectContaining({ message: "delivery failed" }),
     }),
   );
+});
+
+test("a legacy undispatched creation keeps its reserved agent identity when safely retried", async () => {
+  const f = await fixture();
+  const legacyDirectory = join(f.directory, "legacy");
+  await mkdir(legacyDirectory);
+  const request = { config: { cwd: "/project", provider: "codex" } };
+  const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+  await writeFile(
+    join(legacyDirectory, `${hash(["create", "retry-key"])}.json`),
+    JSON.stringify({
+      fingerprint: hash({ ...request, type: "create_agent_request" }),
+      state: "not_dispatched",
+      agentId: agent.id,
+    }),
+  );
+  const created: string[] = [];
+  const input: CreationInput = {
+    kind: "agent",
+    key: "retry-key",
+    request,
+    hasAgent: true,
+    hasPrompt: false,
+    exists: async () => false,
+    readAgent: async () => null,
+    createAgent: async (id) => {
+      created.push(id);
+      return agent;
+    },
+  };
+  const service = new CreationService(f.directory, silentLogger, undefined, legacyDirectory);
+  const result = await service.create(input);
+  expect(result).toMatchObject({ phase: "completed", agentId: agent.id, agent });
+  expect(created).toEqual([agent.id]);
+  await service.drain();
+  expect(await new CreationService(f.directory, silentLogger).create(input)).toMatchObject({
+    phase: "completed",
+    agentId: agent.id,
+  });
+  expect(created).toHaveLength(1);
 });

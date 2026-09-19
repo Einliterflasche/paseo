@@ -118,7 +118,12 @@ async function launchDaemon(
   provider: RealProvider,
   harness: NativeCheckpointHarness,
 ): Promise<TestPaseoDaemon> {
-  const logger = pino({ level: "warn" });
+  // Keep native terminal evidence when a shutdown/resume assertion fails. Each
+  // harness has its own retained directory; production logging is unchanged.
+  const logger = pino(
+    { level: "trace" },
+    pino.destination(path.join(harness.root, "provider-trace.log")),
+  );
   return createTestPaseoDaemon({
     agentClients: { [provider]: createRealProviderClient(provider, logger) },
     logger,
