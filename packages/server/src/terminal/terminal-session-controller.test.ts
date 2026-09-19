@@ -579,6 +579,54 @@ describe("terminal-session-controller subdirectory aggregation", () => {
   });
 });
 
+describe("terminal-session-controller inventory failure", () => {
+  test("list_terminals_request fails closed when enumeration throws, instead of reporting an empty inventory", async () => {
+    const cwd = "/work/repo";
+    const enumerationFailure = new Error("terminal worker IPC timed out");
+    const terminalManager: TerminalManager = {
+      getTerminals: vi.fn(async () => {
+        throw enumerationFailure;
+      }),
+      createTerminal: vi.fn(),
+      registerCwdEnv: vi.fn(),
+      validateTerminalActivityToken: vi.fn(() => "unknown"),
+      getTerminal: vi.fn(),
+      getTerminalState: vi.fn(),
+      setTerminalTitle: vi.fn(),
+      setTerminalActivity: vi.fn(),
+      killTerminal: vi.fn(),
+      killTerminalAndWait: vi.fn(),
+      captureTerminal: vi.fn(),
+      listDirectories: vi.fn(() => [cwd]),
+      killAll: vi.fn(),
+      subscribeTerminalsChanged: vi.fn(() => vi.fn()),
+      subscribeTerminalActivity: vi.fn(() => vi.fn()),
+      subscribeTerminalWorkspaceContributionChanged: vi.fn(() => vi.fn()),
+    };
+    const outboundMessages: SessionOutboundMessage[] = [];
+    const controller = new TerminalSessionController({
+      terminalManager,
+      emit: (message) => outboundMessages.push(message),
+      emitBinary: vi.fn(),
+      hasBinaryChannel: () => true,
+      isPathWithinRoot: isSameOrDescendantPath,
+      sessionLogger: createLogger(),
+      listTerminalWorkspaceRoots: async () => [cwd],
+    });
+
+    // No cwd: the "every workspace" query used by the deploy continuity veto.
+    await expect(
+      controller.dispatch({ type: "list_terminals_request", requestId: "req-all" }),
+    ).rejects.toThrow("Terminal inventory unavailable");
+
+    // A caller deciding whether it is safe to replace the daemon must never see this
+    // as an ordinary empty list_terminals_response: the throw must reach the caller
+    // (session.ts's existing rpc_error handling), not be swallowed into a false-empty
+    // reply here in the controller.
+    expect(outboundMessages).toEqual([]);
+  });
+});
+
 describe("terminal-session-controller workspace-scoped subscriptions", () => {
   test("two workspaces sharing a cwd subscribe and unsubscribe independently", async () => {
     const cwd = "/work/shared";
