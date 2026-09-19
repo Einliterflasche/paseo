@@ -84,6 +84,7 @@ import {
   useHorizontalScrollBoundary,
 } from "@/components/ui/horizontal-scroll-boundary";
 import { useSessionStore } from "@/stores/session-store";
+import { useServicePreviewForTab } from "@/services/preview-host";
 
 const DROPDOWN_WIDTH = 220;
 const DEFAULT_INLINE_ADD_BUTTON_RESERVED_WIDTH = 36;
@@ -1247,6 +1248,7 @@ function ResolvedWorkspaceDesktopTabsRow({
         <ResolvedDesktopTabChip
           key={`${item.tab.key}:${item.tab.kind}`}
           serverId={normalizedServerId}
+          workspaceId={normalizedWorkspaceId}
           item={item}
           isFocused={isFocused}
           isDragging={isActive}
@@ -1280,6 +1282,7 @@ function ResolvedWorkspaceDesktopTabsRow({
       layout.closeButtonPolicy,
       layout.items,
       normalizedServerId,
+      normalizedWorkspaceId,
       onCloseOtherTabs,
       onCloseTab,
       onCloseTabsToLeft,
@@ -1394,6 +1397,7 @@ function ResolvedWorkspaceDesktopTabsRow({
 }
 function ResolvedDesktopTabChip({
   serverId,
+  workspaceId,
   item,
   isFocused,
   isDragging,
@@ -1420,6 +1424,7 @@ function ResolvedDesktopTabChip({
   showDropIndicatorAfter,
 }: {
   serverId: string;
+  workspaceId: string;
   item: ResolvedWorkspaceDesktopTabRowItem;
   isFocused: boolean;
   isDragging: boolean;
@@ -1447,7 +1452,21 @@ function ResolvedDesktopTabChip({
 }) {
   const { t } = useTranslation();
   const presentation = item.presentation;
-  const resolvedTab = useMemo(
+  const previewContext = useMemo(
+    () =>
+      item.tab.target.kind === "service_preview"
+        ? {
+            serverId,
+            workspaceId,
+            tabId: item.tab.tabId,
+            serviceId: item.tab.target.serviceId,
+          }
+        : null,
+    [item.tab.tabId, item.tab.target, serverId, workspaceId],
+  );
+  const embeddedPreview = useServicePreviewForTab(previewContext, "iframe");
+  const browserPreview = useServicePreviewForTab(previewContext, "tab");
+  const resolvedTabBase = useMemo(
     () =>
       buildWorkspaceDesktopTabActions({
         tab: item.tab,
@@ -1482,6 +1501,45 @@ function ResolvedDesktopTabChip({
       tabCount,
     ],
   );
+  const resolvedTab = useMemo(() => {
+    if (!previewContext) return resolvedTabBase;
+    const embeddedBusy = ["preparing", "loading", "cancelling"].includes(
+      embeddedPreview.state.status,
+    );
+    const browserBusy = ["preparing", "cancelling"].includes(browserPreview.state.status);
+    const previewEntries: WorkspaceTabMenuEntry[] = [
+      {
+        kind: "item",
+        key: "reload-preview",
+        label: t("services.reloadPreview"),
+        icon: "rotate-cw",
+        disabled: !embeddedPreview.coordinator || embeddedBusy,
+        testID: `${resolvedTabBase.contextMenuTestId}-reload-preview`,
+        onSelect: () => void embeddedPreview.coordinator?.open({ reload: true }),
+      },
+      {
+        kind: "item",
+        key: "open-preview-browser-tab",
+        label: t("services.openBrowserTab"),
+        disabled: !browserPreview.coordinator || browserBusy,
+        testID: `${resolvedTabBase.contextMenuTestId}-open-browser-tab`,
+        onSelect: () => void browserPreview.coordinator?.open(),
+      },
+      { kind: "separator", key: "preview-actions-separator" },
+    ];
+    return {
+      ...resolvedTabBase,
+      menuEntries: [...previewEntries, ...resolvedTabBase.menuEntries],
+    };
+  }, [
+    browserPreview.coordinator,
+    browserPreview.state.status,
+    embeddedPreview.coordinator,
+    embeddedPreview.state.status,
+    previewContext,
+    resolvedTabBase,
+    t,
+  ]);
 
   const rawTooltipLabel =
     presentation.titleState === "loading" ? t("common.states.loading") : presentation.tooltip;

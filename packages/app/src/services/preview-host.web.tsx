@@ -183,3 +183,45 @@ export function useBrowserServicePreview({
   );
   return { coordinator, state };
 }
+
+/** Resolves preview actions for a tab-strip item without depending on pane focus. */
+export function useServicePreviewForTab(
+  context: { serverId: string; workspaceId: string; tabId: string; serviceId: string } | null,
+  mode: "iframe" | "tab",
+) {
+  const runtime = useContext(PreviewRuntimeContext);
+  const workspaceKey = context ? buildWorkspaceTabPersistenceKey(context) : null;
+  const generation = useSyncExternalStore(
+    runtime?.owner.subscribe ?? noSubscription,
+    () =>
+      runtime && context && workspaceKey
+        ? runtime.owner.getGeneration({
+            workspaceKey,
+            tabId: context.tabId,
+            serviceId: context.serviceId,
+          })
+        : null,
+    () => null,
+  );
+  const [coordinator, setCoordinator] = useState<ReturnType<
+    typeof createPreviewCoordinator
+  > | null>(null);
+  useLayoutEffect(() => {
+    if (!runtime || !context || !generation) {
+      setCoordinator(null);
+      return;
+    }
+    if (mode === "tab") {
+      const lease = runtime.acquireBrowser(context);
+      setCoordinator(lease?.coordinator ?? null);
+      return lease?.release;
+    }
+    setCoordinator(runtime.get(context));
+  }, [runtime, context, generation, mode]);
+  const state = useSyncExternalStore(
+    coordinator?.subscribe ?? noSubscription,
+    coordinator?.getSnapshot ?? getIdle,
+    getIdle,
+  );
+  return { coordinator, state };
+}
