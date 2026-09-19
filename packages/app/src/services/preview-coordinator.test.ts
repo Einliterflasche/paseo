@@ -144,12 +144,14 @@ function fixture({
   clock = new ManualClock(),
   client = new MemoryClient(),
   idPrefix = "attempt",
+  reserveLaunch = false,
 }: {
   mode?: "iframe" | "tab";
   report?: () => void | Promise<void>;
   clock?: ManualClock;
   client?: MemoryClient;
   idPrefix?: string;
+  reserveLaunch?: boolean;
 } = {}) {
   const profile = new MemoryProfile();
   const lifetime = new AbortController();
@@ -161,6 +163,7 @@ function fixture({
   let source: PreviewClientSource | null = initialSource;
   let nextId = 0;
   let launchError: Error | null = null;
+  const reservations: Array<{ attemptId: string; closed(): void; closeCount: number }> = [];
   const coordinator = createPreviewCoordinator({
     serviceId: "atlas",
     mode,
@@ -180,6 +183,22 @@ function fixture({
       launchOptions.push(options);
       if (launchError) throw launchError;
     },
+    reserveLaunch: reserveLaunch
+      ? ({ attemptId, closed }) => {
+          const reservation = { attemptId, closed, closeCount: 0 };
+          reservations.push(reservation);
+          return {
+            launch(ticket, options) {
+              launches.push(ticket);
+              launchOptions.push(options);
+              if (launchError) throw launchError;
+            },
+            close() {
+              reservation.closeCount += 1;
+            },
+          };
+        }
+      : undefined,
     onCloseFailure() {
       closeFailures.push("close-failed");
       return report();
@@ -195,6 +214,7 @@ function fixture({
     launchOptions,
     closeFailures,
     initialSource,
+    reservations,
     setLaunchError(error: Error | null) {
       launchError = error;
     },
@@ -237,6 +257,46 @@ function waitForState(
 }
 
 describe("preview open coordinator", () => {
+  it("reserves a standalone tab on the original click and launches it as soon as Prepare completes", async () => {
+    const { coordinator, client, launches, reservations } = fixture({
+      mode: "tab",
+      reserveLaunch: true,
+    });
+    try {
+      const opening = coordinator.open();
+      expect(reservations.map(({ attemptId }) => attemptId)).toEqual(["attempt-1"]);
+      const pending = await client.waitForPrepare(0);
+      pending.reply.resolve({ result: prepared(pending) });
+      await opening;
+      expect(launches.map(({ attemptId }) => attemptId)).toEqual([pending.input.attemptId]);
+      expect(coordinator.getSnapshot()).toEqual({ status: "open" });
+    } finally {
+      coordinator.close();
+    }
+  });
+
+  it("releases standalone authority when the reserved browser tab closes", async () => {
+    const { coordinator, client, reservations } = fixture({ mode: "tab", reserveLaunch: true });
+    try {
+      const opening = coordinator.open();
+      const pending = await client.waitForPrepare(0);
+      pending.reply.resolve({ result: prepared(pending) });
+      await opening;
+      reservations[0]?.closed();
+      expect(coordinator.getSnapshot()).toEqual({ status: "cancelling" });
+      expect(client.closes.map(({ attemptId }) => attemptId)).toEqual([pending.input.attemptId]);
+      const closing = client.closes[0];
+      closing?.reply.resolve({
+        requestId: "close",
+        result: { status: "closed", attemptId: pending.input.attemptId },
+      });
+      await waitForState(coordinator, (state) => state.status === "idle");
+      expect(coordinator.getSnapshot()).toEqual({ status: "idle" });
+    } finally {
+      coordinator.close();
+    }
+  });
+
   it("refuses an already-expired standalone ticket without launching or replaying", async () => {
     const { coordinator, client, launches } = fixture({ mode: "tab" });
     try {

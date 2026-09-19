@@ -13,6 +13,7 @@ import { createPreviewBrowserOwner } from "./preview-browser-owner";
 import { browserPreviewProfile } from "./preview-browser-profile.web";
 import { submitPreviewForm } from "./preview-form.web";
 import { openPreviewDocument } from "./preview-navigation.web";
+import { reserveStandalonePreview } from "./preview-standalone-navigation.web";
 
 export interface PreviewWorkspaceContext {
   serverId: string;
@@ -134,6 +135,15 @@ export function createPreviewRuntime({ document, onCloseFailure }: PreviewRuntim
           stopSession();
         };
       },
+      reserveLaunch:
+        mode === "tab"
+          ? ({ attemptId, closed }) =>
+              reserveStandalonePreview({
+                document,
+                name: `paseo-preview-${attemptId}`,
+                closed,
+              })
+          : undefined,
       launch(prepared, options) {
         if (mode === "tab") {
           submitPreviewForm({ document, prepared, target: "_blank" });

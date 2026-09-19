@@ -47,11 +47,17 @@ export interface PreviewCoordinatorPort {
   getSource(): PreviewClientSource | null;
   subscribeSource(listener: () => void): () => void;
   launch(prepared: PreparedPreview, options: PreviewLaunchOptions): void;
+  reserveLaunch?(input: { attemptId: string; closed(): void }): PreviewLaunchReservation | null;
   onCloseFailure(): void | Promise<void>;
   clock?: {
     now(): number;
     schedule(input: { delayMs: number; callback(): void }): () => void;
   };
+}
+
+export interface PreviewLaunchReservation {
+  launch(prepared: PreparedPreview, options: PreviewLaunchOptions): void;
+  close(): void;
 }
 
 export interface PreviewLaunchOptions {
@@ -70,6 +76,7 @@ interface Attempt {
   reload: boolean;
   expiresAt: number | null;
   cancelExpiry: (() => void) | null;
+  reservation: PreviewLaunchReservation | null;
 }
 
 function sameSource(a: PreviewClientSource, b: PreviewClientSource | null): boolean {
@@ -119,6 +126,8 @@ export function createPreviewCoordinator(port: PreviewCoordinatorPort) {
     previous.cancelExpiry = null;
     previous.prepared = null;
     previous.navigation.abort();
+    previous.reservation?.close();
+    previous.reservation = null;
     // Never send an old Close through a replacement physical source. Detach
     // already removes that source's authority on the server.
     if (previous.sent && sameSource(previous.source, port.getSource())) {
@@ -181,7 +190,9 @@ export function createPreviewCoordinator(port: PreviewCoordinatorPort) {
     value.cancelExpiry?.();
     value.cancelExpiry = null;
     try {
-      port.launch(prepared, { signal: value.navigation.signal, reload: value.reload });
+      const options = { signal: value.navigation.signal, reload: value.reload };
+      if (value.reservation) value.reservation.launch(prepared, options);
+      else port.launch(prepared, options);
     } catch {
       fail(value, "launch");
     }
@@ -197,6 +208,19 @@ export function createPreviewCoordinator(port: PreviewCoordinatorPort) {
     void end(value);
     // End never retries. A fresh user action is required to obtain another ticket.
     if (!closed && attempt === null) publish({ status: "idle" });
+  }
+
+  function reserve(value: Attempt): boolean {
+    if (port.mode !== "tab" || !port.reserveLaunch) return true;
+    value.reservation = port.reserveLaunch({
+      attemptId: value.id,
+      closed() {
+        if (current(value)) coordinator.cancel();
+      },
+    });
+    if (value.reservation) return true;
+    fail(value, "launch");
+    return false;
   }
 
   function acceptPrepared(value: Attempt, result: PreparedPreview, requestedAt: number): void {
@@ -216,9 +240,10 @@ export function createPreviewCoordinator(port: PreviewCoordinatorPort) {
       },
     });
     publish({ status: "ready" });
-    // Embedded navigation does not need popup activation. Standalone launch
-    // stays ready until a fresh user gesture invokes launch().
-    if (port.mode === "iframe") launch();
+    // Embedded navigation needs no popup activation. A standalone reservation
+    // was created synchronously by the user's original click, so it can also
+    // navigate as soon as authorization is ready.
+    if (port.mode === "iframe" || value.reservation) launch();
   }
 
   async function open(options?: { recover?: boolean; reload?: boolean }): Promise<void> {
@@ -242,8 +267,10 @@ export function createPreviewCoordinator(port: PreviewCoordinatorPort) {
       reload: options?.reload === true,
       expiresAt: null,
       cancelExpiry: null,
+      reservation: null,
     };
     attempt = value;
+    if (!reserve(value)) return;
     const requestedRecovery = options?.recover ? recovery : null;
     recovery = null;
     publish({ status: "preparing" });
@@ -307,7 +334,7 @@ export function createPreviewCoordinator(port: PreviewCoordinatorPort) {
   port.lifetime.addEventListener("abort", close, { once: true });
   if (port.lifetime.aborted) close();
 
-  return {
+  const coordinator = {
     getSnapshot: () => state,
     subscribe(listener: () => void) {
       listeners.add(listener);
@@ -341,4 +368,5 @@ export function createPreviewCoordinator(port: PreviewCoordinatorPort) {
     },
     close,
   };
+  return coordinator;
 }

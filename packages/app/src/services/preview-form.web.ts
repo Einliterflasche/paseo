@@ -5,10 +5,12 @@ export function submitPreviewForm({
   document,
   prepared,
   target,
+  openerAlreadyCleared = false,
 }: {
   document: Document;
   prepared: PreparedPreview;
   target: string;
+  openerAlreadyCleared?: boolean;
 }) {
   if (!/^[a-zA-Z0-9-]+$/.test(prepared.bootstrapId)) throw new Error("Invalid preview bootstrap");
   const form = document.createElement("form");
@@ -17,7 +19,7 @@ export function submitPreviewForm({
   form.target = target;
   // noreferrer also suppresses the POST's Origin in Chromium. The gateway
   // requires that exact Origin; the ticket is only in the body, never the URL.
-  if (prepared.mode === "tab") form.rel = "noopener";
+  if (prepared.mode === "tab" && !openerAlreadyCleared) form.rel = "noopener";
   form.hidden = true;
   const ticket = document.createElement("input");
   ticket.type = "hidden";

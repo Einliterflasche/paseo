@@ -126,11 +126,9 @@ function BrowserActionsMenuView(props: BrowserActionsMenuViewProps) {
               {t(ready ? "services.openBrowserTabReady" : "services.openBrowserTab")}
             </DropdownMenuItem>
           ) : null}
-          {state.status === "preparing" || ready || state.status === "open" ? (
+          {state.status === "open" ? (
             <DropdownMenuItem onSelect={cancel}>
-              {t(
-                state.status === "open" ? "services.closeBrowserPreview" : "common.actions.cancel",
-              )}
+              {t("services.closeBrowserPreview")}
             </DropdownMenuItem>
           ) : null}
           {state.status === "error" && state.recovery ? (
