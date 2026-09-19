@@ -39,8 +39,8 @@ export const ja: TranslationResources = {
       storageError: "サービスの登録を保存できませんでした。ホストのストレージを確認してください。",
       unknownResult: "結果を確認できません。再試行する前にカタログを確認してください。",
     },
-    openBrowserTab: "ブラウザーのタブ",
-    openBrowserTabReady: "今すぐタブを開く",
+    openBrowserTab: "新しいタブで開く",
+    openBrowserTabReady: "新しいタブで開く",
     closeBrowserPreview: "ブラウザーのプレビューを閉じる",
     previewCloseError:
       "プレビューの終了を確認できませんでした。アクセスがまだ有効な可能性があります。",

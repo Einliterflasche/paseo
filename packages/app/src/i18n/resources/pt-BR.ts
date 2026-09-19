@@ -39,8 +39,8 @@ export const ptBR: TranslationResources = {
       storageError: "Não foi possível salvar o registro. Verifique o armazenamento do host.",
       unknownResult: "O resultado é desconhecido. Confira o catálogo antes de tentar novamente.",
     },
-    openBrowserTab: "Aba do navegador",
-    openBrowserTabReady: "Abrir aba agora",
+    openBrowserTab: "Abrir em uma nova aba",
+    openBrowserTabReady: "Abrir em uma nova aba",
     closeBrowserPreview: "Fechar prévia do navegador",
     previewCloseError:
       "Não foi possível confirmar o fechamento da prévia. O acesso ainda pode estar ativo.",

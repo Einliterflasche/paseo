@@ -41,8 +41,8 @@ export const es: TranslationResources = {
       storageError: "No se pudo guardar el registro. Comprueba el almacenamiento del host.",
       unknownResult: "Se desconoce el resultado. Revisa el catálogo antes de intentarlo de nuevo.",
     },
-    openBrowserTab: "Pestaña del navegador",
-    openBrowserTabReady: "Abrir pestaña ahora",
+    openBrowserTab: "Abrir en una pestaña nueva",
+    openBrowserTabReady: "Abrir en una pestaña nueva",
     closeBrowserPreview: "Cerrar vista previa del navegador",
     previewCloseError:
       "No se pudo confirmar el cierre de la vista previa. El acceso puede seguir activo.",

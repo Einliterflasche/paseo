@@ -2,6 +2,7 @@ import type { ServiceProxySubsystem } from "../service-proxy.js";
 import type { WorkspaceScriptRuntimeStore } from "../workspace-script-runtime-store.js";
 import { PreviewRoutes, PreviewRouteError } from "./routes.js";
 import { PreviewHttpPolicyError, type PreviewHttpRoute } from "./http-policy.js";
+import { managedPreviewServiceId } from "./policy.js";
 
 export interface ManagedPreviewEnrollment {
   serviceId: string;
@@ -64,6 +65,34 @@ export class ManagedPreviewRoutes {
   /** Saved mount policy may outlive a stopped script; it never starts that script. */
   restore(enrollment: ManagedPreviewEnrollment): void {
     this.add(enrollment, false);
+  }
+
+  /** Every managed service is previewable without a separate enrollment step. */
+  restoreDefaults(workspaceId: string): void {
+    if (this.closed || this.blockedWorkspaces.has(workspaceId)) return;
+    for (const runtime of this.options.runtime.listForWorkspace(workspaceId)) {
+      if (runtime.type !== "service") continue;
+      this.restoreDefault(workspaceId, runtime.scriptName);
+    }
+  }
+
+  restoreDefault(workspaceId: string, scriptName: string): void {
+    if (this.closed || this.blockedWorkspaces.has(workspaceId)) return;
+    const duplicate = [...this.records.values()].some(
+      ({ enrollment }) =>
+        enrollment.workspaceId === workspaceId && enrollment.scriptName === scriptName,
+    );
+    if (duplicate) return;
+    this.add(
+      {
+        serviceId: managedPreviewServiceId({ workspaceId, scriptName }),
+        workspaceId,
+        scriptName,
+        mount: "strip",
+        name: scriptName,
+      },
+      false,
+    );
   }
 
   private add(enrollment: ManagedPreviewEnrollment, requireRunning: boolean): void {

@@ -49,14 +49,12 @@ describe("external service registration form", () => {
         port: "",
         workspaceId: "workspace-a",
         workspaceLabel: "Workspace A",
-        mount: "preserve",
       },
       canSubmit: false,
       operation: { status: "editing" },
     });
     snapshot.workspaceLabel = "Changed elsewhere";
     enterValidValues(first);
-    first.setMount("strip");
     first.setWorkspace({ id: "workspace-b", label: "Captured workspace label" });
 
     const second = open();
@@ -66,7 +64,6 @@ describe("external service registration form", () => {
         port: "",
         workspaceId: null,
         workspaceLabel: "This host",
-        mount: "preserve",
       },
       canSubmit: false,
       operation: { status: "editing" },
@@ -76,7 +73,6 @@ describe("external service registration form", () => {
       port: "5173",
       workspaceId: "workspace-b",
       workspaceLabel: "Captured workspace label",
-      mount: "strip",
     });
   });
 
@@ -100,7 +96,7 @@ describe("external service registration form", () => {
     expect(form.getState().canSubmit).toBe(true);
     const saving = form.submit(save);
     expect(inputs).toEqual([
-      { name: "Atlas", port: Number(port), workspaceId: "workspace-a", mount: "preserve" },
+      { name: "Atlas", port: Number(port), workspaceId: "workspace-a", mount: "strip" },
     ]);
     reply.resolve({ result: { status: "ok", serviceId: "registered-atlas" } });
     expect(await saving).toBe(true);
@@ -114,7 +110,6 @@ describe("external service registration form", () => {
     expect(inputs).toEqual([]);
     form.setName("  Atlas React  ");
     form.setWorkspace({ id: null, label: "Entire host" });
-    form.setMount("strip");
     const saving = form.submit(save);
     expect(inputs).toEqual([
       { name: "Atlas React", port: 5173, workspaceId: null, mount: "strip" },
@@ -127,7 +122,6 @@ describe("external service registration form", () => {
         port: " 05173 ",
         workspaceId: null,
         workspaceLabel: "Entire host",
-        mount: "strip",
       },
       canSubmit: false,
       operation: { status: "saved", serviceId: "registered-atlas" },
@@ -155,11 +149,10 @@ describe("external service registration form", () => {
     const pending = form.getState();
     form.setName("Changed");
     form.setPort("9000");
-    form.setMount("strip");
     form.setWorkspace({ id: null, label: "Entire host" });
     expect(form.getState()).toBe(pending);
     expect(inputs).toEqual([
-      { name: "Atlas React", port: 5173, workspaceId: "workspace-a", mount: "preserve" },
+      { name: "Atlas React", port: 5173, workspaceId: "workspace-a", mount: "strip" },
     ]);
     reply.resolve({ result: { status: "ok", serviceId: "registered-atlas" } });
     expect(await saving).toBe(true);
@@ -181,7 +174,6 @@ describe("external service registration form", () => {
           port: "5173",
           workspaceId: "workspace-a",
           workspaceLabel: "Workspace A",
-          mount: "preserve",
         },
         canSubmit: true,
         operation: { status: "error", code },
@@ -275,7 +267,6 @@ describe("external service registration form", () => {
     const closed = form.getState();
     form.setName("Changed");
     form.setPort("9000");
-    form.setMount("strip");
     form.setWorkspace({ id: null, label: "Entire host" });
     form.close();
     expect(await form.submit(save)).toBe(false);

@@ -14,7 +14,6 @@ interface FormValues {
   port: string;
   workspaceId: string | null;
   workspaceLabel: string;
-  mount: "preserve" | "strip";
 }
 
 export interface RegistrationFormSnapshot {
@@ -48,7 +47,6 @@ export function openServiceRegistration(snapshot: RegistrationFormSnapshot) {
       port: "",
       workspaceId: snapshot.workspaceId,
       workspaceLabel: snapshot.workspaceLabel,
-      mount: "preserve",
     },
     canSubmit: false,
     operation: { status: "editing" },
@@ -83,7 +81,6 @@ export function openServiceRegistration(snapshot: RegistrationFormSnapshot) {
     },
     setName: (name: string) => edit({ name }),
     setPort: (port: string) => edit({ port }),
-    setMount: (mount: FormValues["mount"]) => edit({ mount }),
     setWorkspace(workspace: { id: string | null; label: string }) {
       edit({ workspaceId: workspace.id, workspaceLabel: workspace.label });
     },
@@ -98,7 +95,7 @@ export function openServiceRegistration(snapshot: RegistrationFormSnapshot) {
           name: values.name.trim(),
           port,
           workspaceId: values.workspaceId,
-          mount: values.mount,
+          mount: "strip",
         });
         if (isClosed()) return false;
         if (result.status === "error") {

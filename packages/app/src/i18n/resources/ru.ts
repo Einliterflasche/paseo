@@ -40,8 +40,8 @@ export const ru: TranslationResources = {
       storageError: "Не удалось сохранить регистрацию. Проверьте хранилище хоста.",
       unknownResult: "Результат неизвестен. Проверьте каталог перед повторной попыткой.",
     },
-    openBrowserTab: "Вкладка браузера",
-    openBrowserTabReady: "Открыть вкладку",
+    openBrowserTab: "Открыть в новой вкладке",
+    openBrowserTabReady: "Открыть в новой вкладке",
     closeBrowserPreview: "Закрыть предпросмотр браузера",
     previewCloseError:
       "Не удалось подтвердить закрытие предпросмотра. Доступ может оставаться активным.",

@@ -119,6 +119,28 @@ async function fixture(
 const noop = () => {};
 
 describe("managed preview enrollment persistence", () => {
+  it("publishes a default stripped preview for a stopped configured service without persisting it", async () => {
+    const f = await fixture();
+    const serviceId = f.services.restoreDefault(declaration.workspaceId, declaration.scriptName);
+
+    expect(f.services.describe()).toEqual([
+      {
+        serviceId,
+        workspaceId: declaration.workspaceId,
+        scriptName: declaration.scriptName,
+        name: declaration.scriptName,
+        mount: "strip",
+        enabled: true,
+      },
+    ]);
+    expect(f.routes.describe()).toEqual([]);
+    await expect(readFile(f.file, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+
+    f.endpoint();
+    f.runtime.set(runtimeEntry());
+    expect(f.routes.capture(serviceId)?.route.port).toBe(5173);
+  });
+
   it("enables a stopped service, persists it, and leaves the workspace without a live route until the script runs", async () => {
     const f = await fixture();
     const serviceId = await f.services.enable(

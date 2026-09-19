@@ -41,8 +41,8 @@ export const fr: TranslationResources = {
       storageError: "Impossible d’enregistrer le service. Vérifiez le stockage de l’hôte.",
       unknownResult: "Le résultat est inconnu. Vérifiez le catalogue avant de réessayer.",
     },
-    openBrowserTab: "Onglet du navigateur",
-    openBrowserTabReady: "Ouvrir l’onglet",
+    openBrowserTab: "Ouvrir dans un nouvel onglet",
+    openBrowserTabReady: "Ouvrir dans un nouvel onglet",
     closeBrowserPreview: "Fermer l’aperçu du navigateur",
     previewCloseError:
       "Impossible de confirmer la fermeture de l’aperçu. L’accès peut être encore actif.",

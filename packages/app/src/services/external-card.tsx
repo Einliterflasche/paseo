@@ -1,5 +1,5 @@
 import { useCallback, useMemo } from "react";
-import { Text, View } from "react-native";
+import { Pressable, Text, View } from "react-native";
 import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { Globe } from "lucide-react-native";
@@ -67,10 +67,16 @@ export function ExternalServiceCard({
   return (
     <View style={styles.card} testID={`external-service-${entry.serviceId}`}>
       {!compact ? (
-        <View style={styles.preview}>
+        <Pressable
+          style={styles.preview}
+          disabled={!entry.available || !entry.workspaceId || !onOpen || disabled}
+          onPress={openWorkspace}
+          accessibilityRole="button"
+          accessibilityLabel={`${t("services.openPreview")}: ${entry.name}`}
+        >
           <ThemedGlobe size={32} uniProps={muted} />
           <Text style={styles.caption}>{t("services.registration.external")}</Text>
-        </View>
+        </Pressable>
       ) : null}
       <View style={styles.cardBody}>
         <View style={styles.cardHeading}>
@@ -89,7 +95,7 @@ export function ExternalServiceCard({
           {t("services.registration.basePath")}: /__paseo_services/apps/{entry.serviceId}/
         </Text>
         <View style={styles.actions}>
-          {entry.available && entry.workspaceId && entry.workspaceName && onOpen ? (
+          {compact && entry.available && entry.workspaceId && entry.workspaceName && onOpen ? (
             <Button
               size="sm"
               variant="outline"
@@ -121,14 +127,14 @@ export function ExternalServiceCard({
           >
             {t("services.registration.remove")}
           </Button>
+          <BrowserPreviewActions
+            serverId={entry.serverId}
+            serviceId={entry.serviceId}
+            name={entry.name}
+            available={entry.available}
+            disabled={disabled}
+          />
         </View>
-        <BrowserPreviewActions
-          serverId={entry.serverId}
-          serviceId={entry.serviceId}
-          name={entry.name}
-          available={entry.available}
-          disabled={disabled}
-        />
         {errorKey ? <Alert variant="error" description={t(errorKey)} /> : null}
       </View>
     </View>
