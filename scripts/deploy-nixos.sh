@@ -2,18 +2,16 @@
 # Build first, checkpoint the running daemon, then activate the immutable closure.
 # The whole operation runs in a finite systemd unit outside paseo.service.
 # Usage: deploy-nixos.sh [--flake <ref>] [--reason <text>] [-- <deploy options>]
-# PASEO_HOME selects the daemon; PASEO_CLI may override the built checkout CLI.
+# PASEO_HOME selects the daemon. The built closure owns the deployment CLI.
 # PASEO_DEPLOY_ENV_FILE supplies daemon credentials inside the detached unit.
 set -euo pipefail
 
 SCRIPT_PATH="$(readlink -f "$0")"
-ROOT_DIR="$(dirname "$(dirname "$SCRIPT_PATH")")"
 
 if [[ "${1:-}" != --worker ]]; then
-  CLI_PATH="$(command -v "${PASEO_CLI:-$ROOT_DIR/packages/cli/bin/paseo}")"
   UNIT_NAME="paseo-deploy-$(date +%s)-$$"
   echo "Deployment job: $UNIT_NAME (logs: journalctl -fu $UNIT_NAME)"
-  ENV_ARGS=(--setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv="PASEO_CLI=$CLI_PATH")
+  ENV_ARGS=(--setenv="PATH=$PATH" --setenv="HOME=$HOME")
   for name in PASEO_HOME PASEO_DEPLOY_FLAKE NIX_PATH; do
     if [[ -v "$name" ]]; then ENV_ARGS+=(--setenv="$name=${!name}"); fi
   done
@@ -80,6 +78,6 @@ else
 fi
 ACTIVATE
 chmod 700 "$ACTIVATION_SCRIPT"
-exec "${PASEO_CLI:-$ROOT_DIR/packages/cli/bin/paseo}" daemon deploy \
+exec "$TARGET_CLI" daemon deploy \
   --target-cli "$TARGET_CLI" --reason "$REASON" "${EXTRA_DEPLOY_ARGS[@]}" -- \
   /run/wrappers/bin/sudo "$ACTIVATION_SCRIPT" "$CLOSURE_DIR"

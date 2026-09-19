@@ -157,6 +157,15 @@ const COMMAND_ADMISSION = {
   "schedule/resume": "mutation",
   "schedule/run-once": "owned",
   "schedule/update": "mutation",
+  // Physical-source dispatch owns admission. Authority-reducing actions remain
+  // available while new Prepare/Enable/Register/Connect requests are frozen.
+  "service.preview.prepare.request": "owned",
+  "service.preview.close.request": "owned",
+  "service.external.register.request": "owned",
+  "service.external.connect.request": "owned",
+  "service.external.disconnect.request": "owned",
+  "service.managed.enable.request": "owned",
+  "service.managed.disable.request": "owned",
   send_agent_message_request: "mutation",
   set_agent_feature_request: "mutation",
   set_agent_mode_request: "mutation",

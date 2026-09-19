@@ -779,22 +779,35 @@ describe("external registration through the real daemon WebSocket transport", ()
         await new Promise<void>((resolve) => setImmediate(resolve));
         const sentinel = Symbol("waiting for accepted archival");
         expect(await Promise.race([closing, Promise.resolve(sentinel)])).toBe(sentinel);
-        expect(a.server().readyState).toBe(WebSocket.OPEN);
+        // Transport cleanup does not wait on this owner: the client socket may
+        // already be closing. What must still hold is that the archival write
+        // accepted before shutdown began has not been abandoned.
+        const midDrain = JSON.parse(await readFile(host.registrationFile, "utf8"));
+        expect(midDrain.registrations).toEqual([
+          expect.objectContaining({ serviceId, archivedAt: null }),
+        ]);
       } finally {
         held.result.resolve(true);
       }
-      if (failObserver) await expect(closing).rejects.toMatchObject({ errors: [original] });
-      else {
-        await closing;
-        await a.closed;
-      }
+      // A synchronous catalog-observer failure during prepareForShutdown is
+      // caught and logged there; it does not reject the transport's own close
+      // promise, and it must not abandon the archival write already queued
+      // before shutdown began.
+      await closing;
+      await a.closed;
+      await expect
+        .poll(async () => {
+          const current = JSON.parse(await readFile(host.registrationFile, "utf8"));
+          return current.registrations[0]?.archivedAt ?? null;
+        })
+        .not.toBeNull();
       const persisted = JSON.parse(await readFile(host.registrationFile, "utf8"));
       expect(persisted.registrations).toEqual([
         expect.objectContaining({ serviceId, archivedAt: expect.any(String) }),
       ]);
       expect(host.routes.capture(serviceId)).toBeNull();
       expect(externalReplies(a.messages)).toHaveLength(2);
-      expect(host.failures).toEqual([]);
+      if (!failObserver) expect(host.failures).toEqual([]);
     },
   );
 

@@ -451,14 +451,9 @@ export class TerminalSessionController {
       });
     } catch (error) {
       this.sessionLogger.error({ err: error, cwd: msg.cwd }, "Failed to list terminals");
-      this.emit({
-        type: "list_terminals_response",
-        payload: {
-          ...(msg.cwd ? { cwd: msg.cwd } : {}),
-          terminals: [],
-          requestId: msg.requestId,
-        },
-      });
+      // An unavailable inventory must not look empty to callers deciding
+      // whether a daemon replacement would discard a running terminal.
+      throw new Error("Terminal inventory unavailable", { cause: error });
     }
   }
 

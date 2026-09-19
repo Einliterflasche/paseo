@@ -25,11 +25,41 @@ function baseState(overrides: Partial<LocalDaemonState> = {}): LocalDaemonState 
 }
 
 function prepareClient(overrides: Partial<DeployPrepareClient> = {}): DeployPrepareClient {
+  // getLastServerInfoMessage and prepareRestart default to a stateful pair: once
+  // prepareRestart resolves with a generationId, the default server-info snapshot
+  // reports that exact generation paused/ready, matching what requirePreparedGeneration
+  // checks immediately after prepare and again after the post-prepare terminal check.
+  // A test overriding getLastServerInfoMessage directly (to simulate a race or a stale
+  // report) takes full precedence over this tracking. A test overriding prepareRestart
+  // only (to change the returned generationId or fail) still updates the tracked
+  // generation, so every existing generationId-only override keeps working unmodified.
+  const {
+    prepareRestart: prepareRestartOverride,
+    getLastServerInfoMessage: infoOverride,
+    ...rest
+  } = overrides;
+  let preparedGeneration: string | undefined;
+  const prepareRestartImpl = prepareRestartOverride ?? (async () => ({ generationId: "gen-1" }));
   return {
-    getLastServerInfoMessage: () => ({ features: { restartRecovery: true } }),
-    prepareRestart: async () => ({ generationId: "gen-1" }),
+    getLastServerInfoMessage:
+      infoOverride ??
+      (() =>
+        preparedGeneration
+          ? {
+              features: { restartRecovery: true },
+              restartRecoveryState: "paused",
+              restartRecoveryStage: "ready",
+              restartRecoveryGeneration: preparedGeneration,
+            }
+          : { features: { restartRecovery: true } }),
+    listTerminals: async () => ({ terminals: [] }),
+    prepareRestart: async (reason) => {
+      const result = await prepareRestartImpl(reason);
+      if (result.generationId) preparedGeneration = result.generationId;
+      return result;
+    },
     close: async () => {},
-    ...overrides,
+    ...rest,
   };
 }
 
@@ -479,5 +509,149 @@ describe("runDeployCommand", () => {
       ),
     ).rejects.toBeTruthy();
     expect(close).toHaveBeenCalledOnce();
+  });
+
+  // Terminal/managed-service continuity veto. These test the CLI's own request/refuse
+  // logic given whatever DeployPrepareClient.listTerminals() actually returns or throws.
+  // They do NOT prove the daemon-side enumeration is fail-closed: terminal-session-
+  // controller.ts's handleListTerminalsRequest catches enumeration errors and emits
+  // terminals:[] rather than propagating them (line ~452-462), so an empty CLI-level
+  // reply is not on its own proof of zero live terminals — it is equally consistent with
+  // a swallowed server-side enumeration failure. That gap is root's to close server-side;
+  // these tests only cover what the CLI does with the client-level outcomes it is given.
+  describe("terminal/managed-service continuity veto", () => {
+    it("refuses immediately when terminals are already active, before preparing or activating", async () => {
+      const prepareRestart = vi.fn();
+      const { deps, calls } = makeDeps({
+        connectPrepare: async () =>
+          prepareClient({
+            listTerminals: async () => ({
+              terminals: [{ id: "term-1", name: "install" }],
+            }),
+            prepareRestart,
+          }),
+      });
+      await expect(
+        runDeployCommand(
+          ["sudo", "switch"],
+          { targetCli: "/nix/store/target/bin/paseo" },
+          {} as never,
+          deps,
+        ),
+      ).rejects.toMatchObject({ code: "DEPLOY_TERMINALS_ACTIVE" });
+      expect(prepareRestart).not.toHaveBeenCalled();
+      expect(calls.spawnActivation).toEqual([]);
+    });
+
+    it("refuses activation when a terminal starts during preparation (post-prepare check catches the race)", async () => {
+      let calls = 0;
+      const { deps, calls: depCalls } = makeDeps({
+        connectPrepare: async () =>
+          prepareClient({
+            listTerminals: async () => {
+              calls += 1;
+              // Empty before prepare, active by the post-prepare recheck: the exact
+              // race the second requireNoTerminals call exists to close.
+              return calls === 1
+                ? { terminals: [] }
+                : { terminals: [{ id: "term-2", name: "race-started" }] };
+            },
+          }),
+      });
+      await expect(
+        runDeployCommand(
+          ["sudo", "switch"],
+          { targetCli: "/nix/store/target/bin/paseo" },
+          {} as never,
+          deps,
+        ),
+      ).rejects.toMatchObject({ code: "DEPLOY_TERMINALS_ACTIVE" });
+      expect(calls).toBe(2);
+      expect(depCalls.spawnActivation).toEqual([]);
+    });
+
+    it("never activates when the post-prepare terminal query itself fails", async () => {
+      let calls = 0;
+      const { deps, calls: depCalls } = makeDeps({
+        connectPrepare: async () =>
+          prepareClient({
+            listTerminals: async () => {
+              calls += 1;
+              if (calls === 1) return { terminals: [] };
+              throw new Error("terminal worker IPC timed out");
+            },
+          }),
+      });
+      await expect(
+        runDeployCommand(
+          ["sudo", "switch"],
+          { targetCli: "/nix/store/target/bin/paseo" },
+          {} as never,
+          deps,
+        ),
+      ).rejects.toMatchObject({ code: "DEPLOY_TERMINAL_INSPECTION_FAILED" });
+      expect(calls).toBe(2);
+      expect(depCalls.spawnActivation).toEqual([]);
+    });
+
+    it("refuses activation when the reported generation changes between the two post-prepare checks", async () => {
+      let infoCalls = 0;
+      const { deps, calls } = makeDeps({
+        connectPrepare: async () =>
+          prepareClient({
+            getLastServerInfoMessage: () => {
+              infoCalls += 1;
+              // First requirePreparedGeneration call (right after prepare+validateTarget)
+              // sees the prepared generation; the second (after the post-prepare
+              // requireNoTerminals) sees a different one, as if another prepare/replace
+              // cycle raced this one.
+              return infoCalls === 1
+                ? {
+                    features: { restartRecovery: true },
+                    restartRecoveryState: "paused",
+                    restartRecoveryStage: "ready",
+                    restartRecoveryGeneration: "gen-1",
+                  }
+                : {
+                    features: { restartRecovery: true },
+                    restartRecoveryState: "paused",
+                    restartRecoveryStage: "ready",
+                    restartRecoveryGeneration: "gen-2",
+                  };
+            },
+          }),
+      });
+      await expect(
+        runDeployCommand(
+          ["sudo", "switch"],
+          { targetCli: "/nix/store/target/bin/paseo" },
+          {} as never,
+          deps,
+        ),
+      ).rejects.toMatchObject({ code: "DEPLOY_PREPARATION_CHANGED" });
+      expect(calls.spawnActivation).toEqual([]);
+    });
+
+    it("deploys normally with zero terminal inventory confirmed against the same exact generation twice", async () => {
+      let calls = 0;
+      const { deps, calls: depCalls } = makeDeps({
+        connectPrepare: async () =>
+          prepareClient({
+            listTerminals: async () => {
+              calls += 1;
+              return { terminals: [] };
+            },
+          }),
+      });
+      const result = await runDeployCommand(
+        ["sudo", "switch"],
+        { targetCli: "/nix/store/target/bin/paseo" },
+        {} as never,
+        deps,
+      );
+      expect(calls).toBe(2);
+      expect(depCalls.spawnActivation).toEqual([["sudo", "switch"]]);
+      expect(result.data).toMatchObject({ action: "deployed", generationId: "gen-1" });
+    });
   });
 });

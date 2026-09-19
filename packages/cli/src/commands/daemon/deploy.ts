@@ -40,7 +40,11 @@ export interface DeployPrepareClient {
   getLastServerInfoMessage(): {
     features?: { restartRecovery?: boolean };
     restartCheckpointFormat?: number;
+    restartRecoveryState?: string;
+    restartRecoveryStage?: string;
+    restartRecoveryGeneration?: string;
   } | null;
+  listTerminals(): Promise<{ terminals: readonly { id: string; name: string }[] }>;
   prepareRestart(reason?: string): Promise<{ generationId?: string }>;
   close(): Promise<void>;
 }
@@ -202,6 +206,41 @@ function toCommandError(err: unknown, fallbackCode: string, fallbackPrefix: stri
   return { code: fallbackCode, message: `${fallbackPrefix}: ${message}` };
 }
 
+async function requireNoTerminals(client: DeployPrepareClient): Promise<void> {
+  let inventory: Awaited<ReturnType<DeployPrepareClient["listTerminals"]>>;
+  try {
+    // No cwd means every workspace, including managed script terminals.
+    inventory = await client.listTerminals();
+  } catch (error) {
+    throw toCommandError(
+      error,
+      "DEPLOY_TERMINAL_INSPECTION_FAILED",
+      "Cannot establish terminal continuity; activation was not run",
+    );
+  }
+  if (inventory.terminals.length) {
+    throw {
+      code: "DEPLOY_TERMINALS_ACTIVE",
+      message: "Deployment would stop live terminals or managed services; activation was not run.",
+      details: inventory.terminals.map(({ id, name }) => `${name} (${id})`).join(", "),
+    } satisfies CommandError;
+  }
+}
+
+function requirePreparedGeneration(client: DeployPrepareClient, generationId: string): void {
+  const info = client.getLastServerInfoMessage();
+  if (
+    info?.restartRecoveryState !== "paused" ||
+    info.restartRecoveryStage !== "ready" ||
+    info.restartRecoveryGeneration !== generationId
+  ) {
+    throw {
+      code: "DEPLOY_PREPARATION_CHANGED",
+      message: `The daemon no longer reports prepared generation '${generationId}'; activation was not run.`,
+    } satisfies CommandError;
+  }
+}
+
 /**
  * Requests checkpoint preparation from the running daemon. Never spawns activation on a
  * daemon that lacks restart-recovery support, is unreachable, or fails to return a ready
@@ -214,6 +253,7 @@ async function prepareGeneration(
   timeoutMs: number,
   deps: DeployCommandDependencies,
   targetFormats: readonly number[],
+  targetCli: string,
 ): Promise<string> {
   const client = await deps.connectPrepare(state.listen, timeoutMs);
   if (!client) {
@@ -245,6 +285,9 @@ async function prepareGeneration(
         message: `Replacement package cannot read checkpoint format ${format}. The running daemon was not paused.`,
       } satisfies CommandError;
     }
+    // Refuse known live work before interrupting agents. Repeat after Prepare:
+    // its frozen mutation admission and drained scheduler close the start race.
+    await requireNoTerminals(client);
     const result = await client.prepareRestart(reason);
     if (!result.generationId) {
       const error: CommandError = {
@@ -254,6 +297,10 @@ async function prepareGeneration(
       };
       throw error;
     }
+    await deps.validateTarget(targetCli, state.home, result.generationId);
+    requirePreparedGeneration(client, result.generationId);
+    await requireNoTerminals(client);
+    requirePreparedGeneration(client, result.generationId);
     return result.generationId;
   } finally {
     await client.close().catch(() => undefined);
@@ -356,8 +403,14 @@ export async function runDeployCommand(
 
   try {
     const targetFormats = await deps.targetFormats(targetCli);
-    const generationId = await prepareGeneration(state, reason, timeoutMs, deps, targetFormats);
-    await deps.validateTarget(targetCli, state.home, generationId);
+    const generationId = await prepareGeneration(
+      state,
+      reason,
+      timeoutMs,
+      deps,
+      targetFormats,
+      targetCli,
+    );
 
     const activation = await deps.spawnActivation(argv);
     if (activation.code !== 0 || activation.signal) {
