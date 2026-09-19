@@ -119,7 +119,12 @@ This is a refusal policy, not terminal transfer: deployment cannot preserve a
 running managed service by moving it into the replacement. A refusal after
 Prepare leaves the checkpoint and paused daemon intact for diagnosis.
 The complete build and activation run in a finite `systemd-run` unit as the operator,
-outside `paseo.service`, with build logs and the result link retained. Readiness has no
+outside `paseo.service`, with build logs and the result link retained. The launcher
+returns after submission; follow the printed unit with `journalctl -fu <unit>`
+until deployment reports the restored generation. Submission is not deployment success.
+The worker waits for an explicit handoff after `sudo systemd-run` returns, so no
+privileged waiting client remains in the provider tree when checkpointing begins.
+This does not change service OOM preferences or the activation command's privileges. Readiness has no
 default deadline; `--wait-timeout` adds one explicitly and never kills a process.
 
 The VM-wide continuity rules are in `/home/agent/AGENTS.md`. Build and test while

@@ -21,10 +21,33 @@ if [[ "${1:-}" != --worker ]]; then
     echo "Use PASEO_DEPLOY_ENV_FILE to supply credentials to the detached job." >&2
     exit 1
   fi
-  exec sudo systemd-run --unit="$UNIT_NAME" --uid="$(id -u)" --collect --wait \
+  # A privileged --wait client remains in the provider's process tree and
+  # cannot be stopped by the unprivileged daemon during checkpoint preparation.
+  # Launch only, then release the worker after sudo has exited.
+  HANDOFF_DIR="$(mktemp -d /tmp/paseo-deploy-handoff.XXXXXXXX)"
+  printf '%s\n' "$$" > "$HANDOFF_DIR/launcher-pid"
+  ENV_ARGS+=(--setenv="PASEO_DEPLOY_HANDOFF=$HANDOFF_DIR")
+  sudo systemd-run --unit="$UNIT_NAME" --uid="$(id -u)" --collect \
     --working-directory="$PWD" "${ENV_ARGS[@]}" -- "$SCRIPT_PATH" --worker "$@"
+  touch "$HANDOFF_DIR/ready"
+  echo "Deployment submitted; follow completion with: journalctl -fu $UNIT_NAME"
+  exit 0
 fi
 shift
+
+# The worker is already outside Paseo's cgroup. Do not start the build or
+# checkpoint until its privileged launcher has returned to the caller.
+if [[ -n "${PASEO_DEPLOY_HANDOFF:-}" ]]; then
+  LAUNCHER_PID="$(cat "$PASEO_DEPLOY_HANDOFF/launcher-pid")"
+  while [[ ! -f "$PASEO_DEPLOY_HANDOFF/ready" ]]; do
+    if ! kill -0 "$LAUNCHER_PID" 2>/dev/null; then
+      echo "Deployment launcher exited before releasing the worker." >&2
+      exit 1
+    fi
+    sleep 0.1
+  done
+  unset PASEO_DEPLOY_HANDOFF
+fi
 
 FLAKE_REF="${PASEO_DEPLOY_FLAKE:-}"
 REASON="NixOS deployment"
