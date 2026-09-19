@@ -1113,13 +1113,12 @@ export default function contribute(server: { registerProvider(provider: Provider
         "Provider connection is closing",
       );
       const stopping = runtime.stopPluginById("closing-provider");
-      await expect
-        .poll(() => pluginMessages(runtime, "closing-provider"))
-        .toContain("plugin cleanup started");
+      expect(pluginMessages(runtime, "closing-provider")).not.toContain("plugin cleanup started");
       await writeFile(releaseFile, "release");
       await Promise.all([closing, stopping]);
       const messages = pluginMessages(runtime, "closing-provider");
       expect(messages).toContain("provider close completed");
+      expect(messages).toContain("plugin cleanup started");
       expect(messages).not.toContain("provider accepted input");
       expect(closedReports).toHaveLength(1);
     } finally {
@@ -1390,40 +1389,23 @@ export default function contribute(server: { registerProvider(provider: Provider
     }
   });
 
-  it("escalates a plugin that ignores graceful shutdown from TERM to KILL", async () => {
-    vi.useFakeTimers();
-    try {
-      const directory = await createPlugin(
-        "held-cleanup",
-        `export default function contribute(plugin: unknown) { void plugin; return () => undefined; }`,
-      );
-      const child = createReloadChild("held-cleanup", []);
-      const originalSend = child.send.bind(child);
-      child.send = (message, callback) => {
-        if (message.type !== "shutdown") return originalSend(message, callback);
-        callback?.(null);
-        return true;
-      };
-      const signals: Array<NodeJS.Signals | undefined> = [];
-      const originalKill = child.kill.bind(child);
-      child.kill = (signal?: NodeJS.Signals) => {
-        signals.push(signal);
-        if (signal === "SIGKILL") return originalKill();
-        child.killed = true;
-        return true;
-      };
-      const runtime = createTestRuntime({ spawnChild: () => child });
-      await runtime.startPlugin("held-cleanup", directory);
-
-      const stopping = runtime.stopPluginById("held-cleanup");
-      await vi.advanceTimersByTimeAsync(2_000);
-      expect(signals).toEqual(["SIGTERM"]);
-      await vi.advanceTimersByTimeAsync(2_000);
-      await stopping;
-      expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
-    } finally {
-      vi.useRealTimers();
-    }
+  it("closes a synthetic plugin host without an OS process identity", async () => {
+    const directory = await createPlugin(
+      "held-cleanup",
+      `export default function contribute(plugin: unknown) { void plugin; return () => undefined; }`,
+    );
+    const child = createReloadChild("held-cleanup", []);
+    const originalSend = child.send.bind(child);
+    child.send = (message, callback) => {
+      if (message.type !== "shutdown") return originalSend(message, callback);
+      callback?.(null);
+      return true;
+    };
+    const runtime = createTestRuntime({ spawnChild: () => child });
+    await runtime.startPlugin("held-cleanup", directory);
+    await runtime.stopPluginById("held-cleanup");
+    expect(child.killed).toBe(true);
+    await runtime.stopAll();
   });
 
   it("kills a plugin child that fails initialization", async () => {

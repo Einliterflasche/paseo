@@ -97,6 +97,9 @@ export class SessionTurns {
     this.retryTimer = null;
     turn.settle();
   }
+  async drainDispatch(): Promise<void> {
+    await this.turn?.submitted;
+  }
   close() {
     if (this.turn) this.release(this.turn);
   }

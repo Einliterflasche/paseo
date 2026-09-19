@@ -169,6 +169,7 @@ export class V2Harness {
   };
   readonly connection: V2Connection = {
     client: this.api,
+    prepareRelease: async () => undefined,
     release: async () => {
       this.releases += 1;
     },

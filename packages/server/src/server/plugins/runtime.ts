@@ -1,3 +1,6 @@
+import { prepareProcessTreeTermination, terminateWithTreeKill } from "../../utils/tree-kill.js";
+import { ProviderInitializationCleanupError } from "../agent/provider-initialization-cleanup-error.js";
+import { withTimeout } from "../../utils/promise-timeout.js";
 import {
   ProviderStatusSchema,
   type ProviderStatus,
@@ -49,6 +52,10 @@ interface PluginOutputStream {
 }
 
 interface PluginChild {
+  pid?: number;
+  exitCode?: number | null;
+  signalCode?: NodeJS.Signals | null;
+  closeRuntime?(): Promise<void>;
   connected: boolean;
   killed: boolean;
   stdout?: PluginOutputStream | null;
@@ -81,6 +88,11 @@ interface LoadedPlugin {
   providerConnectionTombstones: Set<string>;
   sessionSocket: PluginSessionSocket | null;
   sessionClosed: Promise<void> | null;
+  stopping?: boolean;
+  stopped?: boolean;
+  stopPromise?: Promise<void>;
+  preserveForRestart?: boolean;
+  shutdownReceipt?: { promise: Promise<void>; resolve(): void; reject(error: Error): void };
 }
 
 /** The session socket a loaded plugin currently speaks through. */
@@ -113,6 +125,8 @@ interface RemoteProviderConnection {
   sessions: Map<string, readonly string[]>;
   connected: boolean;
   closed: boolean;
+  certifiedClosed: boolean;
+  closing?: Promise<void>;
   closedPromise: Promise<void>;
   resolveConnected(connection: ProviderConnection): void;
   rejectConnected(error: Error): void;
@@ -237,11 +251,6 @@ function spawnPluginChild(): PluginChild {
   }) as PluginChild;
 }
 
-function terminatePluginChild(child: PluginChild): void {
-  if (child.connected) child.disconnect();
-  if (!child.killed) child.kill();
-}
-
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -297,6 +306,8 @@ export class PluginRuntime {
   private readonly plugins = new Map<string, LoadedPlugin>();
   private readonly logTails = new Map<string, PluginLogTail>();
   private readonly logger: pino.Logger;
+  private readonly childOwners = new Map<PluginChild, { close(): Promise<void> }>();
+  private readonly retiredPlugins = new Set<LoadedPlugin>();
   private readonly spawnChild: () => PluginChild;
   private sessionHost: PluginPaseoSessionHost | null;
   private readonly listeners = new Set<(pluginId: string, error?: string) => void>();
@@ -375,9 +386,8 @@ export class PluginRuntime {
   async stopPluginById(pluginId: string): Promise<boolean> {
     const loaded = this.plugins.get(pluginId);
     if (!loaded) return false;
-    this.plugins.delete(pluginId);
-    this.rejectPending(loaded, `Plugin stopped: ${pluginId}`);
     await this.stopPlugin(loaded);
+    if (this.plugins.get(pluginId) === loaded) this.plugins.delete(pluginId);
     return true;
   }
 
@@ -430,7 +440,7 @@ export class PluginRuntime {
         type: "provider.status",
         requestId: randomUUID(),
         providerId,
-        request,
+        request: { launch: request.launch },
       }),
     );
   }
@@ -441,7 +451,7 @@ export class PluginRuntime {
     request: ProviderConnectRequest,
   ): Promise<ProviderConnection> {
     const loaded = this.plugins.get(pluginId);
-    if (!loaded?.child) throw new Error(`Plugin is not available: ${pluginId}`);
+    if (!loaded?.child || loaded.stopping) throw new Error(`Plugin is not available: ${pluginId}`);
     if (!loaded.providers.some((provider) => provider.id === providerId)) {
       throw new Error(`Plugin ${pluginId} does not contribute provider ${providerId}`);
     }
@@ -467,6 +477,7 @@ export class PluginRuntime {
       sessions: new Map(),
       connected: false,
       closed: false,
+      certifiedClosed: false,
       closedPromise: closed,
       resolveConnected,
       rejectConnected,
@@ -487,7 +498,11 @@ export class PluginRuntime {
       type: "provider.connect",
       providerId,
       connectionId,
-      request,
+      request: {
+        launch: request.launch,
+        versions: request.versions,
+        capabilities: request.capabilities,
+      },
     }).catch((error) => {
       clearTimeout(timeout);
       this.abandonProviderConnect(loaded, connectionId, state, error);
@@ -597,6 +612,8 @@ export class PluginRuntime {
     const child = loaded.child;
     const pluginId = loaded.id;
     if (!child) throw new Error(`Plugin ${pluginId} has no server entry`);
+    if (loaded.stopping && message.type !== "prepare_restart")
+      throw new Error(`Plugin is stopping: ${pluginId}`);
     const requestId = message.requestId;
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -615,13 +632,81 @@ export class PluginRuntime {
     });
   }
 
+  async prepareForRestart(): Promise<void> {
+    const plugins = new Set([...this.plugins.values(), ...this.retiredPlugins]);
+    await Promise.all(
+      [...plugins].map(async (plugin) => {
+        plugin.preserveForRestart = true;
+        plugin.stopping = true;
+        if (plugin.stopped || !plugin.child) return;
+        if (plugin.child.pid !== undefined)
+          await prepareProcessTreeTermination(plugin.child, {
+            timeoutMs: SOFT_SHUTDOWN_TIMEOUT_MS,
+          });
+        if (plugin.child.connected)
+          await this.request(plugin, { type: "prepare_restart", requestId: randomUUID() });
+        await this.stopPlugin(plugin);
+      }),
+    );
+    await Promise.all([...this.childOwners.values()].map((owner) => owner.close()));
+  }
+
   async stopAll(): Promise<void> {
-    const loaded = [...this.plugins.values()];
-    this.plugins.clear();
-    for (const plugin of loaded) {
-      this.rejectPending(plugin, `Plugin stopped: ${plugin.id}`);
+    const plugins = new Set([...this.plugins.values(), ...this.retiredPlugins]);
+    await Promise.all(
+      [...plugins].map(async (plugin) => {
+        await this.stopPlugin(plugin);
+        if (this.plugins.get(plugin.id) === plugin) this.plugins.delete(plugin.id);
+        this.retiredPlugins.delete(plugin);
+      }),
+    );
+    await Promise.all([...this.childOwners.values()].map((owner) => owner.close()));
+  }
+
+  private ownChild(child: PluginChild): { close(): Promise<void> } {
+    const existing = this.childOwners.get(child);
+    if (existing) return existing;
+    let closing: Promise<void> | null = null;
+    const closed = new Promise<void>((resolve) => child.on("close", () => resolve()));
+    if (child.pid !== undefined)
+      void prepareProcessTreeTermination(child, { timeoutMs: SOFT_SHUTDOWN_TIMEOUT_MS }).catch(
+        () => undefined,
+      );
+    const owner = {
+      close: (): Promise<void> => {
+        if (closing) return closing;
+        const attempt = (async () => {
+          if (child.closeRuntime)
+            await withTimeout(child.closeRuntime(), REQUEST_TIMEOUT_MS, "Plugin worker shutdown");
+          else {
+            const result = await terminateWithTreeKill(child, {
+              gracefulTimeoutMs: SOFT_SHUTDOWN_TIMEOUT_MS,
+              forceTimeoutMs: SOFT_SHUTDOWN_TIMEOUT_MS,
+            });
+            if (result === "kill-timeout") throw new Error("Plugin host process did not stop");
+          }
+          // A failed spawn has no OS execution or native output to drain.
+          if (child.closeRuntime || child.pid !== undefined) await closed;
+          this.childOwners.delete(child);
+        })();
+        closing = attempt;
+        void attempt.catch(() => {
+          if (closing === attempt) closing = null;
+        });
+        return attempt;
+      },
+    };
+    this.childOwners.set(child, owner);
+    return owner;
+  }
+
+  private async stopChild(child: PluginChild, error?: unknown): Promise<void> {
+    const owner = this.ownChild(child);
+    try {
+      await owner.close();
+    } catch (cleanupError) {
+      throw new ProviderInitializationCleanupError(owner, error, cleanupError);
     }
-    await Promise.all(loaded.map((plugin) => this.stopPlugin(plugin)));
   }
 
   private async loadDirectoryPlugin(
@@ -671,6 +756,7 @@ export class PluginRuntime {
     clientBundle: string;
   }): Promise<LoadedPlugin> {
     const { pluginId, requirements, child, bundle, clientBundle } = input;
+    this.ownChild(child);
     const sessionHost = this.sessionHost;
     if (!sessionHost) throw new Error("Plugin Paseo session host is not attached");
     const outputCapture = new PluginOutputCapture(child, (stream, message) => {
@@ -684,8 +770,8 @@ export class PluginRuntime {
     const pending = new Map<string, PendingInvocation>();
     const sessionAttachment = await sessionHost
       .attachPluginSocket(pluginId, session.socket)
-      .catch((error) => {
-        terminatePluginChild(child);
+      .catch(async (error) => {
+        await this.stopChild(child, error);
         throw error;
       });
     let loaded: LoadedPlugin | null = null;
@@ -760,7 +846,7 @@ export class PluginRuntime {
     } catch (error) {
       session.socket.close();
       await sessionAttachment.closed;
-      terminatePluginChild(child);
+      await this.stopChild(child, error);
       throw error;
     }
     loaded = {
@@ -842,11 +928,22 @@ export class PluginRuntime {
   }): boolean {
     const { session, pluginId, child } = input;
     return (
-      session.plugin !== null && this.plugins.get(pluginId) === session.plugin && child.connected
+      session.plugin !== null &&
+      !session.plugin.stopping &&
+      this.plugins.get(pluginId) === session.plugin &&
+      child.connected
     );
   }
 
   private handleChildMessage(loaded: LoadedPlugin, message: PluginProcessMessage): void {
+    if (message.type === "shutdown_failed") {
+      loaded.shutdownReceipt?.reject(new Error(message.error));
+      return;
+    }
+    if (message.type === "shutdown_ready") {
+      loaded.shutdownReceipt?.resolve();
+      return;
+    }
     if (message.type === "hooks.changed") {
       loaded.hooks = message.hooks;
       return;
@@ -906,6 +1003,10 @@ export class PluginRuntime {
       this.publishProviderEvent(loaded, message.connectionId, state, message.event);
       return;
     }
+    if (message.type === "provider.close_failed") {
+      state.rejectClosed(new Error(message.error));
+      return;
+    }
     if (message.type === "provider.closed") {
       loaded.providerConnections.delete(message.connectionId);
       if (message.error) {
@@ -913,6 +1014,7 @@ export class PluginRuntime {
         return;
       }
       state.closed = true;
+      state.certifiedClosed = true;
       this.rejectProviderSends(state, "Provider connection closed");
       state.resolveClosed();
     }
@@ -998,6 +1100,7 @@ export class PluginRuntime {
     input: ProviderInput,
   ): Promise<void> {
     if (state.closed) return Promise.reject(new Error("Provider connection is closed"));
+    if (state.closing) return Promise.reject(new Error("Provider connection is closing"));
     try {
       if (input.type === "session.open" || !("sessionId" in input)) {
         requireProviderCapabilities(state.capabilities, input);
@@ -1026,16 +1129,34 @@ export class PluginRuntime {
     });
   }
 
-  private async closeProviderConnection(
+  private closeProviderConnection(
     loaded: LoadedPlugin,
     connectionId: string,
     state: RemoteProviderConnection,
   ): Promise<void> {
-    if (state.closed) return;
+    if (state.certifiedClosed || loaded.stopped) return Promise.resolve();
+    if (state.closing) return state.closing;
     const child = loaded.child;
-    if (!child) throw new Error(`Plugin has no server entry: ${loaded.id}`);
-    await send(child, { type: "provider.close", connectionId });
-    await state.closedPromise;
+    if (!child) return Promise.reject(new Error(`Plugin has no server entry: ${loaded.id}`));
+    const attempt = (async () => {
+      if (!child.connected) {
+        await this.stopChild(child);
+        state.certifiedClosed = true;
+        return;
+      }
+      state.closedPromise = new Promise<void>((resolve, reject) => {
+        state.resolveClosed = resolve;
+        state.rejectClosed = reject;
+      });
+      void state.closedPromise.catch(() => undefined);
+      await send(child, { type: "provider.close", connectionId });
+      await state.closedPromise;
+    })();
+    state.closing = attempt;
+    void attempt.catch(() => {
+      if (state.closing === attempt) state.closing = undefined;
+    });
+    return attempt;
   }
 
   private publishProviderEvent(
@@ -1107,11 +1228,8 @@ export class PluginRuntime {
     state: RemoteProviderConnection,
     error: Error,
   ): void {
-    loaded.providerConnections.delete(connectionId);
     this.failRemoteProviderConnection(state, error);
-    if (loaded.child?.connected) {
-      void send(loaded.child, { type: "provider.close", connectionId }).catch(() => undefined);
-    }
+    void this.closeProviderConnection(loaded, connectionId, state).catch(() => undefined);
   }
 
   private trackAcceptedProviderInput(state: RemoteProviderConnection, input: ProviderInput): void {
@@ -1130,7 +1248,10 @@ export class PluginRuntime {
     const state = connectionId ? loaded.providerConnections.get(connectionId) : undefined;
     if (!connectionId || !state) {
       this.appendLog(loaded.id, "stderr", `[paseo] ${error.message}`);
-      terminatePluginChild(loaded.child!);
+      if (loaded.child)
+        void this.stopChild(loaded.child).catch((failure) =>
+          this.logger.warn({ err: failure }, "Failed to stop malformed plugin host"),
+        );
       return;
     }
     this.failProviderConnection(loaded, connectionId, state, error);
@@ -1160,59 +1281,84 @@ export class PluginRuntime {
   private async handleChildClose(loaded: LoadedPlugin): Promise<void> {
     loaded.sessionSocket?.peerClosed();
     const wasPublished = this.plugins.get(loaded.id) === loaded;
-    if (wasPublished) {
+    if (wasPublished && !loaded.preserveForRestart) {
       this.plugins.delete(loaded.id);
+      this.retiredPlugins.add(loaded);
     }
+    loaded.shutdownReceipt?.reject(
+      new Error(`Plugin process exited before shutdown receipt: ${loaded.id}`),
+    );
     this.rejectPending(loaded, `Plugin process exited: ${loaded.id}`);
     for (const state of loaded.providerConnections.values()) {
       this.failRemoteProviderConnection(state, new Error(`Plugin process exited: ${loaded.id}`));
     }
-    loaded.providerConnections.clear();
     await loaded.sessionClosed;
-    if (wasPublished) this.notify(loaded.id, `Plugin process exited: ${loaded.id}`);
+    if (wasPublished && !loaded.preserveForRestart)
+      this.notify(loaded.id, `Plugin process exited: ${loaded.id}`);
   }
 
-  private async stopPlugin(loaded: LoadedPlugin): Promise<void> {
+  private stopPlugin(loaded: LoadedPlugin): Promise<void> {
+    if (loaded.stopped) return Promise.resolve();
+    if (loaded.stopPromise) return loaded.stopPromise;
+    const attempt = this.stopPluginRuntime(loaded);
+    loaded.stopPromise = attempt;
+    void attempt.catch(() => {
+      if (loaded.stopPromise === attempt) loaded.stopPromise = undefined;
+    });
+    return attempt;
+  }
+
+  private async stopPluginRuntime(loaded: LoadedPlugin): Promise<void> {
+    loaded.stopping = true;
+    this.retiredPlugins.add(loaded);
     this.appendLog(loaded.id, "stdout", "[paseo] Stopping plugin");
-    for (const [connectionId, state] of loaded.providerConnections) {
-      if (state.connected) continue;
-      this.abandonProviderConnect(
-        loaded,
-        connectionId,
-        state,
-        new Error(`Plugin stopped: ${loaded.id}`),
-      );
-    }
     const { child, sessionSocket, sessionClosed } = loaded;
     if (!child || !sessionSocket || !sessionClosed) {
-      this.appendLog(loaded.id, "stdout", "[paseo] Plugin stopped");
+      loaded.stopped = true;
+      this.retiredPlugins.delete(loaded);
       return;
     }
-    if (child.killed) {
-      sessionSocket.peerClosed();
-      await sessionClosed;
-      this.appendLog(loaded.id, "stdout", "[paseo] Plugin stopped");
-      return;
-    }
-    const closed = new Promise<void>((resolve) =>
-      child.on("close", () => {
-        resolve();
+    if (child.pid !== undefined)
+      await prepareProcessTreeTermination(child, { timeoutMs: SOFT_SHUTDOWN_TIMEOUT_MS });
+    await Promise.all(
+      [...loaded.providerConnections].map(async ([connectionId, state]) => {
+        if (!state.connected) {
+          this.abandonProviderConnect(
+            loaded,
+            connectionId,
+            state,
+            new Error(`Plugin stopped: ${loaded.id}`),
+          );
+          return;
+        }
+        await this.closeProviderConnection(loaded, connectionId, state);
       }),
     );
     if (child.connected) {
-      await send(child, { type: "shutdown" }).catch(() => undefined);
+      if (child.pid !== undefined) {
+        let resolve!: () => void;
+        let reject!: (error: Error) => void;
+        const promise = new Promise<void>((onResolve, onReject) => {
+          resolve = onResolve;
+          reject = onReject;
+        });
+        void promise.catch(() => undefined);
+        loaded.shutdownReceipt = { promise, resolve, reject };
+      }
+      await send(child, { type: "shutdown" });
+      if (loaded.shutdownReceipt)
+        await withTimeout(
+          loaded.shutdownReceipt.promise,
+          REQUEST_TIMEOUT_MS,
+          "Plugin shutdown receipt",
+        );
     }
-    let forceTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-      if (!child.killed) child.kill("SIGTERM");
-      forceTimer = setTimeout(() => {
-        child.kill("SIGKILL");
-      }, SOFT_SHUTDOWN_TIMEOUT_MS);
-    }, SOFT_SHUTDOWN_TIMEOUT_MS);
-    await closed.finally(() => {
-      if (forceTimer) clearTimeout(forceTimer);
-    });
+    await this.stopChild(child);
     sessionSocket.peerClosed();
     await sessionClosed;
+    loaded.stopped = true;
+    this.retiredPlugins.delete(loaded);
+    this.rejectPending(loaded, `Plugin stopped: ${loaded.id}`);
     this.appendLog(loaded.id, "stdout", "[paseo] Plugin stopped");
   }
 

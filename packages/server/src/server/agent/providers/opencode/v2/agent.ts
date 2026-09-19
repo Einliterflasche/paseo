@@ -1,3 +1,4 @@
+import { ProviderInitializationCleanupError } from "../../../provider-initialization-cleanup-error.js";
 import { OpenCodeV2Session } from "./session.js";
 import { V2_CAPABILITIES } from "./capabilities.js";
 import {
@@ -17,6 +18,8 @@ import type {
   AgentCapabilityFlags,
   AgentClient,
   AgentCreateSessionOptions,
+  AgentProbeContext,
+  AgentResumeSessionOptions,
   AgentFeature,
   AgentLaunchContext,
   AgentPersistenceHandle,
@@ -50,6 +53,65 @@ interface V2AgentOptions {
   runtime?: Pick<V2Runtime, "acquire" | "shutdown">;
 }
 
+interface OwnedV2Connection {
+  get(): Promise<V2Connection>;
+  attach(session: AgentSession): void;
+  close(): Promise<void>;
+}
+
+function ownV2Connection(
+  acquisition: Promise<V2Connection>,
+  probe?: AgentProbeContext,
+): OwnedV2Connection {
+  const pending = acquisition.then(
+    (value) => ({ value }),
+    (error: unknown) => ({ error }),
+  );
+  let session: AgentSession | null = null;
+  let closing: Promise<void> | null = null;
+  let disown: (() => void) | undefined;
+  const ownership: OwnedV2Connection = {
+    async get() {
+      const acquired = await pending;
+      if ("error" in acquired) throw acquired.error;
+      probe?.signal.throwIfAborted();
+      return acquired.value;
+    },
+    attach(value) {
+      session = value;
+    },
+    close() {
+      if (closing) return closing;
+      const attempt = (async () => {
+        const acquired = await pending;
+        if (session) await session.close();
+        else if ("value" in acquired) await acquired.value.release();
+        else if (acquired.error instanceof ProviderInitializationCleanupError)
+          await acquired.error.cleanup.close();
+        disown?.();
+      })();
+      closing = attempt;
+      void attempt.catch(() => {
+        if (closing === attempt) closing = null;
+      });
+      return attempt;
+    },
+  };
+  disown = probe?.own(ownership);
+  return ownership;
+}
+
+async function closeV2Connection(
+  ownership: OwnedV2Connection,
+  operationError?: unknown,
+): Promise<void> {
+  try {
+    await ownership.close();
+  } catch (cleanupError) {
+    throw new ProviderInitializationCleanupError(ownership, operationError, cleanupError);
+  }
+}
+
 export class OpenCodeV2AgentClient implements AgentClient {
   readonly provider = "opencode";
   readonly capabilities: AgentCapabilityFlags;
@@ -71,10 +133,14 @@ export class OpenCodeV2AgentClient implements AgentClient {
     await this.runtime.shutdown();
   }
   async fetchCatalog(options: FetchCatalogOptions, context?: ProviderRefreshContext) {
-    const connection = await this.runtime.acquire({
-      fresh: options.force,
-      signal: context?.signal,
-    });
+    const ownership = ownV2Connection(
+      this.runtime.acquire({
+        fresh: options.force,
+        signal: context?.signal,
+      }),
+      context?.probe,
+    );
+    const connection = await ownership.get();
     const location = {
       directory: options.scope === "workspace" ? options.cwd : resolveOpenCodeHomeDir(),
     };
@@ -96,7 +162,7 @@ export class OpenCodeV2AgentClient implements AgentClient {
         );
       return { models: modelsFromV2(models.data), modes: modesFromV2(agents.data) };
     } finally {
-      await connection.release();
+      await closeV2Connection(ownership);
     }
   }
   async createSession(
@@ -104,10 +170,15 @@ export class OpenCodeV2AgentClient implements AgentClient {
     launch?: AgentLaunchContext,
     options?: AgentCreateSessionOptions,
   ): Promise<AgentSession> {
-    const connection = await this.runtime.acquire(
-      requiresDedicatedV2Server(config, launch) ? { env: launch?.env, dedicated: true } : {},
+    const ownership = ownV2Connection(
+      this.runtime.acquire({
+        ...(requiresDedicatedV2Server(config, launch) ? { env: launch?.env, dedicated: true } : {}),
+        signal: options?.probe?.signal,
+      }),
+      options?.probe,
     );
     try {
+      const connection = await ownership.get();
       const info = await connection.client.session.create({
         location: { directory: config.cwd },
         title: config.title,
@@ -115,9 +186,16 @@ export class OpenCodeV2AgentClient implements AgentClient {
         model: config.model ? modelRef(config.model, config.thinkingOptionId) : undefined,
         permissions: permissionRules(config),
       });
-      return await this.attach(connection, info, config, launch, options?.persistSession !== false);
+      return await this.attach(
+        connection,
+        info,
+        config,
+        launch,
+        options?.persistSession !== false,
+        ownership,
+      );
     } catch (error) {
-      await connection.release();
+      await closeV2Connection(ownership, error);
       throw error;
     }
   }
@@ -125,6 +203,7 @@ export class OpenCodeV2AgentClient implements AgentClient {
     handle: AgentPersistenceHandle,
     overrides?: Partial<AgentSessionConfig>,
     launch?: AgentLaunchContext,
+    _options?: AgentResumeSessionOptions,
   ): Promise<AgentSession> {
     const cwd = overrides?.cwd ?? handle.metadata?.cwd;
     if (typeof cwd !== "string")
@@ -135,19 +214,23 @@ export class OpenCodeV2AgentClient implements AgentClient {
       provider: "opencode",
       cwd,
     };
-    const connection =
-      this.connections.get(handle.nativeHandle ?? handle.sessionId)?.retain() ??
-      (await this.runtime.acquire(
-        requiresDedicatedV2Server(config, launch) ? { env: launch?.env, dedicated: true } : {},
-      ));
+    const retained = this.connections.get(handle.nativeHandle ?? handle.sessionId)?.retain();
+    const ownership = ownV2Connection(
+      retained
+        ? Promise.resolve(retained)
+        : this.runtime.acquire(
+            requiresDedicatedV2Server(config, launch) ? { env: launch?.env, dedicated: true } : {},
+          ),
+    );
     try {
+      const connection = await ownership.get();
       const info = await connection.client.session.get({
         sessionID: handle.nativeHandle ?? handle.sessionId,
       });
       await applyResumeOverrides(connection.client, info, overrides);
-      return await this.attach(connection, info, config, launch, true);
+      return await this.attach(connection, info, config, launch, true, ownership);
     } catch (error) {
-      await connection.release();
+      await closeV2Connection(ownership, error);
       throw error;
     }
   }
@@ -157,6 +240,7 @@ export class OpenCodeV2AgentClient implements AgentClient {
     config: AgentSessionConfig,
     launch: AgentLaunchContext | undefined,
     persist: boolean,
+    ownership?: OwnedV2Connection,
   ) {
     const acquire = () =>
       this.runtime.acquire(
@@ -203,6 +287,7 @@ export class OpenCodeV2AgentClient implements AgentClient {
       acquire,
       moved,
     );
+    ownership?.attach(session);
     try {
       if (this.options.bridge) {
         const location = { directory: config.cwd };
@@ -215,25 +300,32 @@ export class OpenCodeV2AgentClient implements AgentClient {
       );
       return session;
     } catch (error) {
-      await session.close();
+      try {
+        await session.close();
+      } catch (cleanupError) {
+        throw new ProviderInitializationCleanupError(session, error, cleanupError);
+      }
       throw error;
     }
   }
   async listFeatures(config: AgentSessionConfig): Promise<AgentFeature[]> {
     return features(config);
   }
-  async listCommands(config: AgentSessionConfig) {
-    const connection = await this.runtime.acquire();
+  async listCommands(config: AgentSessionConfig, probe?: AgentProbeContext) {
+    const ownership = ownV2Connection(this.runtime.acquire({ signal: probe?.signal }), probe);
+    const connection = await ownership.get();
     try {
       return await commands(connection.client, config.cwd);
     } finally {
-      await connection.release();
+      await closeV2Connection(ownership);
     }
   }
   async listImportableSessions(
     options: ListImportableSessionsOptions = {},
+    probe?: AgentProbeContext,
   ): Promise<ImportableProviderSession[]> {
-    const connection = await this.runtime.acquire();
+    const ownership = ownV2Connection(this.runtime.acquire({ signal: probe?.signal }), probe);
+    const connection = await ownership.get();
     try {
       const sessions: SessionInfo[] = [];
       let cursor: string | undefined;
@@ -258,11 +350,12 @@ export class OpenCodeV2AgentClient implements AgentClient {
           lastActivityAt: new Date(info.time.updated),
         }));
     } finally {
-      await connection.release();
+      await closeV2Connection(ownership);
     }
   }
   async importSession(input: ImportProviderSessionInput, context: ImportProviderSessionContext) {
-    const connection = await this.runtime.acquire();
+    const ownership = ownV2Connection(this.runtime.acquire());
+    const connection = await ownership.get();
     try {
       const info = await connection.client.session.get({ sessionID: input.providerHandleId });
       return await importSessionFromPersistence({
@@ -277,7 +370,7 @@ export class OpenCodeV2AgentClient implements AgentClient {
         },
       });
     } finally {
-      await connection.release();
+      await closeV2Connection(ownership);
     }
   }
 }

@@ -33,7 +33,7 @@ export type PluginProcessRequest =
       type: "provider.status";
       requestId: string;
       providerId: string;
-      request: ProviderStatusRequest;
+      request: Omit<ProviderStatusRequest, "processes">;
     }
   | {
       type: "initialize";
@@ -59,7 +59,7 @@ export type PluginProcessRequest =
       type: "provider.connect";
       providerId: string;
       connectionId: string;
-      request: ProviderConnectRequest;
+      request: Omit<ProviderConnectRequest, "processes">;
     }
   | {
       type: "provider.send";
@@ -68,6 +68,7 @@ export type PluginProcessRequest =
       input: ProviderInput;
     }
   | { type: "provider.close"; connectionId: string }
+  | { type: "prepare_restart"; requestId: string }
   | { type: "shutdown" }
   | { type: "paseo_frame"; data: string | Uint8Array; isBinary: boolean }
   | { type: "paseo_close" };
@@ -101,6 +102,9 @@ export type PluginProcessMessage =
     }
   | { type: "provider.event"; connectionId: string; event: ProviderEvent }
   | { type: "provider.closed"; connectionId: string; error?: string }
+  | { type: "provider.close_failed"; connectionId: string; error: string }
+  | { type: "shutdown_failed"; error: string }
+  | { type: "shutdown_ready" }
   | { type: "paseo_frame"; data: string | Uint8Array; isBinary: boolean }
   | { type: "paseo_close" };
 
@@ -235,6 +239,7 @@ export const PluginProcessRequestSchema: z.ZodType<PluginProcessRequest> = z.dis
       })
       .strict(),
     z.object({ type: z.literal("provider.close"), connectionId: z.string().min(1) }).strict(),
+    z.object({ type: z.literal("prepare_restart"), requestId: z.string().min(1) }).strict(),
     z.object({ type: z.literal("shutdown") }).strict(),
     z.object({ type: z.literal("paseo_frame"), ...frameFields }).strict(),
     z.object({ type: z.literal("paseo_close") }).strict(),
@@ -306,6 +311,15 @@ export const PluginProcessMessageSchema: z.ZodType<PluginProcessMessage> = z.dis
         error: z.string().optional(),
       })
       .strict(),
+    z
+      .object({
+        type: z.literal("provider.close_failed"),
+        connectionId: z.string().min(1),
+        error: z.string(),
+      })
+      .strict(),
+    z.object({ type: z.literal("shutdown_failed"), error: z.string() }).strict(),
+    z.object({ type: z.literal("shutdown_ready") }).strict(),
     z.object({ type: z.literal("paseo_frame"), ...frameFields }).strict(),
     z.object({ type: z.literal("paseo_close") }).strict(),
   ],

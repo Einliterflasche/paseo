@@ -28,6 +28,9 @@ export class SessionUsage {
       .then(() => this.report(tokens))
       .catch((error: unknown) => this.options.reportError(error));
   }
+  async drain(): Promise<void> {
+    await this.reports;
+  }
   private async report(tokens: TokenUsageInfo) {
     const model = this.options.info().model;
     const contextWindowMaxTokens = model ? await this.contextLimit(model) : undefined;

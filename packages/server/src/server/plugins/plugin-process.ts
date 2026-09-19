@@ -1,3 +1,4 @@
+import { PluginProviderProcesses } from "../agent/plugin-provider-processes.js";
 import { PluginHookHandlers } from "./lifecycle/index.js";
 import { evaluateBundle } from "./bundle-evaluator.js";
 import {
@@ -67,13 +68,39 @@ export function createPluginWorker(options: {
   const usageSources = new Map<string, UsageSourceRegistration>();
   const providerConnections = new Map<
     string,
-    { connection: ProviderConnection; unsubscribe: () => void; closing?: Promise<void> }
+    {
+      connection: ProviderConnection;
+      processes: PluginProviderProcesses;
+      unsubscribe: () => void;
+      closing?: Promise<void>;
+    }
   >();
   const pendingProviderConnections = new Map<string, { tombstoned: boolean }>();
   let cleanup: (() => void | Promise<void>) | null = null;
   let daemonClient: DaemonClient | null = null;
   let paseo: PaseoApi | null = null;
   let stopping = false;
+  let preparingRestart = false;
+  let preparation: Promise<void> | null = null;
+  let shutdownPromise: Promise<void> | null = null;
+  const activeProcesses = new Set<PluginProviderProcesses>();
+  const nativeRequests = new Set<Promise<void>>();
+  function createProcesses(): PluginProviderProcesses {
+    const processes = new PluginProviderProcesses((owned) => {
+      if (owned) activeProcesses.add(processes);
+      else activeProcesses.delete(processes);
+    });
+    return processes;
+  }
+  function trackNative(operation: Promise<void>): Promise<void> {
+    nativeRequests.add(operation);
+    void operation.then(
+      () => nativeRequests.delete(operation),
+      () => nativeRequests.delete(operation),
+    );
+    return operation;
+  }
+
   function send(message: PluginProcessMessage): void {
     channel.send(message);
   }
@@ -179,20 +206,23 @@ export function createPluginWorker(options: {
     const pending = { tombstoned: false };
     pendingProviderConnections.set(message.connectionId, pending);
     let connection: ProviderConnection;
+    const processes = createProcesses();
     try {
-      connection = await provider.connect(message.request);
+      connection = await provider.connect({ ...message.request, processes });
     } catch (error) {
       pendingProviderConnections.delete(message.connectionId);
+      await processes.close();
       if (pending.tombstoned || stopping) return;
       throw error;
     }
     pendingProviderConnections.delete(message.connectionId);
+    const state = { connection, processes, unsubscribe: () => {} };
+    providerConnections.set(message.connectionId, state);
     if (pending.tombstoned || stopping) {
-      await connection.close().catch(() => undefined);
+      await closeProviderConnection(message.connectionId);
       return;
     }
-    let unsubscribe = () => {};
-    unsubscribe = connection.onEvent((event) => {
+    state.unsubscribe = connection.onEvent((event) => {
       try {
         send({
           type: "provider.event",
@@ -200,17 +230,14 @@ export function createPluginWorker(options: {
           event: ProviderEventSchema.parse(jsonTransportValue(event)),
         });
       } catch (error) {
-        providerConnections.delete(message.connectionId);
-        unsubscribe();
-        void connection.close().catch(() => undefined);
+        void closeProviderConnection(message.connectionId).catch(() => undefined);
         send({
-          type: "provider.closed",
+          type: "provider.close_failed",
           connectionId: message.connectionId,
           error: describeError(error),
         });
       }
     });
-    providerConnections.set(message.connectionId, { connection, unsubscribe });
     send({
       type: "provider.connected",
       connectionId: message.connectionId,
@@ -241,18 +268,39 @@ export function createPluginWorker(options: {
     if (!current) return;
     if (current.closing) return current.closing;
     const closing = (async () => {
-      current.unsubscribe();
       try {
         await current.connection.close();
+        await current.processes.close();
+        current.unsubscribe();
+        providerConnections.delete(connectionId);
         send({ type: "provider.closed", connectionId });
       } catch (error) {
-        send({ type: "provider.closed", connectionId, error: describeError(error) });
-      } finally {
-        providerConnections.delete(connectionId);
+        send({ type: "provider.close_failed", connectionId, error: describeError(error) });
+        throw error;
       }
     })();
     current.closing = closing;
+    void closing.catch(() => {
+      if (current.closing === closing) current.closing = undefined;
+    });
     return closing;
+  }
+
+  function prepareForRestart(): Promise<void> {
+    if (preparation) return preparation;
+    preparingRestart = true;
+    const attempt = (async () => {
+      // Stop initialized workers first so pending native handshakes can reject and drain.
+      await Promise.all([...activeProcesses].map((processes) => processes.close()));
+      await Promise.allSettled(nativeRequests);
+      await Promise.all([...providerConnections.keys()].map(closeProviderConnection));
+      await Promise.all([...activeProcesses].map((processes) => processes.close()));
+    })();
+    preparation = attempt;
+    void attempt.catch(() => {
+      if (preparation === attempt) preparation = null;
+    });
+    return attempt;
   }
 
   const transportFactory = createPluginDaemonTransportFactory({
@@ -314,28 +362,28 @@ export function createPluginWorker(options: {
     });
   }
 
-  async function shutdown(): Promise<void> {
-    if (stopping) return;
+  function shutdown(): Promise<void> {
+    if (shutdownPromise) return shutdownPromise;
     stopping = true;
-    const releaseApi = paseo
-      ?.dispose()
-      .catch((error) => console.error("Plugin API cleanup failed", error));
-    hooks.close();
-    for (const pending of pendingProviderConnections.values()) pending.tombstoned = true;
-    const currentCleanup = cleanup;
-    cleanup = null;
-    try {
-      await currentCleanup?.();
-    } catch (error) {
-      console.error("Plugin cleanup failed", error);
-    }
-    await Promise.all([...providerConnections.keys()].map(closeProviderConnection));
-    await releaseApi;
-    await daemonClient?.close().catch(() => undefined);
-    await sendAndWait({ type: "paseo_close" });
-    daemonClient = null;
-    paseo = null;
-    channel.disconnect();
+    const attempt = (async () => {
+      await prepareForRestart();
+      hooks.close();
+      await cleanup?.();
+      cleanup = null;
+      await paseo?.dispose();
+      await daemonClient?.close();
+      await sendAndWait({ type: "shutdown_ready" });
+      await sendAndWait({ type: "paseo_close" });
+      daemonClient = null;
+      paseo = null;
+      channel.disconnect();
+    })();
+    shutdownPromise = attempt;
+    void attempt.catch((error) => {
+      if (shutdownPromise === attempt) shutdownPromise = null;
+      send({ type: "shutdown_failed", error: describeError(error) });
+    });
+    return attempt;
   }
 
   function handleUsageRequest(
@@ -344,19 +392,22 @@ export function createPluginWorker(options: {
       { type: "usage.identify" | "usage.fetch" | "usage.discover" }
     >,
   ): void {
-    void (async () => {
-      const source = usageSources.get(message.sourceId);
-      if (!source) throw new Error(`Unknown usage source: ${message.sourceId}`);
-      if (message.type === "usage.discover") return jsonTransportValue(await source.discover());
-      const input = await source.input.parseAsync(message.input);
-      return jsonTransportValue(
-        message.type === "usage.identify"
-          ? await source.identify(input)
-          : await source.fetch(input),
-      );
-    })().then(
-      (output) => send({ type: "result", requestId: message.requestId, output }),
-      (error) => send({ type: "error", requestId: message.requestId, error: describeError(error) }),
+    void trackNative(
+      (async () => {
+        const source = usageSources.get(message.sourceId);
+        if (!source) throw new Error(`Unknown usage source: ${message.sourceId}`);
+        if (message.type === "usage.discover") return jsonTransportValue(await source.discover());
+        const input = await source.input.parseAsync(message.input);
+        return jsonTransportValue(
+          message.type === "usage.identify"
+            ? await source.identify(input)
+            : await source.fetch(input),
+        );
+      })().then(
+        (output) => send({ type: "result", requestId: message.requestId, output }),
+        (error) =>
+          send({ type: "error", requestId: message.requestId, error: describeError(error) }),
+      ),
     );
   }
 
@@ -383,30 +434,30 @@ export function createPluginWorker(options: {
         error: "Plugin is stopping",
       });
     } else if (message.type === "provider.close") {
-      send({ type: "provider.closed", connectionId: message.connectionId });
+      void closeProviderConnection(message.connectionId).catch(() => undefined);
     }
+  }
+
+  function rejectInvalidMessage(rawMessage: unknown, error: string): void {
+    const value = rawMessage as { connectionId?: unknown; acceptanceId?: unknown } | null;
+    if (value && typeof value.connectionId === "string" && typeof value.acceptanceId === "string") {
+      send({
+        type: "provider.rejected",
+        connectionId: value.connectionId,
+        acceptanceId: value.acceptanceId,
+        error: `Invalid provider input: ${error}`,
+      });
+      void closeProviderConnection(value.connectionId).catch(() => undefined);
+      return;
+    }
+    send({ type: "fatal", error: `Invalid plugin process request: ${error}` });
+    void shutdown().catch(() => undefined);
   }
 
   function handleMessage(rawMessage: unknown): void {
     const parsed = PluginProcessRequestSchema.safeParse(rawMessage);
     if (!parsed.success) {
-      const value = rawMessage as { connectionId?: unknown; acceptanceId?: unknown } | null;
-      if (
-        value &&
-        typeof value.connectionId === "string" &&
-        typeof value.acceptanceId === "string"
-      ) {
-        send({
-          type: "provider.rejected",
-          connectionId: value.connectionId,
-          acceptanceId: value.acceptanceId,
-          error: `Invalid provider input: ${parsed.error.message}`,
-        });
-        void closeProviderConnection(value.connectionId);
-        return;
-      }
-      send({ type: "fatal", error: `Invalid plugin process request: ${parsed.error.message}` });
-      void shutdown();
+      rejectInvalidMessage(rawMessage, parsed.error.message);
       return;
     }
     const message = parsed.data;
@@ -421,34 +472,54 @@ export function createPluginWorker(options: {
       return;
     }
     if (message.type === "shutdown") {
-      void shutdown();
+      void shutdown().catch(() => undefined);
       return;
     }
-    if (stopping) {
+    if (message.type === "prepare_restart") {
+      void prepareForRestart().then(
+        () => send({ type: "result", requestId: message.requestId, output: null }),
+        (error) =>
+          send({ type: "error", requestId: message.requestId, error: describeError(error) }),
+      );
+      return;
+    }
+    if (stopping || preparingRestart) {
       rejectWhileStopping(message);
       return;
     }
     if (message.type === "provider.status") {
-      void (async () => {
-        const provider = providers.get(message.providerId);
-        if (!provider || !provider.status)
-          throw new Error(`Provider has no status capability: ${message.providerId}`);
-        const output = ProviderStatusSchema.parse(await provider.status(message.request));
-        send({ type: "result", requestId: message.requestId, output });
-      })().catch((error) =>
+      void trackNative(
+        (async () => {
+          const provider = providers.get(message.providerId);
+          if (!provider || !provider.status)
+            throw new Error(`Provider has no status capability: ${message.providerId}`);
+          const processes = createProcesses();
+          try {
+            const output = ProviderStatusSchema.parse(
+              await provider.status({ ...message.request, processes }),
+            );
+            await processes.close();
+            send({ type: "result", requestId: message.requestId, output });
+          } finally {
+            await processes.close();
+          }
+        })(),
+      ).catch((error) =>
         send({ type: "error", requestId: message.requestId, error: describeError(error) }),
       );
       return;
     }
     if (message.type === "provider.catalog_key") {
-      void (async () => {
-        const provider = providers.get(message.providerId);
-        if (!provider) throw new Error(`Unknown provider: ${message.providerId}`);
-        const output = await provider.getCatalogCacheKey?.(message.options);
-        if (output !== undefined && typeof output !== "string")
-          throw new Error("Invalid catalogue key");
-        send({ type: "result", requestId: message.requestId, output });
-      })().catch((error) =>
+      void trackNative(
+        (async () => {
+          const provider = providers.get(message.providerId);
+          if (!provider) throw new Error(`Unknown provider: ${message.providerId}`);
+          const output = await provider.getCatalogCacheKey?.(message.options);
+          if (output !== undefined && typeof output !== "string")
+            throw new Error("Invalid catalogue key");
+          send({ type: "result", requestId: message.requestId, output });
+        })(),
+      ).catch((error) =>
         send({ type: "error", requestId: message.requestId, error: describeError(error) }),
       );
       return;
@@ -462,7 +533,7 @@ export function createPluginWorker(options: {
       return;
     }
     if (message.type === "provider.connect") {
-      void connectProvider(message).catch((error) => {
+      void trackNative(connectProvider(message)).catch((error) => {
         if (stopping) return;
         send({
           type: "provider.connect_failed",
@@ -473,7 +544,7 @@ export function createPluginWorker(options: {
       return;
     }
     if (message.type === "provider.send") {
-      void sendProviderInput(message).catch((error) => {
+      void trackNative(sendProviderInput(message)).catch((error) => {
         if (stopping) return;
         send({
           type: "provider.rejected",
@@ -485,7 +556,7 @@ export function createPluginWorker(options: {
       return;
     }
     if (message.type === "provider.close") {
-      void closeProviderConnection(message.connectionId);
+      void closeProviderConnection(message.connectionId).catch(() => undefined);
       return;
     }
     if (message.type === "paseo_frame" || message.type === "paseo_close") return;

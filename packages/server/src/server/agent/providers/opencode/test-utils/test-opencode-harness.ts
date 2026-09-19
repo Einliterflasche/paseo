@@ -74,6 +74,7 @@ export class TestOpenCodeHarness implements OpenCodeServerManagerLike {
     return {
       server: this.server,
       events: this.events,
+      prepareRelease: async () => {},
       release: async () => {
         acquisition.releaseCount += 1;
       },

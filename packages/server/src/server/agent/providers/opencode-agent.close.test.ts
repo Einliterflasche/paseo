@@ -83,6 +83,41 @@ test("OpenCode requires runner idle evidence after abort acknowledgement", async
   expect(runtime.acquisitions[0]?.releaseCount).toBe(1);
 });
 
+test("OpenCode captures server ownership before native stop and retains failed preparation for retry", async () => {
+  const preparation = deferred<void>();
+  class PreparingHarness extends TestOpenCodeHarness {
+    failure: Error | null = new Error("process ownership not established");
+    override async acquireCurrent() {
+      const acquisition = await super.acquireCurrent();
+      return {
+        ...acquisition,
+        prepareRelease: async () => {
+          if (this.failure) throw this.failure;
+          await preparation.promise;
+        },
+      };
+    }
+  }
+  const runtime = new PreparingHarness();
+  const sdk = new TestOpenCodeClient();
+  runtime.enqueueClient(sdk);
+  const provider = new OpenCodeAgentClient(createTestLogger(), undefined, {
+    serverManager: runtime,
+    createClient: runtime.createClient,
+  });
+  const session = await provider.createSession({ provider: "opencode", cwd: "/workspace/repo" });
+  await expect(session.close()).rejects.toThrow("process ownership not established");
+  expect(sdk.calls.sessionAbort).toEqual([]);
+  expect(runtime.acquisitions[0]?.releaseCount).toBe(0);
+  runtime.failure = null;
+  const closing = session.close();
+  expect(sdk.calls.sessionAbort).toEqual([]);
+  preparation.resolve();
+  await closing;
+  expect(sdk.calls.sessionAbort).toHaveLength(1);
+  expect(runtime.acquisitions[0]?.releaseCount).toBe(1);
+});
+
 test("OpenCode transfers its unreleased acquisition when session creation fails", async () => {
   class FailingReleaseHarness extends TestOpenCodeHarness {
     failure: Error | null = new Error("server termination unconfirmed");

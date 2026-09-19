@@ -2,6 +2,7 @@ import type { z } from "zod";
 import type {
   ProviderInput,
   ProviderLaunch,
+  ProviderProcessLifecycle,
   ProviderSessionSummary,
 } from "@getpaseo/plugin/server/provider";
 import { MspConnection } from "./connection.js";
@@ -9,11 +10,12 @@ import { sessionListSchema } from "./wire.js";
 
 export class Sessions {
   private readonly hosts = new Set<MspConnection>();
+  constructor(private readonly processes?: ProviderProcessLifecycle) {}
   async list(
     launch: ProviderLaunch,
     input: Extract<ProviderInput, { type: "sessions" }>,
   ): Promise<ProviderSessionSummary[]> {
-    const host = new MspConnection({ launch });
+    const host = new MspConnection({ launch, processes: this.processes });
     this.hosts.add(host);
     try {
       await host.initialize();

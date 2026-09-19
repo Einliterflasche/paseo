@@ -141,9 +141,10 @@ async function awaitOwnedExecution(
   const child = execution.child;
   const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
   let closing: Promise<void> | undefined;
+  let completedExecution = false;
   const close = (): Promise<void> => {
     if (!closing) {
-      const attempt = closeOwnedCommand(child, closed);
+      const attempt = closeOwnedCommand(child, closed, completedExecution);
       closing = attempt;
       void attempt.catch(() => {
         if (closing === attempt) closing = undefined;
@@ -151,7 +152,8 @@ async function awaitOwnedExecution(
     }
     return closing;
   };
-  const release = probe.own({ close });
+  const cleanup = { close };
+  const release = probe.own(cleanup);
   const signal = options.signal ? AbortSignal.any([probe.signal, options.signal]) : probe.signal;
   let interruption: unknown;
   const interrupt = (reason: unknown) => {
@@ -170,21 +172,43 @@ async function awaitOwnedExecution(
       : undefined;
   // Owned commands stop through one tree-aware path. Letting execFile's abort
   // or timeout kill only the leader first can orphan its native descendants.
+  let outcome: { ok: true; result: ExecCommandResult } | { ok: false; error: unknown };
   try {
     const result = await execution;
+    completedExecution = true;
     if (interruption !== undefined) throw interruption;
-    return result;
+    outcome = { ok: true, result };
   } catch (error) {
-    throw interruption ?? error;
+    outcome = { ok: false, error: interruption ?? error };
   } finally {
     signal.removeEventListener("abort", onAbort);
     if (timer) clearTimeout(timer);
-    await close();
-    release();
   }
+  let cleanupFailure: { error: unknown } | undefined;
+  try {
+    await close();
+  } catch (cleanupError) {
+    cleanupFailure = { error: cleanupError };
+  }
+  if (cleanupFailure) {
+    if (!outcome.ok)
+      throw new AggregateError(
+        [outcome.error, cleanupFailure.error],
+        "Provider query failed and cleanup is unconfirmed",
+        { cause: cleanupFailure.error },
+      );
+    throw cleanupFailure.error;
+  }
+  release();
+  if (!outcome.ok) throw outcome.error;
+  return outcome.result;
 }
 
-async function closeOwnedCommand(child: ChildProcess, closed: Promise<void>): Promise<void> {
+async function closeOwnedCommand(
+  child: ChildProcess,
+  closed: Promise<void>,
+  completedExecution: boolean,
+): Promise<void> {
   // Match the existing provider subprocess shutdown budget. A timeout retains
   // the owner so the lifecycle coordinator can retry certification.
   if (child.pid !== undefined) {
@@ -192,6 +216,7 @@ async function closeOwnedCommand(child: ChildProcess, closed: Promise<void>): Pr
       // Temporary queries have no turn to finish. Kill the whole discovered tree
       // together so an exiting shell cannot leave an ignoring descendant behind.
       gracefulSignal: "SIGKILL",
+      completedExecution,
       gracefulTimeoutMs: 2_000,
       forceTimeoutMs: 1_000,
     });

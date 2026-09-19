@@ -4,7 +4,11 @@ import type { Logger } from "pino";
 import { z } from "zod";
 
 import { withTimeout } from "../../../../utils/promise-timeout.js";
-import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
+import {
+  prepareProcessTreeTermination,
+  terminateWithTreeKill,
+  type ProcessTerminator,
+} from "../../../../utils/tree-kill.js";
 
 const DEFAULT_TIMEOUT_MS = 14 * 24 * 60 * 60 * 1000;
 const APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 2_000;
@@ -184,6 +188,7 @@ export class CodexAppServerClient {
     private readonly child: ChildProcessWithoutNullStreams,
     private readonly logger: Logger,
     private readonly getTraceContext: () => CodexAppServerTraceContext = () => ({}),
+    private readonly terminateProcess: ProcessTerminator = terminateWithTreeKill,
   ) {
     this.rl = readline.createInterface({ input: child.stdout });
     this.outputClosed = new Promise((resolve) => this.rl.once("close", () => resolve()));
@@ -273,6 +278,10 @@ export class CodexAppServerClient {
 
   private async disposeProcess(): Promise<void> {
     this.disposed = true;
+    if (this.terminateProcess === terminateWithTreeKill)
+      await prepareProcessTreeTermination(this.child, {
+        timeoutMs: APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+      });
     this.unexpectedTerminationHandler = null;
     this.rejectPending(new Error("Codex app-server client is closed"));
     try {
@@ -280,7 +289,7 @@ export class CodexAppServerClient {
     } catch {
       // ignore
     }
-    const result = await terminateWithTreeKill(this.child, {
+    const result = await this.terminateProcess(this.child, {
       gracefulTimeoutMs: APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
       forceTimeoutMs: APP_SERVER_FORCE_SHUTDOWN_TIMEOUT_MS,
       onForceSignal: () => {

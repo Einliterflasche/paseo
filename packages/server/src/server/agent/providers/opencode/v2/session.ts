@@ -51,11 +51,14 @@ export class OpenCodeV2Session implements AgentSession {
   private streamAbort = new AbortController();
   private exited = false;
   private reconnecting: Promise<void> | null = null;
+  private readonly retiredConnections = new Set<V2Connection>();
   private launchEnv: Record<string, string> | undefined;
   private sync: Promise<void> = Promise.resolve();
   private dirty = false;
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
+  private closing = false;
+  private closePromise: Promise<void> | null = null;
   private history: SessionMessageInfo[] = [];
   private modes: AgentMode[] = [];
   constructor(
@@ -140,7 +143,7 @@ export class OpenCodeV2Session implements AgentSession {
       if (this.closed || this.connection !== connection) return undefined;
       this.exited = true;
       this.streamAbort.abort(error);
-      this.turns.fail(error);
+      if (!this.closing) this.turns.fail(error);
       return undefined;
     });
   }
@@ -196,7 +199,7 @@ export class OpenCodeV2Session implements AgentSession {
     );
   }
   private async reconnectIfExited() {
-    if (this.closed) throw new Error("OpenCode session is closed");
+    if (this.closed || this.closing) throw new Error("OpenCode session is closed");
     if (!this.exited) return;
     this.reconnecting ??= this.reconnect().finally(() => {
       this.reconnecting = null;
@@ -208,8 +211,8 @@ export class OpenCodeV2Session implements AgentSession {
     await this.stream;
     await this.sync.catch(() => undefined);
     const next = await this.acquire();
-    if (this.closed) {
-      await next.release();
+    if (this.closed || this.closing) {
+      await this.releaseRetiredConnection(next);
       throw new Error("OpenCode session is closed");
     }
     const old = this.connection;
@@ -224,11 +227,16 @@ export class OpenCodeV2Session implements AgentSession {
       this.connection = old;
       this.exited = true;
       this.streamAbort.abort();
-      await next.release();
+      await this.releaseRetiredConnection(next);
       throw error;
     }
     this.moved?.(next);
-    await old.release();
+    await this.releaseRetiredConnection(old);
+  }
+  private async releaseRetiredConnection(connection: V2Connection): Promise<void> {
+    this.retiredConnections.add(connection);
+    await connection.release();
+    this.retiredConnections.delete(connection);
   }
   subscribe(callback: (event: AgentStreamEvent) => void) {
     this.listeners.add(callback);
@@ -349,6 +357,7 @@ export class OpenCodeV2Session implements AgentSession {
     this.emit({ type: "thinking_option_changed", provider: "opencode", thinkingOptionId: variant });
   }
   async setFeature(id: string, value: unknown) {
+    if (this.closed || this.closing) throw new Error("OpenCode session is closed");
     if (id !== "auto_accept" || typeof value !== "boolean")
       throw new Error("Unknown OpenCode feature");
     this.config.featureValues = { ...this.config.featureValues, [id]: value };
@@ -385,6 +394,7 @@ export class OpenCodeV2Session implements AgentSession {
     return this.turns.startTurn(prompt, options);
   }
   steerActiveTurn(prompt: AgentPromptInput, options: SteerActiveTurnOptions): Promise<SteerResult> {
+    if (this.closed || this.closing) return Promise.reject(new Error("OpenCode session is closed"));
     return this.turns.steerActiveTurn(prompt, options);
   }
   interrupt() {
@@ -513,22 +523,43 @@ export class OpenCodeV2Session implements AgentSession {
       await delay(100, undefined, { signal }).catch(() => undefined);
     }
   }
-  async close() {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    const attempt = this.closeSession();
+    this.closePromise = attempt;
+    void attempt.catch(() => {
+      if (this.closePromise === attempt) this.closePromise = null;
+    });
+    return attempt;
+  }
+  private async closeSession(): Promise<void> {
+    this.closing = true;
+    await this.reconnecting;
+    for (const connection of this.retiredConnections)
+      await this.releaseRetiredConnection(connection);
+    await this.connection.prepareRelease();
+    if (!this.exited) {
+      await this.turns.drainDispatch();
+      if ((await this.client.session.active())[this.id])
+        await this.client.session.interrupt({ sessionID: this.id });
+      await this.children.stop();
+      while ((await this.client.session.active())[this.id]) await delay(50);
+      await this.reconcile();
+      await this.sync;
+      if (!this.persist) await this.client.session.remove({ sessionID: this.id });
+    }
+    // A shared helper is released only after this session and its descendants stop.
+    // The final lease certifies the complete OS tree before it returns.
+    await this.connection.release();
     this.closed = true;
     this.abort.abort();
-    this.turns.close();
     this.streamAbort.abort();
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     await this.stream;
-    await this.reconnecting?.catch(() => undefined);
-    await this.sync.catch(() => undefined);
+    await this.sync;
+    await this.usage.drain();
+    this.turns.close();
     this.unbind?.();
-    try {
-      if (!this.persist) await this.client.session.remove({ sessionID: this.id });
-    } finally {
-      await this.connection.release();
-    }
     this.listeners.clear();
   }
 }

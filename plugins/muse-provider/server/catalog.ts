@@ -1,4 +1,8 @@
-import type { ProviderCatalog, ProviderLaunch } from "@getpaseo/plugin/server/provider";
+import type {
+  ProviderCatalog,
+  ProviderLaunch,
+  ProviderProcessLifecycle,
+} from "@getpaseo/plugin/server/provider";
 import type { z } from "zod";
 import { createHash } from "node:crypto";
 import { MspConnection } from "./connection.js";
@@ -32,13 +36,14 @@ export function launchKey(launch: ProviderLaunch): string {
 export class Catalog {
   private readonly cache = new Map<string, { expires: number; catalog: ProviderCatalog }>();
   private readonly hosts = new Set<MspConnection>();
+  constructor(private readonly processes?: ProviderProcessLifecycle) {}
   private closed = false;
   async read(launch: ProviderLaunch): Promise<ProviderCatalog> {
     if (this.closed) throw new Error("Muse catalogue is closed");
     const key = launchKey(launch);
     const cached = this.cache.get(key);
     if (cached && cached.expires > Date.now()) return cached.catalog;
-    const host = new MspConnection({ launch, timeoutMs: 5000 });
+    const host = new MspConnection({ launch, timeoutMs: 5000, processes: this.processes });
     this.hosts.add(host);
     try {
       await host.initialize();

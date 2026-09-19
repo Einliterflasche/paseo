@@ -6,7 +6,11 @@ import { randomBytes } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import type { Logger } from "pino";
 import { spawnProcess } from "../../../../../utils/spawn.js";
-import { terminateWithTreeKill } from "../../../../../utils/tree-kill.js";
+import {
+  prepareProcessTreeTermination,
+  terminateWithTreeKill,
+} from "../../../../../utils/tree-kill.js";
+import { ProviderInitializationCleanupError } from "../../../provider-initialization-cleanup-error.js";
 import {
   createProviderEnvSpec,
   resolveProviderLaunch,
@@ -19,6 +23,7 @@ import { raceProviderRefreshAbort } from "../../../provider-refresh-deadline.js"
 
 export interface V2Connection {
   client: V2Api;
+  prepareRelease(): Promise<void>;
   release(): Promise<void>;
   retain(): V2Connection;
   readonly exited: Promise<Error>;
@@ -26,7 +31,9 @@ export interface V2Connection {
 interface Generation {
   client: V2Api;
   users: number;
+  prepare(): Promise<void>;
   stop(): Promise<void>;
+  running: boolean;
   exited: Promise<Error>;
 }
 export interface V2RuntimeOptions {
@@ -48,6 +55,8 @@ export class V2Runtime {
   private current: Promise<Generation> | null = null;
   private generations = new Set<Generation>();
   private starts = new Set<Promise<Generation>>();
+  private readonly pendingAcquisitions = new Map<Promise<Generation>, number>();
+  private readonly processOwners = new Set<{ close(): Promise<void> }>();
   private closed = false;
 
   constructor(private readonly options: V2RuntimeOptions) {}
@@ -62,29 +71,17 @@ export class V2Runtime {
       if (input.fresh || !this.current) this.current = this.startTracked();
       pending = this.current;
     }
+    this.pendingAcquisitions.set(pending, (this.pendingAcquisitions.get(pending) ?? 0) + 1);
     let generation: Generation;
     try {
       generation = await raceProviderRefreshAbort(input.signal, pending);
     } catch (error) {
-      if (this.current === pending) this.current = null;
-      if (input.signal?.aborted) {
-        void pending
-          .then(async (started) => {
-            if (started.users !== 0) return undefined;
-            this.generations.delete(started);
-            await started.stop();
-            return undefined;
-          })
-          .catch((cleanupError: unknown) => {
-            this.options.logger.warn(
-              { error: String(cleanupError) },
-              "OpenCode canceled startup cleanup failed",
-            );
-          });
-      }
+      this.releasePendingAcquisition(pending);
+      await this.settleFailedAcquisition(pending, input.signal);
       throw error;
     }
-    if (!this.generations.has(generation)) {
+    this.releasePendingAcquisition(pending);
+    if (!generation.running || !this.generations.has(generation)) {
       if (this.current === pending) this.current = null;
       throw new Error("OpenCode helper server exited");
     }
@@ -97,24 +94,63 @@ export class V2Runtime {
     return connection;
   }
 
+  private async settleFailedAcquisition(
+    pending: Promise<Generation>,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (!signal?.aborted) {
+      if (this.current === pending) this.current = null;
+      return;
+    }
+    const started = await pending.catch((startError: unknown) => {
+      if (startError instanceof ProviderInitializationCleanupError) throw startError;
+      return null;
+    });
+    if (started && started.users === 0 && !this.pendingAcquisitions.has(pending)) {
+      if (this.current === pending) this.current = null;
+      await started.stop();
+      this.generations.delete(started);
+    }
+  }
+
+  private releasePendingAcquisition(pending: Promise<Generation>): void {
+    const remaining = (this.pendingAcquisitions.get(pending) ?? 1) - 1;
+    if (remaining === 0) this.pendingAcquisitions.delete(pending);
+    else this.pendingAcquisitions.set(pending, remaining);
+  }
+
   private lease(generation: Generation, pending: Promise<Generation>): V2Connection {
-    if (this.closed || !this.generations.has(generation))
+    if (this.closed || !generation.running || !this.generations.has(generation))
       throw new Error("OpenCode helper server is no longer running");
     generation.users += 1;
     let released = false;
-    const release = async () => {
-      if (released) return;
-      released = true;
-      generation.users -= 1;
-      if (generation.users !== 0) return;
-      if (this.current === pending) this.current = null;
-      this.generations.delete(generation);
-      await generation.stop();
+    let releasing: Promise<void> | null = null;
+    const release = (): Promise<void> => {
+      if (releasing) return releasing;
+      if (!released) {
+        released = true;
+        generation.users -= 1;
+      }
+      const attempt = (async () => {
+        if (generation.users !== 0 || this.pendingAcquisitions.has(pending)) return;
+        if (this.current === pending) this.current = null;
+        await generation.stop();
+        this.generations.delete(generation);
+      })();
+      releasing = attempt;
+      void attempt.catch(() => {
+        if (releasing === attempt) releasing = null;
+      });
+      return attempt;
     };
     return {
       client: generation.client,
+      prepareRelease: () => generation.prepare(),
       release,
-      retain: () => this.lease(generation, pending),
+      retain: () => {
+        if (released) throw new Error("OpenCode connection lease is released");
+        return this.lease(generation, pending);
+      },
       exited: generation.exited,
     };
   }
@@ -122,7 +158,7 @@ export class V2Runtime {
   async shutdown(): Promise<void> {
     this.closed = true;
     await Promise.allSettled(this.starts);
-    await Promise.all([...this.generations].map((generation) => generation.stop()));
+    await Promise.all([...this.processOwners].map((owner) => owner.close()));
     this.generations.clear();
     this.current = null;
   }
@@ -196,14 +232,38 @@ export class V2Runtime {
               return null;
             })
         : Promise.resolve(null);
-    const stop = () => {
-      stopped ??= (async () => {
-        await terminateWithTreeKill(process, { gracefulTimeoutMs: 5_000, forceTimeoutMs: 1_000 });
-        const entry = await record;
-        if (entry) await managedProcesses?.remove(entry.id);
-      })();
-      return stopped;
+    const prepare = () => prepareProcessTreeTermination(process, { timeoutMs: 5_000 });
+    let generation: Generation | undefined;
+    const ownership = {
+      close: (): Promise<void> => {
+        if (stopped) return stopped;
+        const attempt = (async () => {
+          await prepare();
+          const result = await terminateWithTreeKill(process, {
+            gracefulTimeoutMs: 5_000,
+            forceTimeoutMs: 1_000,
+          });
+          if (result === "kill-timeout") throw new Error("OpenCode helper process did not stop");
+          const entry = await record;
+          if (entry) await managedProcesses?.remove(entry.id);
+          this.processOwners.delete(ownership);
+          if (generation) {
+            generation.running = false;
+            this.generations.delete(generation);
+          }
+        })();
+        stopped = attempt;
+        void attempt.catch(() => {
+          if (stopped === attempt) stopped = undefined;
+        });
+        return attempt;
+      },
     };
+    this.processOwners.add(ownership);
+    const stop = ownership.close;
+    // Capture the tree while the leader exists, before readiness or native stop can retire it.
+    const prepared = prepare();
+    void prepared.catch(() => undefined);
     const deadline = Date.now() + 30_000;
     try {
       const url = await new Promise<string>((resolve, reject) => {
@@ -253,17 +313,22 @@ export class V2Runtime {
         },
       });
       await client.server.info({ signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())) });
-      const generation: Generation = { client, users: 0, stop, exited };
+      await prepared;
+      generation = { client, users: 0, prepare, stop, exited, running: true };
       this.generations.add(generation);
       process.once("exit", () => {
-        this.generations.delete(generation);
+        if (generation) generation.running = false;
         void stop().catch((error: unknown) =>
           logger.warn({ error }, "OpenCode process cleanup failed"),
         );
       });
       return generation;
     } catch (error) {
-      await stop();
+      try {
+        await stop();
+      } catch (cleanupError) {
+        throw new ProviderInitializationCleanupError(ownership, error, cleanupError);
+      }
       throw error;
     }
   }

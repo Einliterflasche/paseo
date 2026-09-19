@@ -3766,8 +3766,10 @@ test("model overrides preserve negotiated plugin capabilities and connection shu
     await manager.getProvider({ provider: registration.id, wait: true });
     const client = manager.getAgentManagerProviderState().clients[registration.id]!;
     expect(client.capabilities.supportsSessionPersistence).toBe(true);
-    await manager.shutdown();
+    // Discovery owns an isolated connection that closes before publication.
     expect(closed).toBe(1);
+    await manager.shutdown();
+    expect(closed).toBe(2);
   } finally {
     await manager.shutdown();
     manager.destroy();

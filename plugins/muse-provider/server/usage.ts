@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import type { UsageSourceRegistration } from "@getpaseo/plugin/server";
-import type { ProviderLaunch } from "@getpaseo/plugin/server/provider";
+import type { ProviderLaunch, ProviderProcessLifecycle } from "@getpaseo/plugin/server/provider";
 import {
   hashAccountKey,
   unavailableUsage,
@@ -16,26 +16,38 @@ import { usageSchema } from "./wire.js";
 const inputSchema = z.object({ account: z.string() }).strict();
 type Observation = z.infer<typeof usageSchema>;
 export class Usage {
-  private readonly launches = new Map<string, ProviderLaunch>();
+  private readonly launches = new Map<
+    string,
+    { launch: ProviderLaunch; processes?: ProviderProcessLifecycle }
+  >();
   private readonly sessions = new Map<
     string,
     { account: string; read: () => Promise<Observation> }
   >();
-  remember(launch: ProviderLaunch): { account: string } {
+  remember(launch: ProviderLaunch, processes?: ProviderProcessLifecycle): { account: string } {
     // MSP 1.4.1 has no stable account ID; swapping accounts in one config directory shares a report ID.
     const configHome =
       launch.env.XDG_CONFIG_HOME ?? path.join(launch.env.HOME ?? homedir(), ".config");
     const key = hashAccountKey(path.resolve(configHome, "muse"));
-    this.launches.set(key, launch);
+    this.launches.set(key, { launch, processes });
     return { account: key };
   }
-  attach(id: string, launch: ProviderLaunch, read: () => Promise<Observation>): void {
-    this.sessions.set(id, { ...this.remember(launch), read });
+  attach(
+    id: string,
+    launch: ProviderLaunch,
+    read: () => Promise<Observation>,
+    processes?: ProviderProcessLifecycle,
+  ): void {
+    this.sessions.set(id, { ...this.remember(launch, processes), read });
   }
   detach(id: string): void {
     this.sessions.delete(id);
   }
-  private async read(account: string, launch: ProviderLaunch): Promise<Observation> {
+  private async read(
+    account: string,
+    launch: ProviderLaunch,
+    processes?: ProviderProcessLifecycle,
+  ): Promise<Observation> {
     const readers = [...this.sessions.values()].filter((session) => session.account === account);
     if (readers.length > 0) {
       const observations = await Promise.all(readers.map((session) => session.read()));
@@ -45,7 +57,7 @@ export class Usage {
       usages.sort((a, b) => b.observedAtMs - a.observedAtMs);
       return usages.length > 0 ? { usage: usages[0] } : {};
     }
-    const host = new MspConnection({ launch });
+    const host = new MspConnection({ launch, processes });
     try {
       await host.initialize();
       return await host.request("usage/read", {}, usageSchema);
@@ -66,10 +78,10 @@ export class Usage {
       },
       fetch: async (input) => {
         const { account } = inputSchema.parse(input);
-        const launch = this.launches.get(account);
-        if (!launch) return unavailableUsage();
+        const source = this.launches.get(account);
+        if (!source) return unavailableUsage();
         try {
-          const { usage } = await this.read(account, launch);
+          const { usage } = await this.read(account, source.launch, source.processes);
           if (!usage) return unavailableUsage();
           return {
             status: "available",

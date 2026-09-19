@@ -1605,6 +1605,7 @@ export class OpenCodeAgentClient implements AgentClient {
         false,
         unbindBridge,
         connectServer,
+        connection.prepareRelease,
       );
     } catch (error) {
       try {
@@ -1671,6 +1672,7 @@ export class OpenCodeAgentClient implements AgentClient {
         registeredAcquisition !== null,
         unbindBridge,
         connectServer,
+        connection.prepareRelease,
       );
     } catch (error) {
       try {
@@ -1716,6 +1718,7 @@ export class OpenCodeAgentClient implements AgentClient {
       events: acquisition.events,
       url: acquisition.server.url,
       release: acquisition.release,
+      prepareRelease: acquisition.prepareRelease,
     };
   }
 
@@ -3496,6 +3499,7 @@ interface OpenCodeServerConnection {
   events: OpenCodeEventSource;
   url: string;
   release: () => Promise<void>;
+  prepareRelease: () => Promise<void>;
 }
 
 class OpenCodeAgentSession implements AgentSession {
@@ -3504,6 +3508,7 @@ class OpenCodeAgentSession implements AgentSession {
 
   private readonly config: OpenCodeAgentConfig;
   private server: OpenCodeServerConnection;
+  private readonly retiredServers = new Set<OpenCodeServerConnection>();
   /** Connects to the server generation that is current now. */
   private readonly connectServer: (() => Promise<OpenCodeServerConnection>) | null;
   private serverExited = false;
@@ -3592,9 +3597,10 @@ class OpenCodeAgentSession implements AgentSession {
     private readonly externallyDriven = false,
     releaseBridge?: () => void,
     connectServer?: () => Promise<OpenCodeServerConnection>,
+    prepareRelease: () => Promise<void> = async () => undefined,
   ) {
     this.config = config;
-    this.server = { client, events, url: serverUrl ?? "", release: releaseServer };
+    this.server = { client, events, url: serverUrl ?? "", release: releaseServer, prepareRelease };
     this.connectServer = connectServer ?? null;
     this.sessionId = sessionId;
     this.logger = logger.child({ agentId: this.agentId });
@@ -3652,7 +3658,7 @@ class OpenCodeAgentSession implements AgentSession {
     const exited = this.server;
     const next = await connectServer();
     if (this.closed) {
-      await next.release();
+      await this.releaseRetiredServer(next);
       return;
     }
     this.unsubscribeEvents?.();
@@ -3661,7 +3667,7 @@ class OpenCodeAgentSession implements AgentSession {
     // running, so none of them can fail a turn started on the new server.
     await this.ingress;
     if (this.closed) {
-      await next.release();
+      await this.releaseRetiredServer(next);
       return;
     }
     this.server = next;
@@ -3673,7 +3679,13 @@ class OpenCodeAgentSession implements AgentSession {
       { sessionId: this.sessionId, previousUrl: exited.url, url: next.url },
       "OpenCode session moved to the current server after its server exited",
     );
-    await exited.release();
+    await this.releaseRetiredServer(exited);
+  }
+
+  private async releaseRetiredServer(server: OpenCodeServerConnection): Promise<void> {
+    this.retiredServers.add(server);
+    await server.release();
+    this.retiredServers.delete(server);
   }
 
   get id(): string | null {
@@ -5211,6 +5223,9 @@ class OpenCodeAgentSession implements AgentSession {
     this.recoveryAbortController.abort();
     // Closing command admission is separate from closing output. Both the
     // event subscription and its turn attribution survive until stop is proven.
+    await this.reconnection;
+    for (const server of this.retiredServers) await this.releaseRetiredServer(server);
+    await this.server.prepareRelease();
     if (!this.serverExited) {
       const stopAbort = new AbortController();
       try {

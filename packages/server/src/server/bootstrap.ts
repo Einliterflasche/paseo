@@ -1388,6 +1388,7 @@ export async function createPaseoDaemon(
       await agentManager.quiesceRestartExecution();
       await workspaceSetupRuntime.drain();
       await wsServer?.drainAgentRequests();
+      await pluginRuntime.prepareForRestart();
       await drainFinishNotificationWatches(agentManager);
       await scheduleService.snapshotForRestart();
     },

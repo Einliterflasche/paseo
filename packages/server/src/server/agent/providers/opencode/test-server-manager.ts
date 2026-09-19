@@ -47,6 +47,7 @@ export class TestOpenCodeServerManager implements OpenCodeServerManagerLike {
     return {
       server: this.server,
       events,
+      prepareRelease: async () => {},
       release: async () => {
         acquisition.released = true;
       },

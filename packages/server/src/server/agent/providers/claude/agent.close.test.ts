@@ -432,7 +432,7 @@ test("Claude rejects an uncertain interrupt and retries without discarding its o
   await session.close();
 });
 
-test("real Claude SDK certifies a process which exited before close", async () => {
+test("real Claude SDK preserves output but cannot certify a process lost before capture", async () => {
   const fixture = fileURLToPath(new URL("./test-utils/closing-runtime.cjs", import.meta.url));
   const session = await new ClaudeAgentClient({
     logger: createTestLogger(),
@@ -448,8 +448,8 @@ test("real Claude SDK certifies a process which exited before close", async () =
   try {
     const { turnId } = await session.startTurn("exit before close");
     await terminal.promise;
-    await session.close();
-    await session.close();
+    await expect(session.close()).rejects.toThrow("descendant ownership was inspected");
+    await expect(session.close()).rejects.toThrow("descendant ownership was inspected");
     expect(events).toContainEqual(
       expect.objectContaining({
         type: "timeline",
@@ -461,6 +461,6 @@ test("real Claude SDK certifies a process which exited before close", async () =
       }),
     );
   } finally {
-    await session.close();
+    await expect(session.close()).rejects.toThrow("descendant ownership was inspected");
   }
 });

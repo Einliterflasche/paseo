@@ -52,15 +52,28 @@ export class InternalPluginChild extends EventEmitter {
     return true;
   }
 
-  disconnect(): void {
-    if (this.closing) return;
-    this.closing = Promise.resolve()
+  closeRuntime(): Promise<void> {
+    if (this.closing) return this.closing;
+    const attempt = Promise.resolve()
       .then(() => this.worker.shutdown())
-      .finally(() => {
+      .then(() => {
         this.connected = false;
         this.stdout.end();
         this.stderr.end();
         this.emit("close", 0, null);
+        return undefined;
       });
+    this.closing = attempt;
+    void attempt.catch(() => {
+      if (this.closing === attempt) this.closing = null;
+    });
+    return attempt;
+  }
+
+  disconnect(): void {
+    void this.closeRuntime().catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      this.stderr.write(`Plugin shutdown failed: ${message}\n`);
+    });
   }
 }

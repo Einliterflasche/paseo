@@ -1,4 +1,5 @@
 import { V2Timeline } from "./timeline.js";
+import { setTimeout as delay } from "node:timers/promises";
 
 import type { SessionInfo } from "@opencode/client";
 
@@ -51,6 +52,21 @@ export class SessionChildren {
       }
       cursor = page.cursor.next ?? undefined;
     } while (cursor);
+  }
+  async stop(): Promise<void> {
+    const interrupted = new Set<string>();
+    while (true) {
+      await this.reconcile(this.options.id);
+      for (const id of this.children.keys()) {
+        if (interrupted.has(id)) continue;
+        await this.options.client().session.interrupt({ sessionID: id });
+        interrupted.add(id);
+      }
+      const active = await this.options.client().session.active();
+      if (![...this.children.keys()].some((id) => Boolean(active[id]))) break;
+      await delay(50);
+    }
+    await this.reconcile(this.options.id);
   }
   private async reconcileChild(info: SessionInfo) {
     await this.options.reconcilePermissions(info.id);

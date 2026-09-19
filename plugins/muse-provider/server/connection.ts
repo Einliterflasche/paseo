@@ -1,4 +1,8 @@
-import type { ProviderLaunch } from "@getpaseo/plugin/server/provider";
+import type {
+  ProviderLaunch,
+  ProviderProcessLifecycle,
+  ProviderProcessOwner,
+} from "@getpaseo/plugin/server/provider";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createInterface } from "node:readline";
@@ -35,6 +39,8 @@ export class MspConnection {
   private stderr = "";
   private failure: MuseError | null = null;
   private closing = false;
+  private closingPromise: Promise<void> | null = null;
+  private readonly ownership: ProviderProcessOwner | undefined;
   private readonly exited: Promise<void>;
 
   constructor(
@@ -43,6 +49,8 @@ export class MspConnection {
       cwd?: string;
       timeoutMs?: number;
       serveArgs?: string[];
+      processes?: ProviderProcessLifecycle;
+      sessionId?: string;
     },
   ) {
     const { launch, cwd } = options;
@@ -51,6 +59,7 @@ export class MspConnection {
       cwd,
       stdio: "pipe",
     });
+    this.ownership = options.processes?.own({ process: this.child, sessionId: options.sessionId });
     this.child.stderr.setEncoding("utf8");
     this.child.stderr.on("data", (chunk: string) => {
       this.stderr = (this.stderr + chunk).slice(-8192);
@@ -62,7 +71,9 @@ export class MspConnection {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         this.fail(new MuseError("invalidFrame", `Invalid MSP frame: ${message}`));
-        this.child.kill();
+        void this.close().catch((failure: unknown) =>
+          process.stderr.write(`Muse cleanup failed: ${String(failure)}\n`),
+        );
       }
     });
     this.child.stdin.on("error", () => {
@@ -125,7 +136,7 @@ export class MspConnection {
   }
   async request<T>(method: string, params: object, schema: z.ZodType<T>): Promise<T> {
     if (this.failure) throw this.failure;
-    if (this.closing) throw new MuseError("closed", "Muse host is closing");
+    if (this.closing) throw new MuseError("closed", "Muse connection is closing");
     const id = ++this.sequence;
     const response = await new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -137,16 +148,25 @@ export class MspConnection {
     });
     return schema.parse(response);
   }
-  async close(): Promise<void> {
-    if (this.closing) return this.exited;
+  close(): Promise<void> {
+    if (this.closingPromise) return this.closingPromise;
     this.closing = true;
-    this.child.stdin.end();
-    const drained = await Promise.race([
-      this.exited.then(() => true),
-      delay(1000).then(() => false),
-    ]);
-    if (!drained) this.child.kill("SIGKILL");
-    await this.exited;
+    const attempt = (async () => {
+      await this.ownership?.prepare();
+      this.child.stdin.end();
+      const drained = await Promise.race([
+        this.exited.then(() => true),
+        delay(1000).then(() => false),
+      ]);
+      if (this.ownership) await this.ownership.close();
+      else if (!drained) this.child.kill("SIGKILL");
+      await this.exited;
+    })();
+    this.closingPromise = attempt;
+    void attempt.catch(() => {
+      if (this.closingPromise === attempt) this.closingPromise = null;
+    });
+    return attempt;
   }
   private write(frame: object): void {
     this.child.stdin.write(JSON.stringify(frame) + "\n");

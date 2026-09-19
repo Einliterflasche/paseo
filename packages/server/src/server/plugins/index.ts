@@ -50,6 +50,7 @@ interface PluginRuntimePort {
   startPlugin(pluginId: string, path: string, canPublish: () => boolean): Promise<void>;
   startBuiltinPlugin?(plugin: BuiltinPlugin): Promise<void>;
   stopPluginById(pluginId: string): Promise<boolean>;
+  prepareForRestart?: PluginRuntime["prepareForRestart"];
   stopAll(): Promise<void>;
   subscribe(listener: (pluginId: string, error?: string) => void): () => void;
   bindPaseoSessionHost(sessionHost: Parameters<PluginRuntime["bindPaseoSessionHost"]>[0]): void;
@@ -134,6 +135,10 @@ export class PluginService {
   subscribe(listener: (pluginId: string) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  async prepareForRestart(): Promise<void> {
+    await this.runtime.prepareForRestart?.();
   }
 
   bindPaseoSessionHost(sessionHost: Parameters<PluginRuntime["bindPaseoSessionHost"]>[0]): void {

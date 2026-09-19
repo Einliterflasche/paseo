@@ -330,6 +330,7 @@ export class ScheduleService {
     runId: string,
   ) => Promise<ScheduleExecutionHandle>;
   private readonly runningScheduleIds = new Set<string>();
+  private readonly deletingScheduleIds = new Set<string>();
   // Manual-run context for whatever is currently in runningScheduleIds. Not
   // persisted on ScheduleRun (the protocol type owns that schema); ephemeral,
   // rebuilt on every runSchedule() and only read back by snapshotForRestart().
@@ -876,7 +877,22 @@ export class ScheduleService {
   }
 
   private async deleteInternal(id: string): Promise<void> {
-    await this.store.delete(id);
+    if (this.deletingScheduleIds.has(id)) {
+      throw new Error("Schedule is being deleted; retry shortly");
+    }
+    if ([...this.decidedSettlements.values()].some((outcome) => outcome.scheduleId === id)) {
+      throw new Error("Run completion is still being saved; retry shortly");
+    }
+    if (this.runningScheduleIds.has(id) || this.runCompletions.has(id)) {
+      throw new Error("Wait for the current run to finish before deleting this schedule");
+    }
+    // Admission and deletion claim ownership before either can yield to a store write.
+    this.deletingScheduleIds.add(id);
+    try {
+      await this.store.delete(id);
+    } finally {
+      this.deletingScheduleIds.delete(id);
+    }
   }
 
   completeForAgent(agentId: string): Promise<number> {
@@ -1145,11 +1161,23 @@ export class ScheduleService {
         schedule.id,
         this.agentManager.runRequestAdmission(async () => {
           if (this.paused) throw new RestartInProgressError();
+          if (this.deletingScheduleIds.has(schedule.id)) {
+            throw new Error("Schedule is being deleted; retry shortly");
+          }
           this.runningScheduleIds.add(schedule.id);
           this.activeRunContext.set(schedule.id, { runId, manual });
           this.logicalRunIds.set(schedule.id, runId);
           registered = true;
           const scheduleWithRun = await this.appendRunningRun(schedule.id, runningRun);
+          if (!scheduleWithRun) {
+            // A stale tick/read may arrive after deletion. No row was accepted and
+            // no provider was dispatched. Unknown write failures retain ownership.
+            this.runningScheduleIds.delete(schedule.id);
+            this.activeRunContext.delete(schedule.id);
+            this.logicalRunIds.delete(schedule.id);
+            registered = false;
+            throw new Error(`Schedule ${schedule.id} not found`);
+          }
           return this.runner(scheduleWithRun, runId);
         }),
       );
@@ -1211,13 +1239,13 @@ export class ScheduleService {
   private async appendRunningRun(
     scheduleId: string,
     runningRun: ScheduleRun,
-  ): Promise<StoredSchedule> {
+  ): Promise<StoredSchedule | null> {
     const updated = await this.store.update(scheduleId, (schedule) => ({
       ...schedule,
       updatedAt: runningRun.startedAt,
       runs: [...schedule.runs, runningRun],
     }));
-    return requireSchedule(updated, scheduleId);
+    return updated;
   }
 
   /** Save the decided outcome without reclassifying a write failure as execution failure. */

@@ -30,6 +30,8 @@ import type {
   AgentCapabilityFlags,
   AgentClient,
   AgentCreateSessionOptions,
+  AgentProbeContext,
+  AgentResumeSessionOptions,
   AgentFeature,
   AgentLaunchContext,
   AgentMode,
@@ -64,6 +66,8 @@ import {
 } from "./provider-launch-config.js";
 import type { RegisteredProviderDefinition } from "./provider-registry.js";
 import { runProviderTurn } from "./providers/provider-runner.js";
+import { ProviderInitializationCleanupError } from "./provider-initialization-cleanup-error.js";
+import { PluginProviderProcesses } from "./plugin-provider-processes.js";
 import { StaleProviderSessionError } from "./stale-provider-session-error.js";
 
 interface Deferred<Value> {
@@ -123,6 +127,7 @@ class ProviderRuntime {
   private connection: ProviderConnection | null = null;
   private connecting: Promise<ProviderConnection> | null = null;
   private closed = false;
+  private readonly processes = new PluginProviderProcesses();
   private generation = 0;
   private closePromise: Promise<void> | null = null;
   private unsubscribe: (() => void) | null = null;
@@ -166,10 +171,13 @@ class ProviderRuntime {
     try {
       const launch = await this.resolveLaunch();
       if (this.registration.status)
-        return ProviderStatusSchema.parse(await this.registration.status({ launch }));
+        return ProviderStatusSchema.parse(
+          await this.registration.status({ launch, processes: this.processes }),
+        );
       if (!this.registration.command) await this.getConnection();
       return { available: true };
     } catch (error) {
+      if (error instanceof ProviderInitializationCleanupError) throw error;
       return {
         available: false,
         diagnostic: error instanceof Error ? error.message : String(error),
@@ -265,8 +273,11 @@ class ProviderRuntime {
     } catch (error) {
       this.sessionRequests.delete(requestId);
       this.discardPendingOpenDescendants(session);
-      this.sessions.delete(input.sessionId);
-      this.providerSessions.delete(input.sessionId);
+      try {
+        await session.close();
+      } catch (cleanupError) {
+        throw new ProviderInitializationCleanupError(session, error, cleanupError);
+      }
       throw error;
     }
   }
@@ -287,27 +298,42 @@ class ProviderRuntime {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
     this.generation += 1;
-    const connection = this.connection;
-    const connecting = connection ? null : this.connecting;
+    const attempt = (async () => {
+      await this.processes.close();
+      if (this.connecting) {
+        try {
+          await this.connecting;
+        } catch (error) {
+          if (error instanceof ProviderInitializationCleanupError) await error.cleanup.close();
+        }
+      }
+      await this.stopConnection();
+      for (const session of this.sessions.values()) session.connectionClosed();
+      this.sessions.clear();
+      this.providerSessions.clear();
+      this.pendingOpenDescendants.clear();
+      this.pendingOpenDescendantsByRoot.clear();
+      this.sessionListeners.clear();
+      for (const request of this.requests.values()) request.reject(new Error("Provider closed"));
+      this.requests.clear();
+    })();
+    this.closePromise = attempt;
+    void attempt.catch(() => {
+      if (this.closePromise === attempt) this.closePromise = null;
+    });
+    return attempt;
+  }
+
+  private async stopConnection(): Promise<void> {
+    await this.connection?.close();
+    await this.processes.close();
     this.connection = null;
     this.unsubscribe?.();
     this.unsubscribe = null;
-    for (const session of this.sessions.values()) session.connectionClosed();
-    this.sessions.clear();
-    this.providerSessions.clear();
-    this.pendingOpenDescendants.clear();
-    this.pendingOpenDescendantsByRoot.clear();
-    this.sessionListeners.clear();
-    for (const request of this.requests.values()) request.reject(new Error("Provider closed"));
-    this.requests.clear();
-    this.closePromise = Promise.all([
-      connection?.close(),
-      connecting?.then(
-        () => undefined,
-        () => undefined,
-      ),
-    ]).then(() => undefined);
-    return this.closePromise;
+  }
+
+  async certifySessionStopped(sessionId: string): Promise<void> {
+    await this.processes.close(sessionId);
   }
 
   async complete(
@@ -371,31 +397,33 @@ class ProviderRuntime {
   }
 
   private async establishConnection(generation: number): Promise<ProviderConnection> {
-    const rawConnection = await this.registration.connect({
-      launch: await this.resolveLaunch(),
-      versions: [PROVIDER_PROTOCOL_VERSION],
-      capabilities: PROVIDER_CAPABILITIES,
-    });
-    if (this.closed || generation !== this.generation) {
-      await rawConnection.close().catch(() => undefined);
-      throw new Error("Provider runtime is closed");
-    }
     try {
+      const rawConnection = await this.registration.connect({
+        launch: await this.resolveLaunch(),
+        versions: [PROVIDER_PROTOCOL_VERSION],
+        capabilities: PROVIDER_CAPABILITIES,
+        processes: this.processes,
+      });
+      this.connection = rawConnection;
       this.validateConnection(rawConnection);
+      const connection = normalizeConnection(rawConnection);
+      this.connection = connection;
+      this.unsubscribe = connection.onEvent((event) => this.accept(event));
+      if (this.closed || generation !== this.generation)
+        throw new Error("Provider runtime is closed");
+      return connection;
     } catch (error) {
-      await rawConnection.close().catch(() => undefined);
+      try {
+        await this.stopConnection();
+      } catch (cleanupError) {
+        throw new ProviderInitializationCleanupError(
+          { close: () => this.stopConnection() },
+          error,
+          cleanupError,
+        );
+      }
       throw error;
     }
-    const connection = normalizeConnection(rawConnection);
-    const unsubscribe = connection.onEvent((event) => this.accept(event));
-    if (this.closed || generation !== this.generation) {
-      unsubscribe();
-      await connection.close().catch(() => undefined);
-      throw new Error("Provider runtime is closed");
-    }
-    this.unsubscribe = unsubscribe;
-    this.connection = connection;
-    return connection;
   }
 
   private validateConnection(connection: ProviderConnection): void {
@@ -439,9 +467,6 @@ class ProviderRuntime {
     if ("sessionId" in event) {
       const session = this.sessions.get(event.sessionId);
       session?.accept(event);
-      if (event.type === "session.closed" && session) {
-        this.removeSession(session.id, session.providerId);
-      }
     }
   }
 
@@ -574,6 +599,7 @@ class ProviderRuntime {
 }
 
 class ProviderRuntimeSession {
+  private closeCertified = false;
   readonly history: ProviderEvent[] = [];
   private readonly listeners = new Set<(event: ProviderEvent) => void>();
   private capabilities: readonly string[] = [];
@@ -674,22 +700,21 @@ class ProviderRuntimeSession {
     });
   }
 
-  async close(): Promise<void> {
-    if (this.restoration === "parent") {
-      this.runtime.removeSession(this.id, this.providerSessionId);
-      return;
+  async close(onStopped?: () => Promise<void>): Promise<void> {
+    if (!this.closeCertified) {
+      if (this.runtime.isClosed) await this.runtime.close();
+      else if (this.restoration !== "parent") {
+        await this.runtime.complete({
+          type: "session.close",
+          requestId: randomUUID(),
+          sessionId: this.providerSessionId,
+        });
+        await this.runtime.certifySessionStopped(this.providerSessionId);
+      }
+      this.closeCertified = true;
     }
-    try {
-      await this.runtime.complete({
-        type: "session.close",
-        requestId: randomUUID(),
-        sessionId: this.providerSessionId,
-      });
-    } catch (error) {
-      if (!this.runtime.isClosed) throw error;
-    } finally {
-      this.runtime.removeSession(this.id, this.providerSessionId);
-    }
+    await onStopped?.();
+    this.runtime.removeSession(this.id, this.providerSessionId);
   }
 
   beginOpen(requestId: string): Promise<void> {
@@ -817,6 +842,7 @@ interface AdaptedPluginProvider {
 /** Owns the complete plugin-provider adaptation behind the existing core provider boundary. */
 export class PluginAgentClientRegistry {
   private readonly providers = new Map<string, AdaptedPluginProvider>();
+  private readonly retired = new Set<AdaptedPluginProvider>();
 
   constructor(private readonly logger: Logger) {}
 
@@ -832,9 +858,15 @@ export class PluginAgentClientRegistry {
     for (const [id, adapted] of this.providers) {
       if (incoming.get(id) === adapted.registration) continue;
       this.providers.delete(id);
-      void Promise.all([...adapted.clients].map((client) => client.shutdown())).catch((error) => {
-        this.logger.warn({ err: error, provider: id }, "Failed to stop plugin provider");
-      });
+      this.retired.add(adapted);
+      void Promise.all([...adapted.clients].map((client) => client.shutdown()))
+        .then(() => {
+          this.retired.delete(adapted);
+          return undefined;
+        })
+        .catch((error) => {
+          this.logger.warn({ err: error, provider: id }, "Failed to stop plugin provider");
+        });
     }
 
     for (const [id, registration] of incoming) {
@@ -868,10 +900,14 @@ export class PluginAgentClientRegistry {
   }
 
   async shutdown(): Promise<void> {
-    const providers = [...this.providers.values()];
-    this.providers.clear();
+    const providers = new Set([...this.providers.values(), ...this.retired]);
     await Promise.all(
-      providers.flatMap(({ clients }) => [...clients].map((client) => client.shutdown())),
+      [...providers].map(async (adapted) => {
+        await Promise.all([...adapted.clients].map((client) => client.shutdown()));
+        if (this.providers.get(adapted.registration.id) === adapted)
+          this.providers.delete(adapted.registration.id);
+        this.retired.delete(adapted);
+      }),
     );
   }
 }
@@ -905,7 +941,10 @@ class PluginAgentClient implements AgentClient {
 
   readonly getCatalogCacheKey?: AgentClient["getCatalogCacheKey"];
 
-  constructor(registration: ProviderRegistration, runtimeSettings?: ProviderRuntimeSettings) {
+  constructor(
+    private readonly registration: ProviderRegistration,
+    private readonly runtimeSettings?: ProviderRuntimeSettings,
+  ) {
     this.provider = registration.id;
     this.runtime = new ProviderRuntime(registration, runtimeSettings);
     if (registration.getCatalogCacheKey)
@@ -927,6 +966,7 @@ class PluginAgentClient implements AgentClient {
       launchContext,
       history: "skip",
       persist: options?.persistSession !== false,
+      probe: options?.probe,
     });
   }
 
@@ -934,6 +974,7 @@ class PluginAgentClient implements AgentClient {
     handle: AgentPersistenceHandle,
     overrides?: Partial<AgentSessionConfig>,
     launchContext?: AgentLaunchContext,
+    options?: AgentResumeSessionOptions,
   ): Promise<AgentSession> {
     if (!overrides?.cwd) {
       throw new Error(`Plugin provider '${this.provider}' requires cwd to resume a session`);
@@ -942,7 +983,7 @@ class PluginAgentClient implements AgentClient {
       config: { ...overrides, provider: this.provider, cwd: overrides.cwd },
       launchContext,
       persistence: decodePersistence(handle),
-      history: "replay",
+      history: options?.replayHistory === false ? "skip" : "replay",
       persist: true,
     });
   }
@@ -951,51 +992,98 @@ class PluginAgentClient implements AgentClient {
     options: FetchCatalogOptions,
     context?: ProviderRefreshContext,
   ): Promise<ProviderCatalog> {
-    const catalog = await this.runtime.catalog(
-      options.scope === "workspace" ? options.cwd : undefined,
-      context?.signal,
-    );
-    return {
-      models: catalog.models.map((model) =>
-        mapModel(
-          this.provider,
-          model,
-          catalog.defaultModel,
-          catalog.thinkingOptions,
-          catalog.defaultThinkingOption,
+    return this.withProbeRuntime(context?.probe, context?.signal, async (runtime) => {
+      const catalog = await runtime.catalog(
+        options.scope === "workspace" ? options.cwd : undefined,
+        context?.signal,
+      );
+      return {
+        models: catalog.models.map((model) =>
+          mapModel(
+            this.provider,
+            model,
+            catalog.defaultModel,
+            catalog.thinkingOptions,
+            catalog.defaultThinkingOption,
+          ),
         ),
-      ),
-      modes: catalog.modes.map((mode) => ({ ...mode })),
-      defaultModeId: catalog.defaultMode,
-    };
+        modes: catalog.modes.map((mode) => ({ ...mode })),
+        defaultModeId: catalog.defaultMode,
+      };
+    });
   }
 
   async isAvailable(signal?: AbortSignal): Promise<boolean> {
-    signal?.throwIfAborted();
-    return await this.runtime.isAvailable();
+    return this.withProbeRuntime(undefined, signal, (runtime) => runtime.isAvailable());
   }
 
-  async getDiagnostic(): Promise<{ diagnostic: string }> {
-    const status = await this.runtime.status();
-    return { diagnostic: status.diagnostic ?? "Provider is available" };
+  async getDiagnostic(probe?: AgentProbeContext): Promise<{ diagnostic: string }> {
+    return this.withProbeRuntime(probe, probe?.signal, async (runtime) => {
+      const status = await runtime.status();
+      return { diagnostic: status.diagnostic ?? "Provider is available" };
+    });
   }
 
   async listImportableSessions(
     options: ListImportableSessionsOptions = {},
+    probe?: AgentProbeContext,
   ): Promise<ImportableProviderSession[]> {
-    const sessions = await this.runtime.listSessions({
-      query: options.query,
-      cwd: options.cwd,
-      limit: options.limit,
+    return this.withProbeRuntime(probe, probe?.signal, async (runtime) => {
+      const sessions = await runtime.listSessions({
+        query: options.query,
+        cwd: options.cwd,
+        limit: options.limit,
+      });
+      return sessions.map((session) => ({
+        providerHandleId: encodePersistence(session.persistence),
+        cwd: session.cwd,
+        title: session.title ?? null,
+        firstPromptPreview: null,
+        lastPromptPreview: session.description ?? null,
+        lastActivityAt: parseProviderDate(session.updatedAt),
+      }));
     });
-    return sessions.map((session) => ({
-      providerHandleId: encodePersistence(session.persistence),
-      cwd: session.cwd,
-      title: session.title ?? null,
-      firstPromptPreview: null,
-      lastPromptPreview: session.description ?? null,
-      lastActivityAt: parseProviderDate(session.updatedAt),
-    }));
+  }
+
+  private async withProbeRuntime<T>(
+    probe: AgentProbeContext | undefined,
+    signal: AbortSignal | undefined,
+    operation: (runtime: ProviderRuntime) => Promise<T>,
+  ): Promise<T> {
+    signal?.throwIfAborted();
+    if (!probe) {
+      const value = await operation(this.runtime);
+      signal?.throwIfAborted();
+      return value;
+    }
+    const runtime = new ProviderRuntime(this.registration, this.runtimeSettings);
+    const disown = probe?.own(runtime);
+    const abort = () => {
+      void runtime.close().catch(() => undefined);
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    let outcome: { ok: true; value: T } | { ok: false; error: unknown };
+    try {
+      const value = await operation(runtime);
+      signal?.throwIfAborted();
+      outcome = { ok: true, value };
+    } catch (error) {
+      outcome = { ok: false, error };
+    } finally {
+      signal?.removeEventListener("abort", abort);
+    }
+    try {
+      await runtime.close();
+    } catch (cleanupError) {
+      throw new ProviderInitializationCleanupError(
+        runtime,
+        outcome.ok ? undefined : outcome.error,
+        cleanupError,
+      );
+    }
+    disown?.();
+    if (!outcome.ok) throw outcome.error;
+    return outcome.value;
   }
 
   async importSession(
@@ -1038,17 +1126,29 @@ class PluginAgentClient implements AgentClient {
     persistence?: ProviderPersistence;
     history: "replay" | "skip";
     persist: boolean;
+    probe?: AgentProbeContext;
   }): Promise<PluginAgentSession> {
+    const runtime = input.probe
+      ? new ProviderRuntime(this.registration, this.runtimeSettings)
+      : this.runtime;
+    if (input.probe)
+      runtime.onSessionOpened((session, opened) => this.acceptChild(session, opened));
+    const disown = input.probe?.own(runtime);
     const sessionId = randomUUID();
-    const bridge = await this.runtime.openSession({
+    const bridge = await runtime.openSession({
       sessionId,
       config: mapSessionConfig(input.config, input.launchContext, input.persist),
       persistence: input.persistence,
       history: input.history,
     });
-    const session = new PluginAgentSession(this.provider, bridge, () => {
+    const session = new PluginAgentSession(this.provider, bridge, async () => {
+      if (input.probe) {
+        await runtime.close();
+        disown?.();
+      }
       this.rootsBySession.delete(bridge.id);
     });
+    input.probe?.own(session);
     this.rootsBySession.set(bridge.id, session);
     this.attachPendingChildren();
     return session;
@@ -1102,11 +1202,12 @@ class PluginAgentSession implements AgentSession {
   private unsubscribe: (() => void) | null = null;
   private currentTurnId: string | null = null;
   private closed = false;
+  private closePromise: Promise<void> | null = null;
 
   constructor(
     readonly provider: string,
     private readonly bridge: ProviderRuntimeSession,
-    private readonly onClose: () => void,
+    private readonly onClose: () => Promise<void>,
   ) {
     this.subagentIdsBySession.set(bridge.id, null);
     for (const event of bridge.history) this.accept(event, false);
@@ -1146,6 +1247,7 @@ class PluginAgentSession implements AgentSession {
     prompt: AgentPromptInput,
     options: AgentRunOptions = {},
   ): Promise<{ turnId: string }> {
+    if (this.closed) throw new StaleProviderSessionError(this.id);
     const clientMessageId = options.clientMessageId ?? randomUUID();
     const result = await this.bridge.prompt({
       clientMessageId,
@@ -1168,6 +1270,7 @@ class PluginAgentSession implements AgentSession {
     prompt: AgentPromptInput,
     options: SteerActiveTurnOptions,
   ): Promise<SteerResult> {
+    if (this.closed) throw new StaleProviderSessionError(this.id);
     const result = await this.bridge.prompt({
       clientMessageId: options.clientMessageId ?? randomUUID(),
       delivery: "steer",
@@ -1243,17 +1346,23 @@ class PluginAgentSession implements AgentSession {
     await this.bridge.interrupt();
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
     this.closed = true;
-    this.unsubscribe?.();
-    this.unsubscribe = null;
-    for (const unsubscribe of this.childUnsubscribes.values()) unsubscribe();
-    this.childUnsubscribes.clear();
-    this.subagentIdsBySession.clear();
-    this.listeners.clear();
-    this.onClose();
-    await this.bridge.close();
+    const attempt = (async () => {
+      await this.bridge.close(this.onClose);
+      this.unsubscribe?.();
+      this.unsubscribe = null;
+      for (const unsubscribe of this.childUnsubscribes.values()) unsubscribe();
+      this.childUnsubscribes.clear();
+      this.subagentIdsBySession.clear();
+      this.listeners.clear();
+    })();
+    this.closePromise = attempt;
+    void attempt.catch(() => {
+      if (this.closePromise === attempt) this.closePromise = null;
+    });
+    return attempt;
   }
 
   async listCommands(): Promise<AgentSlashCommand[]> {

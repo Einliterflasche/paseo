@@ -2,6 +2,7 @@ import type {
   ProviderEvent,
   ProviderInput,
   ProviderLaunch,
+  ProviderProcessLifecycle,
   ProviderPersistence,
   ProviderSessionConfig,
   ProviderConfigChanges,
@@ -50,6 +51,7 @@ interface SessionOptions {
   id: string;
   config: ProviderSessionConfig;
   launch: ProviderLaunch;
+  processes?: ProviderProcessLifecycle;
   emit(event: ProviderEvent): void;
   capabilities: readonly string[];
 }
@@ -77,6 +79,8 @@ export class Session {
   private readonly buffered: Notification[] = [];
   private opening = true;
   private closing = false;
+  private closePromise: Promise<void> | null = null;
+  private notificationError: unknown | null = null;
   private firstTurn = true;
   private interruptCompletion: {
     turnId: string;
@@ -90,6 +94,8 @@ export class Session {
       launch: { ...options.launch, env: { ...options.launch.env, ...options.config.env } },
       cwd: options.config.cwd,
       serveArgs: options.serveArgs,
+      processes: options.processes,
+      sessionId: options.id,
     });
     this.host.onNotification((notification) => {
       if (this.opening) this.buffered.push(notification);
@@ -362,7 +368,7 @@ export class Session {
             "Muse did not confirm cancellation within 10000ms. Reopen the session before sending another prompt.",
           ),
         );
-        void this.host.close();
+        void this.closeAfterInterruptTimeout();
       }, 10000);
     });
     try {
@@ -375,27 +381,47 @@ export class Session {
       this.interruptCompletion = null;
     }
   }
-  async close(): Promise<void> {
+  private async closeAfterInterruptTimeout(): Promise<void> {
+    try {
+      await this.host.close();
+    } catch (cleanupError) {
+      process.stderr.write(`Muse interruption cleanup is unconfirmed: ${String(cleanupError)}\n`);
+    }
+  }
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
     this.closing = true;
-    if (this.liveState) this.live().recovery.close();
-    await this.host.close();
-    await this.notifications;
-    if (this.liveState) this.live().children.close();
+    const attempt = (async () => {
+      if (this.liveState) this.live().recovery.close();
+      await this.host.close();
+      await this.notifications;
+      if (this.notificationError !== null) throw this.notificationError;
+      if (this.liveState) this.live().children.close();
+    })();
+    this.closePromise = attempt;
+    void attempt.catch(() => {
+      if (this.closePromise === attempt) this.closePromise = null;
+    });
+    return attempt;
   }
   private enqueue(notification: Notification): void {
     this.notifications = this.notifications
       .then(() => this.notify(notification))
-      .catch((error: unknown) => this.runtimeFailed(error));
+      .catch((error: unknown) => {
+        this.notificationError = error;
+        this.runtimeFailed(error);
+      });
   }
   private runtimeFailed(error: unknown): void {
-    this.live().recovery.close();
+    if (this.liveState) this.live().recovery.close();
+    const interrupt = this.interruptCompletion;
+    if (interrupt) interrupt.reject(error instanceof Error ? error : new Error(String(error)));
+    if (this.closing) return;
     this.options.emit({
       type: "session.runtime_failed",
       sessionId: this.options.id,
       error: actionableError(error, this.options.launch),
     });
-    const interrupt = this.interruptCompletion;
-    if (interrupt) interrupt.reject(error instanceof Error ? error : new Error(String(error)));
   }
   private async notify(notification: Notification): Promise<void> {
     const envelope = notificationSchema.parse(notification.params);

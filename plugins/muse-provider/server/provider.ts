@@ -7,10 +7,12 @@ import {
   type ProviderLaunch,
   type ProviderRegistration,
   type ProviderStatus,
+  type ProviderProcessLifecycle,
+  type ProviderProcessOwner,
 } from "@getpaseo/plugin/server/provider";
 import { serveArgs } from "./options.js";
 import { Usage } from "./usage.js";
-import { execFile } from "node:child_process";
+import { execFile, type ExecFileException } from "node:child_process";
 import { Catalog, launchKey } from "./catalog.js";
 import { MspConnection } from "./connection.js";
 import { MuseError, actionableError } from "./errors.js";
@@ -38,20 +40,21 @@ export function createMuseProvider(usage: Usage): ProviderRegistration {
     async getCatalogCacheKey(options) {
       return launchKey(requireLaunch(options.launch));
     },
-    async status({ launch }) {
+    async status({ launch, processes }) {
       if (!launch)
         return { available: false, diagnostic: "Install Muse Code and ensure `muse` is on PATH." };
-      usage.remember(launch);
-      return status(launch);
+      usage.remember(launch, processes);
+      return status(launch, processes);
     },
     async connect(request) {
       if (!request.versions.includes(1))
         throw new MuseError("protocol", "Provider protocol version 1 is required");
-      usage.remember(requireLaunch(request.launch));
+      usage.remember(requireLaunch(request.launch), request.processes);
       return connect(
         requireLaunch(request.launch),
         negotiateProviderCapabilities(request.capabilities, capabilities),
         usage,
+        request.processes,
       );
     },
   };
@@ -60,27 +63,38 @@ function requireLaunch(launch: ProviderLaunch | undefined): ProviderLaunch {
   if (!launch) throw new MuseError("missingLaunch", "Muse requires a daemon-resolved executable");
   return launch;
 }
-async function status(launch: ProviderLaunch): Promise<ProviderStatus> {
+async function status(
+  launch: ProviderLaunch,
+  processes?: ProviderProcessLifecycle,
+): Promise<ProviderStatus> {
   let host: MspConnection | undefined;
   try {
-    const versionText = await new Promise<string>((resolve, reject) => {
-      execFile(
-        launch.command,
-        [...launch.args, "--version"],
-        { env: launch.env, timeout: 3000, maxBuffer: 8192 },
-        (error, stdout) => {
-          if (error) reject(new MuseError("version", error.message));
-          else resolve(stdout);
-        },
-      );
+    let ownership: ProviderProcessOwner | undefined;
+    const version = await new Promise<{ error: ExecFileException | null; stdout: string }>(
+      (resolve) => {
+        const child = execFile(
+          launch.command,
+          [...launch.args, "--version"],
+          { env: launch.env, timeout: 3000, maxBuffer: 8192 },
+          (error, stdout) => resolve({ error, stdout }),
+        );
+        ownership = processes?.own({ process: child });
+      },
+    );
+    await ownership?.close({
+      completedExecution:
+        !version.error ||
+        (typeof version.error.code === "number" && !version.error.killed && !version.error.signal),
     });
+    if (version.error) throw new MuseError("version", version.error.message);
+    const versionText = version.stdout;
     const match = /\b(\d+)\.(\d+)\.(\d+)\b/.exec(versionText);
     if (!match) return { available: false, diagnostic: "Muse returned an unrecognized version." };
     const major = Number(match[1]);
     const minor = Number(match[2]);
     if (major < 1 || (major === 1 && minor < 3))
       return { available: false, diagnostic: `Update Muse Code: found ${match[0]}, need ≥1.3.0` };
-    host = new MspConnection({ launch, timeoutMs: 3000 });
+    host = new MspConnection({ launch, timeoutMs: 3000, processes });
     await host.initialize();
     const account = await host.request("account/read", {}, accountSchema);
     if (account.state === "loggedOut")
@@ -96,12 +110,16 @@ function connect(
   launch: ProviderLaunch,
   negotiated: readonly string[],
   usage: Usage,
+  processes?: ProviderProcessLifecycle,
 ): ProviderConnection {
   const listeners = new Set<(event: ProviderEvent) => void>();
   const sessions = new Map<string, Session>();
-  const catalog = new Catalog();
-  const imports = new Sessions();
+  const catalog = new Catalog(processes);
+  const imports = new Sessions(processes);
   let closed = false;
+  let admissionClosed = false;
+  let closePromise: Promise<void> | null = null;
+  const dispatches = new Set<Promise<void>>();
   function emit(event: ProviderEvent): void {
     if (!closed) for (const listener of listeners) listener(event);
   }
@@ -125,6 +143,7 @@ function connect(
         id: input.sessionId,
         config: input.config,
         launch,
+        processes,
         emit,
         capabilities: negotiated,
         serveArgs: serveArgs(input.config.providerOptions),
@@ -136,10 +155,11 @@ function connect(
           input.sessionId,
           { ...launch, env: { ...launch.env, ...input.config.env } },
           () => session.readUsage(),
+          processes,
         );
       } catch (error) {
-        sessions.delete(input.sessionId);
         await session.close();
+        sessions.delete(input.sessionId);
         throw error;
       }
       return;
@@ -190,27 +210,41 @@ function connect(
     version: 1,
     capabilities: negotiated,
     async send(input) {
-      if (closed) throw new MuseError("closed", "Muse connection is closed");
+      if (admissionClosed) throw new MuseError("closed", "Muse connection is closed");
       requireProviderCapabilities(negotiated, input);
       queueMicrotask(() => {
-        if (!closed) void dispatch(input).catch((error: unknown) => failed(input, error));
+        if (closed) return;
+        const operation = dispatch(input).catch((error: unknown) => failed(input, error));
+        dispatches.add(operation);
+        void operation.then(() => dispatches.delete(operation));
       });
     },
     onEvent(listener) {
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
-    async close() {
-      if (closed) return;
-      closed = true;
-      await Promise.all([
-        catalog.close(),
-        imports.close(),
-        ...[...sessions.values()].map((session) => session.close()),
-      ]);
-      for (const id of sessions.keys()) usage.detach(id);
-      sessions.clear();
-      listeners.clear();
+    close() {
+      if (closePromise) return closePromise;
+      admissionClosed = true;
+      const attempt = (async () => {
+        // Include accepted microtasks before collecting their runtime owners.
+        await Promise.resolve();
+        await Promise.all([
+          catalog.close(),
+          imports.close(),
+          ...[...sessions.values()].map((session) => session.close()),
+        ]);
+        await Promise.all(dispatches);
+        for (const id of sessions.keys()) usage.detach(id);
+        sessions.clear();
+        closed = true;
+        listeners.clear();
+      })();
+      closePromise = attempt;
+      void attempt.catch(() => {
+        if (closePromise === attempt) closePromise = null;
+      });
+      return attempt;
     },
   };
 }

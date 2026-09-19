@@ -4,6 +4,57 @@ import type { AgentStreamEvent } from "../agent-sdk-types.js";
 import { CodexAppServerAgentSession } from "./codex-app-server-agent.js";
 import { createFakeCodexAppServer } from "./codex/test-utils/fake-app-server.js";
 import { setImmediate as nextTurn } from "node:timers/promises";
+import { AgentTurnStartUncertainError } from "../agent-turn-start-uncertain-error.js";
+
+test("Codex treats an explicit native start rejection as settled before a new start", async () => {
+  let starts = 0;
+  const codex = createFakeCodexAppServer({
+    "turn/start": () =>
+      ++starts === 1 ? { __jsonRpcError: { code: -32602, message: "invalid model" } } : {},
+  });
+  const session = new CodexAppServerAgentSession(
+    { provider: "codex", cwd: process.cwd(), modeId: "auto", model: "gpt-5.4" },
+    null,
+    createTestLogger(),
+    async () => codex.child,
+  );
+  try {
+    const error = await session.startTurn("rejected input").catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(AgentTurnStartUncertainError);
+    expect(error).toMatchObject({ message: "invalid model" });
+    await expect(session.startTurn("corrected input")).resolves.toHaveProperty("turnId");
+    expect(starts).toBe(2);
+    codex.assertNoErrors();
+  } finally {
+    await session.close();
+  }
+});
+
+test("Codex retains ownership after an internal start error that cannot prove nonexecution", async () => {
+  const codex = createFakeCodexAppServer({
+    "turn/start": () => ({
+      __jsonRpcError: { code: -32603, message: "internal error after handoff" },
+    }),
+  });
+  const session = new CodexAppServerAgentSession(
+    { provider: "codex", cwd: process.cwd(), modeId: "auto", model: "gpt-5.4" },
+    null,
+    createTestLogger(),
+    async () => codex.child,
+  );
+  try {
+    await expect(session.startTurn("possibly accepted input")).rejects.toBeInstanceOf(
+      AgentTurnStartUncertainError,
+    );
+    await expect(session.startTurn("unsafe successor")).rejects.toThrow(
+      "foreground turn is already active",
+    );
+    expect(codex.requests().filter((request) => request.method === "turn/start")).toHaveLength(1);
+  } finally {
+    await session.close();
+  }
+});
 
 test("Codex keeps a written timed-out start owned through its late acknowledgement and native stop", async () => {
   const acknowledged = Promise.withResolvers<{}>();

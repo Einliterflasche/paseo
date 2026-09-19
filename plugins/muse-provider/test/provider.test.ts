@@ -12,9 +12,12 @@ import {
   type ProviderRegistration,
   type ProviderLaunch,
   type ProviderInput,
+  type ProviderProcessLifecycle,
+  type ProviderOwnedProcessInput,
 } from "@getpaseo/plugin/server/provider";
 import type { UsageSourceRegistration } from "@getpaseo/plugin/server";
 import contribute from "../index.server.js";
+import { PluginProviderProcesses } from "../../../packages/server/src/server/agent/plugin-provider-processes.js";
 
 const connections: ProviderConnection[] = [];
 const roots: string[] = [];
@@ -41,6 +44,7 @@ async function harness(
   scenario = "text-reasoning",
   env: Record<string, string> = {},
   providerOptions?: Record<string, unknown>,
+  processes?: ProviderProcessLifecycle,
 ) {
   const root = await mkdtemp(path.join(os.tmpdir(), "muse-provider-test-"));
   roots.push(root);
@@ -59,6 +63,7 @@ async function harness(
     launch,
     versions: [1],
     capabilities: PROVIDER_CAPABILITIES,
+    processes,
   });
   connections.push(connection);
   const events: ProviderEvent[] = [];
@@ -154,6 +159,51 @@ test("registration exposes Muse with a daemon-resolved command", () => {
     command: ["muse"],
     icon: "icon.svg",
   });
+});
+
+test("owns Muse discovery and usage workers and retries failed native session certification", async () => {
+  const owned = new PluginProviderProcesses();
+  const workers: ProviderOwnedProcessInput[] = [];
+  let failSessionClose = true;
+  const processes: ProviderProcessLifecycle = {
+    own(input) {
+      workers.push(input);
+      const owner = owned.own(input);
+      return {
+        prepare: owner.prepare,
+        async close(options) {
+          if (input.sessionId && failSessionClose) {
+            failSessionClose = false;
+            throw new Error("native session inspection denied");
+          }
+          await owner.close(options);
+        },
+      };
+    },
+  };
+  const h = await harness("catalog-controls", {}, undefined, processes);
+  try {
+    await h.send({ type: "catalog", requestId: "owned-catalog" });
+    await h.wait((event) => event.type === "catalog");
+    await h.send({ type: "sessions", requestId: "owned-imports" });
+    await h.wait((event) => event.type === "sessions");
+    const accounts = await h.usageSource.discover();
+    await h.usageSource.fetch(accounts[0]);
+    expect(workers.filter((worker) => !worker.sessionId)).toHaveLength(3);
+    expect(await h.open()).toMatchObject({ type: "session.ready" });
+    const native = workers.find((worker) => worker.sessionId === "paseo-session");
+    if (!native) throw new Error("Missing native session process owner");
+    await h.send({ type: "session.close", sessionId: "paseo-session", requestId: "failed-close" });
+    await h.wait((event) => event.type === "request.failed" && event.requestId === "failed-close");
+    expect(h.events.some((event) => event.type === "session.closed")).toBe(false);
+    await h.send({ type: "session.close", sessionId: "paseo-session", requestId: "retry-close" });
+    await h.wait((event) => event.type === "session.closed");
+    expect(native.process.exitCode !== null || native.process.signalCode !== null).toBe(true);
+  } finally {
+    failSessionClose = false;
+    await h.connection.close();
+    await owned.close();
+  }
 });
 test("catalog uses model effort variants, modes, and bounded cached discovery", async () => {
   const h = await harness("catalog-controls");

@@ -127,6 +127,23 @@ function nextExit(transport: JsonlRpcProcess): Promise<JsonlRpcExit> {
 }
 
 describe("JsonlRpcProcess", () => {
+  test("an uncorrelated agent_end does not certify a process lost with a pending prompt", async () => {
+    const transport = startProcess({
+      source: String.raw`
+      require("node:readline").createInterface({input:process.stdin}).on("line", () => {
+        process.stdout.write(JSON.stringify({type:"agent_end"})+"\n", () => process.exit(0));
+      });
+    `,
+    });
+    const exit = nextExit(transport);
+    const messages: unknown[] = [];
+    transport.onMessage((message) => messages.push(message));
+    await expect(transport.request({ type: "prompt" })).rejects.toThrow("exited");
+    await exit;
+    expect(messages).toEqual([{ type: "agent_end" }]);
+    await expect(transport.close()).rejects.toThrow("descendant ownership was inspected");
+    await expect(transport.close()).rejects.toThrow("descendant ownership was inspected");
+  });
   test("close drains native responses before rejecting unanswered requests as transport closure", async () => {
     const child = createInMemoryChildProcess();
     const transport = startProcess({
@@ -184,9 +201,9 @@ describe("JsonlRpcProcess", () => {
     expect(messages).toEqual([{ type: "notice", text: "final frame" }]);
   });
 
-  test("already-exited processes still wait for final stdout before close certifies", async () => {
+  test("an injected certified process boundary still waits for final stdout", async () => {
     const child = createInMemoryChildProcess();
-    const transport = startProcess({ child });
+    const transport = startProcess({ child, terminateProcess: async () => "already-exited" });
     const messages: unknown[] = [];
     transport.onMessage((message) => messages.push(message));
     child.exitCode = 7;

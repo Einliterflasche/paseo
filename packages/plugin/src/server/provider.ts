@@ -1,3 +1,4 @@
+import type { ChildProcess } from "node:child_process";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import { z } from "zod";
 
@@ -57,6 +58,8 @@ export type ProviderLaunch = z.infer<typeof ProviderLaunchSchema>;
 
 export interface ProviderStatusRequest {
   launch?: ProviderLaunch;
+  /** Injected inside the worker; never serialize this port across plugin IPC. */
+  processes?: ProviderProcessLifecycle;
 }
 
 export const ProviderStatusSchema = z.discriminatedUnion("available", [
@@ -68,8 +71,31 @@ export type ProviderStatus = z.infer<typeof ProviderStatusSchema>;
 
 export interface ProviderConnectRequest {
   launch?: ProviderLaunch;
+  /** Injected inside the worker; never serialize this port across plugin IPC. */
+  processes?: ProviderProcessLifecycle;
   versions: readonly number[];
   capabilities: readonly string[];
+}
+
+export interface ProviderOwnedProcessInput {
+  process: ChildProcess;
+  /** Session-owned workers stop with that session; omit for a shared helper. */
+  sessionId?: string;
+}
+
+export interface ProviderProcessCloseOptions {
+  /** Only a genuine one-shot command result can certify post-mortem cleanup. */
+  completedExecution?: boolean;
+}
+
+export interface ProviderProcessOwner {
+  prepare(): Promise<void>;
+  close(options?: ProviderProcessCloseOptions): Promise<void>;
+}
+
+/** Own a worker immediately after spawn, before initialization or native shutdown. */
+export interface ProviderProcessLifecycle {
+  own(input: ProviderOwnedProcessInput): ProviderProcessOwner;
 }
 
 export interface ProviderConnection {
@@ -77,6 +103,7 @@ export interface ProviderConnection {
   readonly capabilities: readonly string[];
   send(input: ProviderInput): Promise<void>;
   onEvent(listener: (event: ProviderEvent) => void): () => void;
+  /** Resolve only after owned execution and accepted events drain; retain retry ownership on failure. */
   close(): Promise<void>;
 }
 

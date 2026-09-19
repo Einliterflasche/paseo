@@ -1,4 +1,6 @@
-import { describe, expect, test, vi } from "vitest";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { describe, expect, test } from "vitest";
 
 import { createTestLogger } from "../../../../test-utils/test-logger.js";
 import {
@@ -32,29 +34,46 @@ describe("Codex app-server transport", () => {
     await expect(request).rejects.toThrow("Codex app-server client is closed");
   });
 
-  test("dispose rejects until the child has actually exited", async () => {
-    vi.useFakeTimers();
+  test("dispose retries an uncertain termination until its owner certifies cessation", async () => {
     const child = createCodexAppServerChildProcess();
-    child.kill = () => true;
+    let attempts = 0;
+    const client = new CodexAppServerClient(child, createTestLogger(), undefined, async () => {
+      attempts++;
+      if (attempts < 3) return "kill-timeout";
+      child.stdout.end();
+      child.stderr.end();
+      return "terminated";
+    });
+    for (let i = 0; i < 2; i++)
+      await expect(client.dispose()).rejects.toThrow("did not report exit after SIGKILL");
+    await expect(client.dispose()).resolves.toBeUndefined();
+    expect(attempts).toBe(3);
+  });
+
+  test("an unrelated completed turn cannot certify a lost process with an unanswered start", async () => {
+    const child = spawn(
+      process.execPath,
+      [
+        "-e",
+        String.raw`
+      require("node:readline").createInterface({input:process.stdin}).on("line", () => {
+        process.stdout.write(JSON.stringify({method:"turn/completed",params:{threadId:"other-thread",turn:{id:"other-turn",status:"completed"}}})+"\n", () => process.exit(0));
+      });
+    `,
+      ],
+      { stdio: "pipe" },
+    );
     const client = new CodexAppServerClient(child, createTestLogger());
-    try {
-      for (let i = 0; i < 2; i++) {
-        const closing = expect(client.dispose()).rejects.toThrow(
-          "did not report exit after SIGKILL",
-        );
-        await vi.advanceTimersByTimeAsync(3_000);
-        await closing;
-      }
-      child.exitCode = 0;
-      child.emit("exit", 0, null);
-      child.stdout.end();
-      child.stderr.end();
-      await expect(client.dispose()).resolves.toBeUndefined();
-    } finally {
-      vi.useRealTimers();
-      child.stdout.end();
-      child.stderr.end();
-    }
+    const closed = once(child, "close");
+    const notifications: string[] = [];
+    client.setNotificationHandler((method) => notifications.push(method));
+    const failed = expect(
+      client.request("turn/start", { threadId: "owned-thread" }),
+    ).rejects.toThrow("exited");
+    await Promise.all([closed, failed]);
+    expect(notifications).toEqual(["turn/completed"]);
+    await expect(client.dispose()).rejects.toThrow("descendant ownership was inspected");
+    await expect(client.dispose()).rejects.toThrow("descendant ownership was inspected");
   });
 
   test("keeps final notifications through exit and stdout drain", async () => {

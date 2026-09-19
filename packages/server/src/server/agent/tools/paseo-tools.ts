@@ -3128,13 +3128,19 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       },
     },
     async ({ agentId, limit }) => {
-      await ensureAgentLoaded(agentId, {
-        agentManager,
-        agentStorage,
-        logger: childLogger,
-      });
+      if (!agentManager.hasInstalledHistory(agentId)) {
+        await ensureAgentLoaded(agentId, {
+          agentManager,
+          agentStorage,
+          logger: childLogger,
+        });
+      }
       const timeline = agentManager.getTimeline(agentId);
       const snapshot = agentManager.getAgent(agentId);
+      const currentModeId = snapshot
+        ? snapshot.currentModeId
+        : ((await agentStorage.get(agentId)) ?? agentManager.getRetainedAgentRecord(agentId))
+            ?.lastModeId;
 
       const selection = selectItemsByProjectedLimit({
         items: timeline,
@@ -3157,7 +3163,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         structuredContent: ensureValidJson({
           agentId,
           updateCount: timeline.length,
-          currentModeId: snapshot?.currentModeId ?? null,
+          currentModeId: currentModeId ?? null,
           content: contentWithCount,
         }),
       };

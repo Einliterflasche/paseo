@@ -646,6 +646,8 @@ export type AgentResumePurpose = "interactive" | "history";
 export interface AgentResumeSessionOptions {
   /** Defaults to interactive. History loading may be read-only for archived native sessions. */
   purpose?: AgentResumePurpose;
+  /** Skip native replay when the restart checkpoint already owns displayed history. */
+  replayHistory?: boolean;
 }
 
 /**
@@ -665,6 +667,7 @@ export interface AgentSession {
    * replay them at their original timestamps; restored sessions omit old rows. */
   readonly initialTimeline?: ImportedTimelineEntry[];
   run(prompt: AgentPromptInput, options?: AgentRunOptions): Promise<AgentRunResult>;
+  /** Reject with AgentTurnStartUncertainError when a dispatched native request may have executed. */
   startTurn(prompt: AgentPromptInput, options?: AgentRunOptions): Promise<{ turnId: string }>;
   steerActiveTurn?(prompt: AgentPromptInput, options: SteerActiveTurnOptions): Promise<SteerResult>;
   subscribe(callback: (event: AgentStreamEvent) => void): () => void;
