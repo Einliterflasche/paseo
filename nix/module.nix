@@ -283,7 +283,9 @@ in
     # Preview worker failure must not interrupt ordinary Paseo connections.
     systemd.services.paseo-preview-front = lib.mkIf cfg.previews.enable {
       description = "Paseo same-address service preview front";
-      after = [ "network.target" "systemd-tmpfiles-setup.service" ];
+      # Ordering only: on first activation the old daemon must release the front
+      # port before Caddy starts. Later daemon failure/restarts do not stop it.
+      after = [ "network.target" "systemd-tmpfiles-setup.service" "paseo.service" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
         User = cfg.user;

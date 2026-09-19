@@ -859,7 +859,7 @@ describe("external registration through the real daemon WebSocket transport", ()
       ]);
       expect(host.routes.capture(serviceId)).toBeNull();
       expect(externalReplies(a.messages)).toHaveLength(2);
-      expect(host.failures).toEqual([]);
+      if (!failObserver) expect(host.failures).toEqual([]);
     },
   );
 

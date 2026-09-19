@@ -110,6 +110,14 @@ own Paseo executable as `--target-cli`. Only after
 the checkpoint succeeds does activation update the system profile and switch the
 configuration. If NixOS leaves the service unchanged, activation replaces the
 paused service once; if NixOS already replaced it, activation does not restart it again.
+The wrapper runs the built closure's CLI for both deployment and checkpoint
+validation. That CLI refuses live terminals, including managed script terminals,
+before Prepare and checks again after Prepare has frozen mutation admission and
+drained the scheduler. It verifies the same paused, ready generation around that
+second inventory. A failed inventory or changed generation prevents activation.
+This is a refusal policy, not terminal transfer: deployment cannot preserve a
+running managed service by moving it into the replacement. A refusal after
+Prepare leaves the checkpoint and paused daemon intact for diagnosis.
 The complete build and activation run in a finite `systemd-run` unit as the operator,
 outside `paseo.service`, with build logs and the result link retained. Readiness has no
 default deadline; `--wait-timeout` adds one explicitly and never kills a process.
@@ -119,8 +127,7 @@ the old service stays available, use the wrapper as the sole deployment entry
 point, and follow its detached job until it reports the restored generation.
 Do not invoke its internal worker or generated activation script yourself.
 
-On this VM, use the installed recovery-capable CLI or build the checkout's CLI
-first (`npm run build:server`). Select the live state directory explicitly. The
+On this VM, select the live state directory explicitly. The
 detached job also needs the host's `NIX_PATH`, a PATH that finds
 `/run/wrappers/bin/sudo`, and its credential file via `PASEO_DEPLOY_ENV_FILE`.
 The current credential source is `/home/agent/.config/slack-bridge/raphaels_agent.env`;
@@ -130,7 +137,6 @@ only for a separate NixOS flake, never the Paseo development flake:
 
 ```sh
 PASEO_HOME=/home/agent/.local/state/paseo \
-PASEO_CLI=/run/current-system/sw/bin/paseo \
 PASEO_DEPLOY_ENV_FILE=/home/agent/.config/slack-bridge/raphaels_agent.env \
 ./scripts/deploy-nixos.sh
 ```
