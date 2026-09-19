@@ -318,6 +318,7 @@ function getFallbackTabOptionLabel(
     changes: string;
     files: string;
     pullRequest: string;
+    services: string;
   },
 ): string {
   if (tab.target.kind === "new_tab") {
@@ -341,6 +342,8 @@ function getFallbackTabOptionLabel(
   if (tab.target.kind === "working_diff" || tab.target.kind === "changes_tree") {
     return labels.changes;
   }
+  if (tab.target.kind === "services") return labels.services;
+  if (tab.target.kind === "service_preview") return labels.services;
   if (tab.target.kind === "files") {
     return labels.files;
   }
@@ -365,6 +368,7 @@ function getFallbackTabOptionDescription(
     changes: string;
     files: string;
     pullRequest: string;
+    services: string;
   },
 ): string {
   if (tab.target.kind === "new_tab") {
@@ -394,6 +398,8 @@ function getFallbackTabOptionDescription(
   if (tab.target.kind === "working_diff" || tab.target.kind === "changes_tree") {
     return labels.changes;
   }
+  if (tab.target.kind === "services") return labels.services;
+  if (tab.target.kind === "service_preview") return labels.services;
   if (tab.target.kind === "files") {
     return labels.files;
   }
@@ -602,6 +608,7 @@ function MobileWorkspaceTabOption({
       changes: t("panels.diff.changesLabel"),
       files: t("panels.files.label"),
       pullRequest: t("panels.pullRequest.label"),
+      services: t("services.title"),
     }),
     [t],
   );
@@ -2379,6 +2386,7 @@ function WorkspaceScreenContent({
       changes: t("panels.diff.changesLabel"),
       files: t("panels.files.label"),
       pullRequest: t("panels.pullRequest.label"),
+      services: t("services.title"),
     }),
     [t],
   );

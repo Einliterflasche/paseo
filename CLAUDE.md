@@ -29,6 +29,7 @@ At the start of non-trivial work, list `docs/` and skim anything relevant to the
 | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | [docs/fork-maintenance.md](docs/fork-maintenance.md)                 | Fork branches, commit prefix, rebasing, and deployment baseline                                                                |
 | [docs/fork-requirements.md](docs/fork-requirements.md)               | Raphael's requirements for the move from Slack to Paseo                                                                        |
+| [docs/services-catalog.md](docs/services-catalog.md)                 | Services development slice, compatibility boundaries and remaining rollout gates                                               |
 | [docs/restart-recovery-plan.md](docs/restart-recovery-plan.md)       | Controlled restart checkpoints, automatic continuation, and accepted crash limitation                                          |
 | [docs/product.md](docs/product.md)                                   | What Paseo is, who it's for, where it's going                                                                                  |
 | [docs/architecture.md](docs/architecture.md)                         | System design, package layering, WebSocket protocol, agent lifecycle, data flow                                                |

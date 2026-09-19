@@ -27,6 +27,7 @@ export interface WorkerCreateTerminalOptions {
   env?: Record<string, string>;
   command?: string;
   args?: string[];
+  serviceProcess?: boolean;
   rows?: number;
   cols?: number;
   activityToken?: string;

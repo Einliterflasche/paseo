@@ -1,6 +1,12 @@
 import type { PluginSidebarGroup } from "@/plugins/sidebar-groups";
 
-export const BUILTIN_SIDEBAR_NAV_IDS = ["new-workspace", "history", "search", "schedules"] as const;
+export const BUILTIN_SIDEBAR_NAV_IDS = [
+  "new-workspace",
+  "history",
+  "search",
+  "schedules",
+  "services",
+] as const;
 export type BuiltinSidebarNavId = (typeof BUILTIN_SIDEBAR_NAV_IDS)[number];
 
 /** Persisted shape. Array order is the display order. */
@@ -30,6 +36,7 @@ const BUILTIN_LABEL_KEYS: Record<BuiltinSidebarNavId, string> = {
   history: "sidebar.sections.sessions",
   search: "sidebar.sections.search",
   schedules: "sidebar.sections.schedules",
+  services: "services.title",
 };
 
 export function builtinSidebarNavLabelKey(id: BuiltinSidebarNavId): string {
@@ -46,6 +53,7 @@ const BUILTIN_SHORTCUT_ACTIONS: Record<BuiltinSidebarNavId, string | null> = {
   history: null,
   search: "toggle-command-center",
   schedules: null,
+  services: null,
 };
 
 export function builtinSidebarNavShortcutAction(id: BuiltinSidebarNavId): string | null {
@@ -63,6 +71,7 @@ function isBuiltinSidebarNavId(key: string): key is BuiltinSidebarNavId {
 }
 
 export function resolveSidebarNavItems(input: {
+  servicesEnabled?: boolean;
   pluginGroups: readonly PluginSidebarGroup[];
   preferences: readonly SidebarNavPreference[];
 }): SidebarNavItem[] {
@@ -73,7 +82,8 @@ export function resolveSidebarNavItems(input: {
   const placed = new Set<string>();
 
   for (const preference of input.preferences) {
-    if (placed.has(preference.key)) continue;
+    if (placed.has(preference.key) || (preference.key === "services" && !input.servicesEnabled))
+      continue;
     const group = groupsByKey.get(preference.key);
     if (group) {
       placed.add(preference.key);
@@ -90,7 +100,7 @@ export function resolveSidebarNavItems(input: {
   }
 
   for (const id of BUILTIN_SIDEBAR_NAV_IDS) {
-    if (placed.has(id)) continue;
+    if (placed.has(id) || (id === "services" && !input.servicesEnabled)) continue;
     items.push({ kind: "builtin", key: id, id, visible: true });
   }
   for (const [key, group] of groupsByKey) {

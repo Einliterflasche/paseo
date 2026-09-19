@@ -219,12 +219,13 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
 
   async list(): Promise<TRecord[]> {
     await this.load();
-    return Array.from(this.cache.values());
+    return Array.from(this.cache.values(), (record) => this.schema.parse(record));
   }
 
   async get(id: string): Promise<TRecord | null> {
     await this.load();
-    return this.cache.get(id) ?? null;
+    const record = this.cache.get(id);
+    return record ? this.schema.parse(record) : null;
   }
 
   async upsert(record: TRecord): Promise<void> {
@@ -239,7 +240,9 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
     return this.mutateCache((records) => {
       const existing = records.get(id);
       if (!existing) return null;
-      const next = this.schema.parse(updater(existing));
+      // An updater may mutate its argument. Keep the committed record intact
+      // until pre-write lifecycle hooks and persistence have both succeeded.
+      const next = this.schema.parse(updater(this.schema.parse(existing)));
       records.set(id, next);
       return next;
     });
@@ -307,7 +310,9 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
     updater: (records: ReadonlyMap<string, TRecord>) => readonly TRecord[],
   ): Promise<TRecord[]> {
     return this.mutateCache((records) => {
-      const changed = updater(records);
+      const changed = updater(
+        new Map(Array.from(records, ([id, record]) => [id, this.schema.parse(record)])),
+      );
       if (changed.length === 0) return [];
       const parsed = changed.map((record) => this.schema.parse(record));
       for (const record of parsed) records.set(this.getId(record), record);
@@ -340,12 +345,26 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
       const recordsChanged = !mapsEqual(this.cache, staged);
       if (!recordsChanged && !hooks?.forcePersist?.(result)) return result;
       const records = Array.from(staged.values());
-      await hooks?.beforeWrite?.(records);
-      if (recordsChanged) await this.writeRecords(this.filePath, records);
+      if (recordsChanged) await this.beforeRecordsWrite(this.cache, staged);
+      await hooks?.beforeWrite?.(records.map((record) => this.schema.parse(record)));
+      if (recordsChanged)
+        await this.writeRecords(
+          this.filePath,
+          records.map((record) => this.schema.parse(record)),
+        );
       await hooks?.afterWrite?.();
       if (recordsChanged) {
+        const committedBefore = new Map(this.cache);
         this.cache.clear();
-        for (const [id, record] of staged) this.cache.set(id, record);
+        for (const [id, record] of staged) {
+          // Results and mutation notifications may retain staged records. The
+          // committed cache never shares newly published objects with callers.
+          this.cache.set(
+            id,
+            committedBefore.get(id) === record ? record : this.schema.parse(record),
+          );
+        }
+        this.afterRecordsCommit(committedBefore, this.cache);
       }
       hooks?.afterCommit?.();
       return result;
@@ -357,6 +376,16 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
   protected freezeMutationsUntilRestart(): void {
     this.mutationsBlockedUntilRestart = true;
   }
+
+  protected beforeRecordsWrite(
+    _previous: ReadonlyMap<string, TRecord>,
+    _next: ReadonlyMap<string, TRecord>,
+  ): void | Promise<void> {}
+
+  protected afterRecordsCommit(
+    _previous: ReadonlyMap<string, TRecord>,
+    _next: ReadonlyMap<string, TRecord>,
+  ): void {}
 }
 
 function mapsEqual<TKey, TValue>(left: Map<TKey, TValue>, right: Map<TKey, TValue>): boolean {
@@ -508,6 +537,10 @@ export class FileBackedWorkspaceRegistry
   extends FileBackedRegistry<PersistedWorkspaceRecord>
   implements WorkspaceRegistry
 {
+  private readonly unavailableListeners = new Set<(workspaceId: string) => void | Promise<void>>();
+  private readonly availabilityListeners = new Set<
+    (workspaceId: string, available: boolean) => undefined
+  >();
   private readonly mutationListeners = new Set<
     (mutation: WorkspaceMutation) => void | Promise<void>
   >();
@@ -537,6 +570,62 @@ export class FileBackedWorkspaceRegistry
   ): () => void {
     this.mutationListeners.add(listener);
     return () => this.mutationListeners.delete(listener);
+  }
+
+  /** Revoke access before archive/removal can become visible or durable. */
+  subscribeBeforeUnavailable(listener: (workspaceId: string) => void | Promise<void>): () => void {
+    this.unavailableListeners.add(listener);
+    return () => this.unavailableListeners.delete(listener);
+  }
+
+  /** Synchronous committed state, before the next registry write can enter. */
+  subscribeAvailabilityCommitted(
+    listener: (workspaceId: string, available: boolean) => undefined,
+  ): () => void {
+    this.availabilityListeners.add(listener);
+    return () => this.availabilityListeners.delete(listener);
+  }
+
+  protected override afterRecordsCommit(
+    previous: ReadonlyMap<string, PersistedWorkspaceRecord>,
+    next: ReadonlyMap<string, PersistedWorkspaceRecord>,
+  ): void {
+    const listeners = Array.from(this.availabilityListeners);
+    const ids = new Set([...previous.keys(), ...next.keys()]);
+    for (const workspaceId of ids) {
+      if (previous.get(workspaceId) === next.get(workspaceId)) continue;
+      const record = next.get(workspaceId);
+      for (const listener of listeners) {
+        try {
+          listener(workspaceId, !!record && !record.archivedAt);
+        } catch (error) {
+          this.logger.error({ err: error, workspaceId }, "Workspace availability listener failed");
+        }
+      }
+    }
+  }
+
+  protected override async beforeRecordsWrite(
+    previous: ReadonlyMap<string, PersistedWorkspaceRecord>,
+    next: ReadonlyMap<string, PersistedWorkspaceRecord>,
+  ): Promise<void> {
+    const failures: unknown[] = [];
+    const listeners = Array.from(this.unavailableListeners);
+    for (const [workspaceId, workspace] of previous) {
+      if (workspace.archivedAt) continue;
+      const updated = next.get(workspaceId);
+      if (updated && !updated.archivedAt) continue;
+      for (const listener of listeners) {
+        try {
+          await listener(workspaceId);
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "Workspace access revocation failed before persistence");
+    }
   }
 
   override async update(
@@ -600,7 +689,14 @@ export class FileBackedWorkspaceRegistry
     let changed: PersistedWorkspaceRecord[] = [];
     const committed = await this.mutateCache(
       (records) => {
-        const staged = input.stage(records);
+        const staged = input.stage(
+          new Map(
+            Array.from(records, ([id, record]) => [
+              id,
+              PersistedWorkspaceRecordSchema.parse(record),
+            ]),
+          ),
+        );
         changed = staged.updates.map((record) => PersistedWorkspaceRecordSchema.parse(record));
         for (const record of changed) records.set(record.workspaceId, record);
         return { result: staged.result, forcePersist: staged.forcePersist };

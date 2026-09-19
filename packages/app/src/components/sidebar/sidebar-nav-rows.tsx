@@ -1,5 +1,5 @@
 import { router, usePathname } from "expo-router";
-import { CalendarClock, History, Plus, Search } from "lucide-react-native";
+import { CalendarClock, History, Plus, Search, PanelsTopLeft } from "lucide-react-native";
 import { memo, useCallback, useMemo, type ComponentType } from "react";
 import { useTranslation } from "react-i18next";
 import { View, type StyleProp, type ViewStyle } from "react-native";
@@ -21,7 +21,12 @@ import {
   buildNewWorkspaceRoute,
   buildSchedulesRoute,
   buildSessionsRoute,
+  parseServerIdFromPathname,
+  parseSettingsHostServerIdFromPathname,
 } from "@/utils/host-routes";
+
+import { useHosts } from "@/runtime/host-runtime";
+import { buildHostServicesRoute } from "@/utils/host-routes";
 
 interface SidebarNavRowProps {
   onBeforeNavigate?: () => void;
@@ -170,9 +175,37 @@ function SidebarSchedulesRow({ onBeforeNavigate }: SidebarNavRowProps) {
   );
 }
 
+function SidebarServicesRow({ onBeforeNavigate }: SidebarNavRowProps) {
+  const { t } = useTranslation();
+  const pathname = usePathname();
+  const hosts = useHosts();
+  const selection = useActiveWorkspaceSelection();
+  const routeServerId =
+    parseServerIdFromPathname(pathname) ?? parseSettingsHostServerIdFromPathname(pathname);
+  const preferredServerId = routeServerId ?? selection?.serverId;
+  const knownServerId = hosts.find((host) => host.serverId === preferredServerId)?.serverId;
+  const serverId = routeServerId ? knownServerId : (knownServerId ?? hosts[0]?.serverId);
+  const onPress = useCallback(() => {
+    if (!serverId) return;
+    onBeforeNavigate?.();
+    router.push(buildHostServicesRoute(serverId));
+  }, [serverId, onBeforeNavigate]);
+  return (
+    <SidebarHeaderRow
+      icon={PanelsTopLeft}
+      label={t("services.title")}
+      onPress={onPress}
+      isActive={pathname.endsWith("/services")}
+      testID="sidebar-services"
+      variant="compact"
+    />
+  );
+}
+
 const BUILTIN_ROWS: Record<BuiltinSidebarNavId, ComponentType<SidebarNavRowProps>> = {
   "new-workspace": SidebarNewWorkspaceRow,
   history: SidebarHistoryRow,
   search: SidebarSearchRow,
   schedules: SidebarSchedulesRow,
+  services: SidebarServicesRow,
 };

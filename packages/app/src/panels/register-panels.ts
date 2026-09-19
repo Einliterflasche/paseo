@@ -16,6 +16,9 @@ import { pullRequestPanelRegistration } from "@/panels/pull-request-panel";
 import { pluginPanelRegistration } from "@/plugins/workspace-panels/panel";
 import { newTabPanelRegistration } from "@/panels/new-tab-panel";
 
+import { servicesPanelRegistration } from "@/services/panel";
+import { servicePreviewPanelRegistration } from "@/services/preview-panel";
+
 let panelsRegistered = false;
 
 export function ensurePanelsRegistered(): void {
@@ -31,6 +34,8 @@ export function ensurePanelsRegistered(): void {
   registerPanel(browserPanelRegistration);
   registerPanel(filePanelRegistration);
   registerPanel(filesPanelRegistration);
+  registerPanel(servicesPanelRegistration);
+  registerPanel(servicePreviewPanelRegistration);
   registerPanel(pullRequestPanelRegistration);
   registerPanel(commitDiffPanelRegistration);
   registerPanel(workingDiffPanelRegistration);

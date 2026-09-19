@@ -3,6 +3,7 @@ import { View, type PointerEvent as RNPointerEvent } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { StyleSheet, useUnistyles } from "react-native-unistyles";
 import { startResizeHandleDrag, type ResizeHandleDrag } from "@/components/resize-handle-drag";
+const resizeSurfaceData = { surfaceOcclusion: "resize" };
 import { useHasFinePointer } from "@/hooks/use-fine-pointer";
 import {
   SIDEBAR_RESIZE_ACTIVATION_OFFSET,
@@ -259,6 +260,7 @@ export function ResizeHandle({
       {finePointer ? (
         <View
           role="separator"
+          dataSet={resizeSurfaceData}
           aria-orientation={direction === "horizontal" ? "vertical" : "horizontal"}
           style={hitAreaStyle}
           onPointerDown={handlePointerDown}
@@ -269,6 +271,7 @@ export function ResizeHandle({
         <GestureDetector gesture={touchGesture}>
           <View
             role="separator"
+            dataSet={resizeSurfaceData}
             aria-orientation={direction === "horizontal" ? "vertical" : "horizontal"}
             collapsable={false}
             style={touchHitAreaStyle}

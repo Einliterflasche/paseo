@@ -17,6 +17,7 @@
   # The default is read from a sidecar file so the CI auto-updater can replace
   # the hash with a single file write instead of a sed against this source.
   npmDepsHash ? lib.fileContents ./npm-deps.hash,
+  servicesCatalog ? false,
 }:
 
 buildNpmPackage rec {
@@ -62,6 +63,7 @@ buildNpmPackage rec {
   };
 
   nodejs = nodejs_22;
+  EXPO_PUBLIC_PASEO_SERVICES_CATALOG = if servicesCatalog then "1" else "0";
 
   # Default hash lives in nix/npm-deps.hash (see arg default above).
   # CI auto-updates that file when package-lock.json changes (see .github/workflows/).
@@ -93,7 +95,7 @@ buildNpmPackage rec {
     # Rebuild only node-pty (native addon for terminal emulation). The sherpa
     # speech runtime ships prebuilt platform packages and is copied into the
     # daemon closure by scripts/trace-daemon.mjs.
-    npm rebuild node-pty
+    npm rebuild node-pty --workspace=@getpaseo/server
 
     # Build all server packages in dependency order (defined in package.json)
     npm run build:server

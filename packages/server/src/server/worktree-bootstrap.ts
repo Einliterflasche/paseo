@@ -880,6 +880,7 @@ async function acquireWorkspaceScriptTerminal(params: {
       name: scriptName,
       title: scriptName,
       env,
+      serviceProcess: serviceScript,
     }));
   return { terminal, reusableTerminal };
 }

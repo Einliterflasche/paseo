@@ -31,6 +31,11 @@ function summarize(items: readonly SidebarNavItem[]): SidebarNavPreference[] {
 }
 
 describe("resolveSidebarNavItems", () => {
+  it("keeps Services unavailable by default even when preferences came from an enabled client", () => {
+    const input = { pluginGroups: [], preferences: [{ key: "services", visible: true }] };
+    expect(resolveSidebarNavItems(input).some((item) => item.key === "services")).toBe(false);
+    expect(resolveSidebarNavItems({ ...input, servicesEnabled: true })[0].key).toBe("services");
+  });
   it("yields builtins then plugins, all visible, when nothing is stored", () => {
     const items = resolveSidebarNavItems({ pluginGroups: [kanban, notes], preferences: [] });
 

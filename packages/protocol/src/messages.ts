@@ -2938,6 +2938,58 @@ export const WorkspaceScriptStopRequestSchema = z.object({
   requestId: z.string(),
 });
 
+// Development-only preview RPCs; schema availability does not advertise support.
+export const ServicePreviewPrepareRequestSchema = z.object({
+  type: z.literal("service.preview.prepare.request"),
+  requestId: z.string(),
+  attemptId: z.string().min(1),
+  browserHandle: z.string().min(1),
+  serviceId: z.string().min(1),
+  mode: z.enum(["iframe", "tab"]),
+});
+
+export const ServicePreviewCloseRequestSchema = z.object({
+  type: z.literal("service.preview.close.request"),
+  requestId: z.string(),
+  attemptId: z.string().min(1),
+});
+
+export const ServiceExternalRegisterRequestSchema = z.object({
+  type: z.literal("service.external.register.request"),
+  requestId: z.string(),
+  name: z.string().min(1),
+  port: z.number().int().min(1).max(65535),
+  workspaceId: z.string().min(1).nullable(),
+  mount: z.enum(["preserve", "strip"]),
+});
+
+export const ServiceExternalConnectRequestSchema = z.object({
+  type: z.literal("service.external.connect.request"),
+  requestId: z.string(),
+  serviceId: z.string().min(1),
+});
+
+export const ServiceExternalDisconnectRequestSchema = z.object({
+  type: z.literal("service.external.disconnect.request"),
+  requestId: z.string(),
+  serviceId: z.string().min(1),
+});
+
+export const ServiceManagedEnableRequestSchema = z.object({
+  type: z.literal("service.managed.enable.request"),
+  requestId: z.string(),
+  workspaceId: z.string().min(1),
+  scriptName: z.string().min(1),
+  mount: z.enum(["preserve", "strip"]),
+});
+
+export const ServiceManagedDisableRequestSchema = z.object({
+  type: z.literal("service.managed.disable.request"),
+  requestId: z.string(),
+  workspaceId: z.string().min(1),
+  scriptName: z.string().min(1),
+});
+
 export const SubscribeTerminalRequestSchema = z.object({
   type: z.literal("subscribe_terminal_request"),
   terminalId: z.string(),
@@ -3264,6 +3316,13 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceScriptListRequestSchema,
   WorkspaceScriptStartRequestSchema,
   WorkspaceScriptStopRequestSchema,
+  ServicePreviewPrepareRequestSchema,
+  ServicePreviewCloseRequestSchema,
+  ServiceExternalRegisterRequestSchema,
+  ServiceExternalConnectRequestSchema,
+  ServiceExternalDisconnectRequestSchema,
+  ServiceManagedEnableRequestSchema,
+  ServiceManagedDisableRequestSchema,
   SubscribeTerminalRequestSchema,
   UnsubscribeTerminalRequestSchema,
   TerminalInputSchema,
@@ -3447,6 +3506,39 @@ const ServerCapabilitiesFromUnknownSchema = z
 export const ServerInfoStatusPayloadSchema = z
   .object({
     status: z.literal("server_info"),
+    // Optional development preview registry. Older peers omit this entirely.
+    servicePreviews: z
+      .object({
+        version: z.literal(1),
+        origin: z.string().url(),
+        externalRegistration: z.literal(1).optional(),
+        managedRegistration: z.literal(1).optional(),
+        managedEnrollments: z
+          .array(
+            z.object({
+              serviceId: z.string(),
+              workspaceId: z.string(),
+              scriptName: z.string(),
+              name: z.string(),
+              mount: z.enum(["preserve", "strip"]),
+              enabled: z.boolean(),
+            }),
+          )
+          .optional(),
+        services: z.array(
+          z.object({
+            kind: z.literal("external").optional(),
+            serviceId: z.string(),
+            name: z.string(),
+            workspaceId: z.string().nullable(),
+            scriptName: z.string().nullable(),
+            port: z.number().int().positive(),
+            available: z.boolean(),
+            revision: z.string().optional(),
+          }),
+        ),
+      })
+      .optional(),
     // COMPAT(restartRecovery): added in fork v0.8.0; remove optional parsing after 2027-03-16.
     restartRecoveryState: z.enum(["running", "preparing", "paused", "restoring"]).optional(),
     restartRecoveryGeneration: z.string().optional(),
@@ -4447,6 +4539,98 @@ export const WorkspaceScriptStartResponseMessageSchema = z.object({
 export const WorkspaceScriptStopResponseMessageSchema = z.object({
   type: z.literal("workspace.script.stop.response"),
   payload: WorkspaceScriptOperationPayloadSchema,
+});
+
+const ServicePreviewErrorResultSchema = z.object({
+  status: z.literal("error"),
+  code: z.enum(["unavailable", "duplicate-attempt", "browser-session-replaced"]),
+});
+
+export const ServicePreviewPrepareResponseMessageSchema = z.object({
+  type: z.literal("service.preview.prepare.response"),
+  payload: z.object({
+    requestId: z.string(),
+    result: z.discriminatedUnion("status", [
+      z.object({
+        status: z.literal("prepared"),
+        expiresInMs: z.number().nonnegative().optional(),
+        attemptId: z.string(),
+        bootstrapId: z.string(),
+        ticket: z.string(),
+        serviceId: z.string(),
+        mode: z.enum(["iframe", "tab"]),
+      }),
+      ServicePreviewErrorResultSchema,
+    ]),
+  }),
+});
+
+export const ServicePreviewCloseResponseMessageSchema = z.object({
+  type: z.literal("service.preview.close.response"),
+  payload: z.object({
+    requestId: z.string(),
+    result: z.discriminatedUnion("status", [
+      z.object({ status: z.literal("closed"), attemptId: z.string() }),
+      ServicePreviewErrorResultSchema,
+    ]),
+  }),
+});
+
+const ServiceExternalResultSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("ok"), serviceId: z.string() }),
+  z.object({
+    status: z.literal("error"),
+    code: z.enum([
+      "unavailable",
+      "restarting",
+      "unknown-registration",
+      "unknown-workspace",
+      "already-registered",
+      "infrastructure-port",
+      "invalid-input",
+      "storage-error",
+    ]),
+  }),
+]);
+
+export const ServiceExternalRegisterResponseMessageSchema = z.object({
+  type: z.literal("service.external.register.response"),
+  payload: z.object({ requestId: z.string(), result: ServiceExternalResultSchema }),
+});
+
+export const ServiceExternalConnectResponseMessageSchema = z.object({
+  type: z.literal("service.external.connect.response"),
+  payload: z.object({ requestId: z.string(), result: ServiceExternalResultSchema }),
+});
+
+export const ServiceExternalDisconnectResponseMessageSchema = z.object({
+  type: z.literal("service.external.disconnect.response"),
+  payload: z.object({ requestId: z.string(), result: ServiceExternalResultSchema }),
+});
+
+const ServiceManagedResultSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("ok"), serviceId: z.string() }),
+  z.object({
+    status: z.literal("error"),
+    code: z.enum([
+      "unavailable",
+      "restarting",
+      "unknown-service",
+      "already-enabled",
+      "storage-error",
+      "invalid-input",
+    ]),
+  }),
+]);
+
+export const ServiceManagedEnableResponseMessageSchema = z.object({
+  type: z.literal("service.managed.enable.response"),
+  payload: z.object({ requestId: z.string(), result: ServiceManagedResultSchema }),
+});
+
+export const ServiceManagedDisableResponseMessageSchema = z.object({
+  type: z.literal("service.managed.disable.response"),
+  payload: z.object({ requestId: z.string(), result: ServiceManagedResultSchema }),
 });
 
 // COMPAT(desktopEditorBridge): added in v0.1.88, remove after 2026-12-03 once old clients no longer parse daemon editor RPC responses.
@@ -6607,6 +6791,13 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceScriptListResponseMessageSchema,
   WorkspaceScriptStartResponseMessageSchema,
   WorkspaceScriptStopResponseMessageSchema,
+  ServicePreviewPrepareResponseMessageSchema,
+  ServicePreviewCloseResponseMessageSchema,
+  ServiceExternalRegisterResponseMessageSchema,
+  ServiceExternalConnectResponseMessageSchema,
+  ServiceExternalDisconnectResponseMessageSchema,
+  ServiceManagedEnableResponseMessageSchema,
+  ServiceManagedDisableResponseMessageSchema,
   LegacyListAvailableEditorsResponseMessageSchema,
   LegacyOpenInEditorResponseMessageSchema,
   ArchiveWorkspaceResponseMessageSchema,
@@ -6811,6 +7002,30 @@ export type StartWorkspaceScriptResponseMessage = z.infer<
 export type WorkspaceScriptListRequest = z.infer<typeof WorkspaceScriptListRequestSchema>;
 export type WorkspaceScriptStartRequest = z.infer<typeof WorkspaceScriptStartRequestSchema>;
 export type WorkspaceScriptStopRequest = z.infer<typeof WorkspaceScriptStopRequestSchema>;
+export type ServicePreviewPrepareRequest = z.infer<typeof ServicePreviewPrepareRequestSchema>;
+export type ServicePreviewCloseRequest = z.infer<typeof ServicePreviewCloseRequestSchema>;
+export type ServiceExternalRegisterRequest = z.infer<typeof ServiceExternalRegisterRequestSchema>;
+export type ServiceManagedEnableRequest = z.infer<typeof ServiceManagedEnableRequestSchema>;
+export type ServiceManagedDisableRequest = z.infer<typeof ServiceManagedDisableRequestSchema>;
+export type ServiceManagedResponseMessage = z.infer<
+  | typeof ServiceManagedEnableResponseMessageSchema
+  | typeof ServiceManagedDisableResponseMessageSchema
+>;
+export type ServiceExternalConnectRequest = z.infer<typeof ServiceExternalConnectRequestSchema>;
+export type ServiceExternalDisconnectRequest = z.infer<
+  typeof ServiceExternalDisconnectRequestSchema
+>;
+export type ServiceExternalResponseMessage = z.infer<
+  | typeof ServiceExternalRegisterResponseMessageSchema
+  | typeof ServiceExternalConnectResponseMessageSchema
+  | typeof ServiceExternalDisconnectResponseMessageSchema
+>;
+export type ServicePreviewPrepareResponseMessage = z.infer<
+  typeof ServicePreviewPrepareResponseMessageSchema
+>;
+export type ServicePreviewCloseResponseMessage = z.infer<
+  typeof ServicePreviewCloseResponseMessageSchema
+>;
 export type WorkspaceScriptListResponseMessage = z.infer<
   typeof WorkspaceScriptListResponseMessageSchema
 >;

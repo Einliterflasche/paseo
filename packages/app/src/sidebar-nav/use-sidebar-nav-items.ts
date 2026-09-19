@@ -1,3 +1,4 @@
+import { servicesCatalogEnabled } from "@/services/feature";
 import { useCallback, useMemo } from "react";
 import { useAppSettings } from "@/hooks/use-settings";
 import { useInstalledPlugins } from "@/plugins/registry";
@@ -25,6 +26,7 @@ export function useSidebarNavItems(): UseSidebarNavItemsReturn {
   const items = useMemo(
     () =>
       resolveSidebarNavItems({
+        servicesEnabled: servicesCatalogEnabled,
         pluginGroups,
         preferences,
       }),
@@ -35,7 +37,11 @@ export function useSidebarNavItems(): UseSidebarNavItemsReturn {
     (key: string, visible: boolean) => {
       void updateSettings((current) => {
         const previous = current.sidebarNavItems;
-        const currentItems = resolveSidebarNavItems({ pluginGroups, preferences: previous });
+        const currentItems = resolveSidebarNavItems({
+          pluginGroups,
+          preferences: previous,
+          servicesEnabled: servicesCatalogEnabled,
+        });
         return {
           sidebarNavItems: setSidebarNavItemVisible({
             items: currentItems,
@@ -53,7 +59,11 @@ export function useSidebarNavItems(): UseSidebarNavItemsReturn {
     (key: string, direction: "up" | "down") => {
       void updateSettings((current) => {
         const previous = current.sidebarNavItems;
-        const currentItems = resolveSidebarNavItems({ pluginGroups, preferences: previous });
+        const currentItems = resolveSidebarNavItems({
+          pluginGroups,
+          preferences: previous,
+          servicesEnabled: servicesCatalogEnabled,
+        });
         return {
           sidebarNavItems: moveSidebarNavItem({
             items: currentItems,

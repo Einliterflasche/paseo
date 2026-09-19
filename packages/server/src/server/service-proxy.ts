@@ -423,6 +423,38 @@ export class ServiceProxyRouteRegistry {
   private workspaceHostnames = new Map<string, Set<string>>();
   private configuredPublicBaseHostnames = new Set<string>();
   private publicBaseHostnames = new Set<string>();
+  private readonly listeners = new Set<(workspaceId: string) => void>();
+  private notificationDepth = 0;
+  private readonly changedWorkspaces = new Set<string>();
+
+  subscribeWorkspaceServices(listener: (workspaceId: string) => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private publish(workspaceId: string): void {
+    if (this.notificationDepth > 0) {
+      this.changedWorkspaces.add(workspaceId);
+      return;
+    }
+    for (const listener of this.listeners) listener(workspaceId);
+  }
+
+  private change(work: () => void): void {
+    this.notificationDepth += 1;
+    try {
+      work();
+    } finally {
+      this.notificationDepth -= 1;
+      if (this.notificationDepth === 0) {
+        const changed = [...this.changedWorkspaces];
+        this.changedWorkspaces.clear();
+        for (const workspaceId of changed) this.publish(workspaceId);
+      }
+    }
+  }
 
   constructor(publicBaseUrl?: string | null) {
     if (publicBaseUrl) {
@@ -452,19 +484,22 @@ export class ServiceProxyRouteRegistry {
 
   registerRoute(entry: ServiceProxyRouteEntry): void {
     this.assertCanRegister(entry);
-    const previous = this.routes.get(entry.hostname);
-    if (previous) {
-      this.removeRoute(previous.hostname);
-    }
-    const storedEntry = this.toStoredEntry(entry);
-    this.routes.set(storedEntry.hostname, storedEntry);
-    for (const alias of this.getRouteHostnames(storedEntry)) {
-      this.hostnameAliases.set(alias, storedEntry.hostname);
-    }
-    if (storedEntry.publicBaseUrl) {
-      this.publicBaseHostnames.add(new URL(storedEntry.publicBaseUrl).hostname.toLowerCase());
-    }
-    this.addHostnameToWorkspaceIndex(storedEntry.workspaceId, storedEntry.hostname);
+    this.change(() => {
+      const previous = this.routes.get(entry.hostname);
+      if (previous) {
+        this.removeRoute(previous.hostname);
+      }
+      const storedEntry = this.toStoredEntry(entry);
+      this.routes.set(storedEntry.hostname, storedEntry);
+      for (const alias of this.getRouteHostnames(storedEntry)) {
+        this.hostnameAliases.set(alias, storedEntry.hostname);
+      }
+      if (storedEntry.publicBaseUrl) {
+        this.publicBaseHostnames.add(new URL(storedEntry.publicBaseUrl).hostname.toLowerCase());
+      }
+      this.addHostnameToWorkspaceIndex(storedEntry.workspaceId, storedEntry.hostname);
+      this.publish(storedEntry.workspaceId);
+    });
   }
 
   replaceWorkspaceBranchRoutes(params: { workspaceId: string; newBranch: string | null }): boolean {
@@ -507,12 +542,10 @@ export class ServiceProxyRouteRegistry {
     for (const { entry } of updates) {
       this.assertCanRegister(entry, replacingHostnames);
     }
-    for (const { oldHostname } of updates) {
-      this.removeRoute(oldHostname);
-    }
-    for (const { entry } of updates) {
-      this.registerRoute(entry);
-    }
+    this.change(() => {
+      for (const { oldHostname } of updates) this.removeRoute(oldHostname);
+      for (const { entry } of updates) this.registerRoute(entry);
+    });
     return true;
   }
 
@@ -528,6 +561,7 @@ export class ServiceProxyRouteRegistry {
     }
     this.removeHostnameFromWorkspaceIndex(entry.workspaceId, canonicalHostname);
     this.rebuildPublicBaseHostnames();
+    this.publish(entry.workspaceId);
   }
 
   removeRouteForWorkspaceScript(params: { workspaceId: string; scriptName: string }): void {
@@ -607,16 +641,11 @@ export class ServiceProxyRouteRegistry {
   }
 
   removeRoutesForPort(port: number): void {
-    for (const [hostname, entry] of Array.from(this.routes)) {
-      if (entry.port === port) {
-        this.routes.delete(hostname);
-        for (const alias of this.getRouteHostnames(entry)) {
-          this.hostnameAliases.delete(alias);
-        }
-        this.removeHostnameFromWorkspaceIndex(entry.workspaceId, hostname);
+    this.change(() => {
+      for (const [hostname, entry] of Array.from(this.routes)) {
+        if (entry.port === port) this.removeRoute(hostname);
       }
-    }
-    this.rebuildPublicBaseHostnames();
+    });
   }
 
   classifyHost(host: string | undefined): HostClassification {
@@ -783,20 +812,23 @@ export function createScriptProxyUpgradeHandler({
   routeStore: ServiceProxyRouteRegistry;
   logger: Logger;
   passthroughUnknown?: boolean;
-}): (req: IncomingMessage, socket: net.Socket, head: Buffer) => void {
+}): (req: IncomingMessage, socket: net.Socket, head: Buffer) => boolean {
   return (req, socket, head) => {
     const classification = routeStore.classifyHost(req.headers.host);
     if (classification.type !== "registered-service") {
-      if (!passthroughUnknown) {
+      if (!passthroughUnknown || classification.type === "known-service-miss") {
         socket.destroy();
+        return true;
       }
-      return;
+      return false;
     }
     proxyUpgradeRequest({ req, socket, head, route: classification.route, logger });
+    return true;
   };
 }
 
 export interface ServiceProxySubsystem {
+  subscribeWorkspaceServices(listener: (workspaceId: string) => void): () => void;
   registerWorkspaceService(input: RegisterWorkspaceServiceInput): ServiceProxyRouteEntry;
   removeWorkspaceService(params: { workspaceId: string; scriptName: string }): void;
   removeServiceRoutesByHostnames(hostnames: string[]): void;
@@ -829,7 +861,7 @@ export interface ServiceProxySubsystem {
   middleware(): RequestHandler;
   upgradeHandler(options: {
     passthroughUnknown: boolean;
-  }): (req: IncomingMessage, socket: net.Socket, head: Buffer) => void;
+  }): (req: IncomingMessage, socket: net.Socket, head: Buffer) => boolean;
   startStandalone(options: {
     listenTarget: ServiceProxyListenTarget;
   }): Promise<ServiceProxyListenTarget>;
@@ -839,11 +871,13 @@ export interface ServiceProxySubsystem {
 export function createServiceProxySubsystem({
   logger,
   publicBaseUrl,
+  controlOnly = false,
 }: {
   logger: Logger;
   publicBaseUrl?: string | null;
+  controlOnly?: boolean;
 }): ServiceProxySubsystem {
-  return new NodeServiceProxySubsystem(logger, publicBaseUrl ?? null);
+  return new NodeServiceProxySubsystem(logger, publicBaseUrl ?? null, controlOnly);
 }
 
 class NodeServiceProxySubsystem implements ServiceProxySubsystem {
@@ -854,8 +888,13 @@ class NodeServiceProxySubsystem implements ServiceProxySubsystem {
   constructor(
     private readonly logger: Logger,
     publicBaseUrl: string | null,
+    private readonly controlOnly: boolean,
   ) {
     this.routes = new ServiceProxyRouteRegistry(publicBaseUrl);
+  }
+
+  subscribeWorkspaceServices(listener: (workspaceId: string) => void): () => void {
+    return this.routes.subscribeWorkspaceServices(listener);
   }
 
   registerWorkspaceService(input: RegisterWorkspaceServiceInput): ServiceProxyRouteEntry {
@@ -893,7 +932,7 @@ class NodeServiceProxySubsystem implements ServiceProxySubsystem {
     daemonPort: number | null | undefined;
     publicBaseUrl?: string | null;
   }): ServiceProxyUrlProjection {
-    return projectServiceProxyUrls(input);
+    return projectServiceProxyUrls({ ...input, daemonPort: this.proxyPort(input.daemonPort) });
   }
 
   projectWorkspaceService(input: {
@@ -903,7 +942,7 @@ class NodeServiceProxySubsystem implements ServiceProxySubsystem {
     daemonPort: number | null | undefined;
     publicBaseUrl?: string | null;
   }): ServiceProxyScriptProjection {
-    return projectWorkspaceService(input);
+    return projectWorkspaceService({ ...input, daemonPort: this.proxyPort(input.daemonPort) });
   }
 
   projectWorkspaceServiceState(input: {
@@ -914,7 +953,17 @@ class NodeServiceProxySubsystem implements ServiceProxySubsystem {
     daemonPort: number | null | undefined;
     publicBaseUrl?: string | null;
   }): ServiceProxyWorkspaceScriptProjection {
-    return this.routes.projectWorkspaceServiceState(input);
+    return this.routes.projectWorkspaceServiceState({
+      ...input,
+      daemonPort: this.proxyPort(input.daemonPort),
+    });
+  }
+
+  private proxyPort(daemonPort: number | null | undefined): number | null | undefined {
+    if (this.standaloneListenTarget) {
+      return this.standaloneListenTarget.type === "tcp" ? this.standaloneListenTarget.port : null;
+    }
+    return this.controlOnly ? null : daemonPort;
   }
 
   middleware(): RequestHandler {
@@ -923,7 +972,7 @@ class NodeServiceProxySubsystem implements ServiceProxySubsystem {
 
   upgradeHandler(options: {
     passthroughUnknown: boolean;
-  }): (req: IncomingMessage, socket: net.Socket, head: Buffer) => void {
+  }): (req: IncomingMessage, socket: net.Socket, head: Buffer) => boolean {
     // Pass passthroughUnknown explicitly: the factory defaults it to true, the
     // subsystem requires callers to choose.
     return createScriptProxyUpgradeHandler({

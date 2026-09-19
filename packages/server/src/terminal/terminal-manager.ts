@@ -60,6 +60,7 @@ export interface TerminalManager {
     env?: Record<string, string>;
     command?: string;
     args?: string[];
+    serviceProcess?: boolean;
     rows?: number;
     cols?: number;
     activityToken?: string;
@@ -317,6 +318,7 @@ export function createTerminalManager(
       env?: Record<string, string>;
       command?: string;
       args?: string[];
+      serviceProcess?: boolean;
       rows?: number;
       cols?: number;
       activityToken?: string;
@@ -348,6 +350,7 @@ export function createTerminalManager(
             id: terminalId,
             cwd: options.cwd,
             workspaceId: options.workspaceId,
+            serviceProcess: options.serviceProcess,
             name: options.name ?? defaultName,
             ...(options.title ? { title: options.title } : {}),
             ...(options.command ? { command: options.command } : {}),

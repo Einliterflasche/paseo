@@ -17,6 +17,10 @@ import {
 
 const logger = pino({ level: "silent" });
 
+function targetPorts(targets: ReadonlyArray<{ port: number }>) {
+  return targets.map((target) => target.port);
+}
+
 function readServerSourceFiles(dir = path.resolve(import.meta.dirname)): string[] {
   const entries: string[] = [];
   for (const name of readdirSync(dir)) {
@@ -277,6 +281,67 @@ describe("service proxy subsystem shape", () => {
 
     expect(serviceProxy.getRouteEntry("api--repo.localhost")).toMatchObject({ port: 3000 });
     expect(serviceProxy.getRouteEntry("api.services.example.com")).toMatchObject({ port: 3000 });
+  });
+
+  it("notifies each affected workspace once after all routes for a port are removed", () => {
+    const registry = new ServiceProxyRouteRegistry("https://services.example.com");
+    const workspaceA = {
+      workspaceId: "workspace-a",
+      projectSlug: "repo-a",
+      branchName: "main",
+      publicBaseUrl: "https://services.example.com",
+    };
+    const first = registry.registerWorkspaceService({
+      ...workspaceA,
+      scriptName: "web",
+      port: 5173,
+    });
+    const sameWorkspace = registry.registerWorkspaceService({
+      ...workspaceA,
+      scriptName: "admin",
+      port: 5173,
+    });
+    const otherWorkspace = registry.registerWorkspaceService({
+      ...workspaceA,
+      workspaceId: "workspace-b",
+      projectSlug: "repo-b",
+      scriptName: "api",
+      port: 5173,
+    });
+    const survivor = registry.registerWorkspaceService({
+      ...workspaceA,
+      scriptName: "docs",
+      port: 5174,
+    });
+    const observed: Array<{ workspaceId: string; ports: number[]; allPorts: number[] }> = [];
+    const stop = registry.subscribeWorkspaceServices((workspaceId) => {
+      observed.push({
+        workspaceId,
+        ports: targetPorts(registry.getWorkspaceHealthTargets(workspaceId)),
+        allPorts: targetPorts(registry.getHealthCheckTargets()),
+      });
+    });
+    registry.removeRoutesForPort(5173);
+    expect(observed).toEqual([
+      { workspaceId: "workspace-a", ports: [5174], allPorts: [5174] },
+      { workspaceId: "workspace-b", ports: [], allPorts: [5174] },
+    ]);
+    expect(registry.listRoutesForWorkspace("workspace-a")).toEqual([survivor]);
+    expect(registry.listRoutesForWorkspace("workspace-b")).toEqual([]);
+    for (const removed of [first, sameWorkspace, otherWorkspace]) {
+      expect(registry.getHealthTargetForHostname(removed.hostname)).toBeNull();
+      expect(registry.getRouteEntry(removed.publicHostname!)).toBeNull();
+      expect(registry.classifyHost(removed.publicHostname!)).toEqual({
+        type: "known-service-miss",
+      });
+    }
+    registry.removeRoutesForPort(5173);
+    registry.removeRoutesForPort(65000);
+    expect(observed).toHaveLength(2);
+    stop();
+    registry.removeRoutesForPort(5174);
+    expect(registry.getHealthCheckTargets()).toEqual([]);
+    expect(observed).toHaveLength(2);
   });
 
   it("allows same workspace/script replacement", () => {

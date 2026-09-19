@@ -1,6 +1,7 @@
 import { AgentRequests } from "./agent/requests/index.js";
 import { WebSocket, WebSocketServer } from "ws";
 import type { IncomingMessage, Server as HTTPServer } from "http";
+import type { Duplex } from "node:stream";
 import { join } from "path";
 import { hostname as getHostname } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -99,6 +100,19 @@ import {
   type BrowserAutomationHostCapability,
 } from "@getpaseo/protocol/browser-automation/capabilities";
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
+import type { PreviewSources } from "./service-preview/sources.js";
+import { PreviewBrokerError, type PreviewBroker } from "./service-preview/broker.js";
+import {
+  dispatchExternalPreview,
+  externalPreviewResponseType,
+  isExternalPreviewRequest,
+} from "./service-preview/external-dispatch.js";
+import { RestartInProgressError } from "./restart/restart-errors.js";
+import {
+  dispatchManagedPreview,
+  managedPreviewResponseType,
+  isManagedPreviewRequest,
+} from "./service-preview/managed-dispatch.js";
 import type { DaemonRuntimeConfig } from "./session/daemon/daemon-session.js";
 import { DirectorySyncService } from "./directory-sync/index.js";
 import { OWNER_PERMISSIONS, type DaemonPermission } from "./authorization/index.js";
@@ -154,6 +168,10 @@ interface WebSocketConnectionIdentity {
 }
 
 interface WebSocketServerConfig {
+  // No production bootstrap supplies this while preview admission is experimental.
+  previewBroker?: PreviewBroker;
+  /** The bootstrap ingress exclusively dispatches upgrades in this mode. */
+  externallyDispatched?: boolean;
   allowedOrigins?: Set<string>;
   hostnames?: HostnamesConfig;
   getAllowedOrigins?: () => Set<string>;
@@ -621,9 +639,14 @@ export class VoiceAssistantWebSocketServer {
 
   broadcastRestartStatus(): void {
     for (const [socket, connection] of this.sessions)
-      this.sendToClient(socket, this.createServerInfoMessage(connection.session));
+      this.sendToClient(socket, this.createServerInfoMessage(connection.session, socket));
   }
   private readonly advertiseRelayConfig: boolean;
+  private readonly previewBroker: PreviewBroker | null;
+  private unsubscribePreviewCatalog: (() => void) | null = null;
+  private get previewSources(): PreviewSources | null {
+    return this.previewBroker?.sources ?? null;
+  }
   private readonly directorySync = new DirectorySyncService();
   private readonly pluginRuntime: SessionOptions["pluginRuntime"];
   private readonly orchestrationSkills: SessionOptions["orchestrationSkills"];
@@ -680,6 +703,7 @@ export class VoiceAssistantWebSocketServer {
     this.workspaceSetupRuntime = workspaceSetupRuntime;
     this.advertiseDaemonStatusRpc = wsConfig.daemonStatusRpc !== false;
     this.advertiseRelayConfig = wsConfig.relayConfig !== false;
+    this.previewBroker = wsConfig.previewBroker ?? null;
     this.getRestartStatus = wsConfig.getRestartStatus;
     this.connectionLifecycle = wsConfig.startPaused === true ? "starting" : "accepting";
     this.serverId = serverId;
@@ -768,6 +792,7 @@ export class VoiceAssistantWebSocketServer {
     });
 
     this.wss = this.createWebSocketServer(server, wsConfig, auth);
+    this.subscribeToPreviewCatalog();
     this.startRuntimeMetricsInterval();
     this.startApplicationSocketLeaseInterval();
 
@@ -833,7 +858,7 @@ export class VoiceAssistantWebSocketServer {
   ): WebSocketServer {
     const password = auth?.password;
     const wss = new WebSocketServer({
-      server,
+      ...(wsConfig.externallyDispatched ? { noServer: true as const } : { server }),
       path: "/ws",
       handleProtocols: (protocols) => selectWebSocketProtocol(protocols, password),
       verifyClient: ({ req }, callback) => {
@@ -849,6 +874,12 @@ export class VoiceAssistantWebSocketServer {
       void this.attachAuthenticatedSocket(ws, request, password);
     });
     return wss;
+  }
+
+  handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
+    this.wss.handleUpgrade(request, socket, head, (connection) => {
+      this.wss.emit("connection", connection, request);
+    });
   }
 
   private startRuntimeMetricsInterval(): void {
@@ -946,7 +977,15 @@ export class VoiceAssistantWebSocketServer {
       }
     }
 
-    await this.attachSocket(ws, request);
+    await this.attachSocket(
+      ws,
+      request,
+      undefined,
+      false,
+      OWNER_SESSION_ADMISSION,
+      undefined,
+      password ? "verified-owner-password" : undefined,
+    );
   }
 
   public broadcast(message: WSOutboundMessage): void {
@@ -1029,6 +1068,7 @@ export class VoiceAssistantWebSocketServer {
     principalId: string,
     permissions: readonly DaemonPermission[],
   ): void {
+    this.previewSources?.replacePrincipalPermissions(principalId, permissions);
     for (const pending of this.pendingConnections.values()) {
       if (pending.admission.principalId === principalId) {
         pending.admission = { ...pending.admission, permissions };
@@ -1040,10 +1080,18 @@ export class VoiceAssistantWebSocketServer {
         this.syncBrowserToolsClientRegistration(connection);
       }
     }
+    if (this.previewBroker) this.broadcastCapabilitiesUpdate();
   }
 
   public prepareForShutdown(): void {
+    this.unsubscribePreviewCatalog?.();
+    this.unsubscribePreviewCatalog = null;
     this.connectionLifecycle = "stopping";
+    try {
+      this.previewBroker?.close();
+    } finally {
+      this.previewSources?.close();
+    }
   }
 
   public beginAcceptingConnections(): void {
@@ -1053,7 +1101,13 @@ export class VoiceAssistantWebSocketServer {
   }
 
   public async close(): Promise<void> {
-    this.prepareForShutdown();
+    try {
+      this.prepareForShutdown();
+    } catch (error) {
+      this.logger.error({ err: error }, "Service preview retirement failed during transport close");
+    }
+    // The feature owner drains preview persistence and its worker. Transport
+    // cleanup must still finish when that optional drain fails or stays pending.
     this.unsubscribeSpeechReadiness?.();
     this.unsubscribeSpeechReadiness = null;
     this.unsubscribeDaemonConfigChange?.();
@@ -1138,6 +1192,20 @@ export class VoiceAssistantWebSocketServer {
 
   private sendToClient(ws: WebSocketLike, message: WSOutboundMessage): void {
     this.sendMessageToSockets([ws], message);
+  }
+
+  private async sendPreviewFrame(ws: WebSocketLike, frame: string): Promise<boolean> {
+    try {
+      return await sendBoundedPhysicalFrameAndWait({
+        socket: ws,
+        frame,
+        onHighWater: () => this.closeAtOutboundHighWater(ws),
+      });
+    } catch {
+      // Transport exceptions must not publish secret-bearing payloads or errors.
+      this.logger.warn("preview_source_reply_failed");
+      return false;
+    }
   }
 
   private sendMessageToSockets(sockets: Iterable<WebSocketLike>, message: WSOutboundMessage): void {
@@ -1225,6 +1293,7 @@ export class VoiceAssistantWebSocketServer {
 
   private closePhysicalSocket(params: ClosePhysicalSocketParams): void {
     const { ws, logMessage, logFields } = params;
+    this.previewSources?.detach(ws);
     this.applicationSocketLease.release(ws);
     if (ws.readyState !== 1) {
       return;
@@ -1270,6 +1339,7 @@ export class VoiceAssistantWebSocketServer {
     allowDuringStartup = false,
     admission: SessionAdmission = OWNER_SESSION_ADMISSION,
     initialHello?: WSHelloMessage,
+    directAuthentication?: "verified-owner-password",
   ): Promise<void> {
     if (
       this.connectionLifecycle === "stopping" ||
@@ -1286,6 +1356,16 @@ export class VoiceAssistantWebSocketServer {
     const requestMetadata = extractSocketRequestMetadata(request);
     const identity = createWebSocketConnectionIdentity(requestMetadata, metadata);
     this.socketIdentities.set(ws, identity);
+    if (directAuthentication === "verified-owner-password") {
+      this.previewSources?.admitDirectOwner({
+        socket: ws,
+        connectionId: identity.connectionId,
+        principalId: admission.principalId,
+        permissions: admission.permissions,
+        origin: identity.origin,
+        send: (frame) => this.sendPreviewFrame(ws, frame),
+      });
+    }
     const connectionLogger = this.logger.child(toConnectionLogFields(identity));
 
     const pending: PendingConnection = {
@@ -1614,12 +1694,13 @@ export class VoiceAssistantWebSocketServer {
       admission: pending.admission,
     });
     this.sessions.set(ws, connection);
+    this.previewSources?.negotiate(ws, message.capabilities ?? null);
     if (connection.lifecycle === "reconnectable") {
       this.externalSessionsByKey.set(sessionKey, connection);
     }
     pending.identity.sessionId = connection.session.getSessionId();
     this.syncBrowserToolsClientRegistration(connection);
-    this.sendToClient(ws, this.createServerInfoMessage(connection.session));
+    this.sendToClient(ws, this.createServerInfoMessage(connection.session, ws));
     connection.connectionLogger.info(
       {
         ...toConnectionLogFields(pending.identity),
@@ -1661,9 +1742,10 @@ export class VoiceAssistantWebSocketServer {
     }
     existing.sockets.add(ws);
     this.sessions.set(ws, existing);
+    this.previewSources?.negotiate(ws, message.capabilities ?? null);
     pending.identity.sessionId = existing.session.getSessionId();
     this.syncBrowserToolsClientRegistration(existing);
-    this.sendToClient(ws, this.createServerInfoMessage(existing.session));
+    this.sendToClient(ws, this.createServerInfoMessage(existing.session, ws));
     pending.connectionLogger.info(
       {
         ...toConnectionLogFields(pending.identity),
@@ -1849,12 +1931,17 @@ export class VoiceAssistantWebSocketServer {
     };
   }
 
-  private createServerInfoMessage(session: Session): WSOutboundMessage {
+  private createServerInfoMessage(session: Session, socket?: WebSocketLike): WSOutboundMessage {
+    const previews =
+      socket && this.previewSources?.capture(socket) ? this.previewBroker?.describe() : undefined;
     return {
       type: "session",
       message: {
         type: "status",
-        payload: this.buildServerInfoStatusPayload(session),
+        payload: {
+          ...this.buildServerInfoStatusPayload(session),
+          ...(previews ? { servicePreviews: previews } : {}),
+        },
       },
     };
   }
@@ -1870,9 +1957,16 @@ export class VoiceAssistantWebSocketServer {
   }
 
   private broadcastCapabilitiesUpdate(): void {
-    for (const connection of new Set(this.sessions.values())) {
-      this.sendToConnection(connection, this.createServerInfoMessage(connection.session));
+    for (const [socket, connection] of this.sessions) {
+      this.sendToClient(socket, this.createServerInfoMessage(connection.session, socket));
     }
+  }
+
+  private subscribeToPreviewCatalog(): void {
+    if (!this.previewBroker) return;
+    this.unsubscribePreviewCatalog = this.previewBroker.subscribeCatalog(() =>
+      this.broadcastCapabilitiesUpdate(),
+    );
   }
 
   private broadcastDaemonConfigChanged(config: MutableDaemonConfig): void {
@@ -1922,6 +2016,7 @@ export class VoiceAssistantWebSocketServer {
     },
   ): Promise<void> {
     this.applicationSocketLease.release(ws);
+    this.previewSources?.detach(ws);
     const identity = this.socketIdentities.get(ws);
     const identityFields = identity ? toConnectionLogFields(identity) : {};
     const pending = this.clearPendingConnection(ws);
@@ -2315,6 +2410,7 @@ export class VoiceAssistantWebSocketServer {
       if (message.type === "hello") {
         this.incrementRuntimeCounter("unexpectedHelloOnActiveConnection");
         activeConnection.connectionLogger.warn("Received hello on active connection");
+        this.previewSources?.detach(ws);
         try {
           ws.close(WS_CLOSE_INVALID_HELLO, "Unexpected hello");
         } catch {
@@ -2339,6 +2435,15 @@ export class VoiceAssistantWebSocketServer {
     message: Extract<WSInboundMessage, { type: "session" }>,
   ): Promise<void> {
     this.recordInboundSessionRequestType(message.message.type);
+    if (
+      message.message.type === "service.preview.prepare.request" ||
+      message.message.type === "service.preview.close.request" ||
+      isExternalPreviewRequest(message.message) ||
+      isManagedPreviewRequest(message.message)
+    ) {
+      await this.dispatchPreviewMessage(ws, message.message);
+      return;
+    }
     const controlRpc = getControlRpcLogInfo(message.message);
     if (controlRpc) {
       const identity = this.socketIdentities.get(ws);
@@ -2378,6 +2483,79 @@ export class VoiceAssistantWebSocketServer {
           inflightRequests: activeConnection.session.getRuntimeMetrics().inflightRequests,
         },
         "ws_slow_request",
+      );
+    }
+  }
+
+  private async dispatchPreviewMessage(
+    ws: WebSocketLike,
+    request: Extract<
+      Extract<WSInboundMessage, { type: "session" }>["message"],
+      {
+        type:
+          | "service.preview.prepare.request"
+          | "service.preview.close.request"
+          | "service.external.register.request"
+          | "service.external.connect.request"
+          | "service.external.disconnect.request"
+          | "service.managed.enable.request"
+          | "service.managed.disable.request";
+      }
+    >,
+  ): Promise<void> {
+    try {
+      if (!this.previewBroker) throw new PreviewBrokerError("unavailable");
+      const broker = this.previewBroker;
+      if (isManagedPreviewRequest(request)) {
+        await dispatchManagedPreview({
+          broker,
+          socket: ws,
+          request,
+          runAdmission: (operation) => this.agentManager.runRequestAdmission(operation),
+        });
+      } else if (isExternalPreviewRequest(request)) {
+        await dispatchExternalPreview({
+          broker,
+          socket: ws,
+          request,
+          runAdmission: (operation) => this.agentManager.runRequestAdmission(operation),
+        });
+      } else if (request.type === "service.preview.prepare.request") {
+        await this.agentManager.runRequestAdmission(() => broker.prepare({ socket: ws, request }));
+      } else {
+        await broker.closeAttempt({ socket: ws, request });
+      }
+      return;
+    } catch (error) {
+      if (!(error instanceof PreviewBrokerError) && !(error instanceof RestartInProgressError)) {
+        try {
+          this.previewBroker?.close();
+        } catch {
+          // All broker authority ends before observer notification. An observer
+          // failure must not escape into shared-session error delivery.
+        }
+        this.logger.warn("preview_dispatch_failed");
+      }
+      // Never pass preview failures to shared-session error handling: a sibling
+      // may have the same clientId. Neither raw errors nor request data are logged.
+      let type: string;
+      if (isManagedPreviewRequest(request)) type = managedPreviewResponseType(request);
+      else if (isExternalPreviewRequest(request)) type = externalPreviewResponseType(request);
+      else if (request.type === "service.preview.prepare.request")
+        type = "service.preview.prepare.response";
+      else type = "service.preview.close.response";
+      await this.sendPreviewFrame(
+        ws,
+        JSON.stringify({
+          type: "session",
+          message: {
+            type,
+            payload: {
+              requestId: request.requestId,
+              result: { status: "error", code: "unavailable" },
+            },
+          },
+        }),
       );
     }
   }

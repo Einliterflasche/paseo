@@ -2,6 +2,94 @@ import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const es: TranslationResources = {
+  services: {
+    managed: {
+      settings: "Configuración de la vista previa",
+      disable: "Desactivar vista previa",
+      unavailable: "La configuración de la vista previa no está disponible en esta conexión.",
+      alreadyEnabled: "La vista previa ya está activada. Revisa su configuración actual.",
+      invalidInput: "Elige un modo de ruta del servidor.",
+      enableHelp:
+        "Configura tu aplicación para usar la ruta base de vista previa después de activarla.",
+      disableHelp:
+        "Al desactivar se cierra el acceso a la vista previa y el servicio sigue funcionando.",
+    },
+    registration: {
+      basePath: "Ruta base de la vista previa",
+      title: "Registrar servicio",
+      register: "Registrar",
+      name: "Nombre",
+      localPort: "Puerto local",
+      workspace: "Espacio de trabajo",
+      hostOnly: "Solo host",
+      mount: "Ruta del servidor",
+      preservePath: "Conservar el prefijo del servicio",
+      stripPath: "Quitar el prefijo del servicio",
+      external: "Servicio registrado",
+      enabled: "Vista previa activada",
+      disabled: "Vista previa desactivada",
+      connect: "Activar vista previa",
+      remove: "Quitar registro",
+      unavailable: "No se pueden registrar servicios en esta conexión.",
+      restarting:
+        "La configuración de vistas previas está en pausa durante el reinicio o la recuperación del host. Resuelve cualquier error de recuperación indicado y vuelve a intentarlo cuando el host esté listo.",
+      unknownRegistration: "Este registro ya no está disponible.",
+      unknownWorkspace: "Este espacio de trabajo ya no está disponible.",
+      duplicate: "Ese puerto ya está registrado.",
+      infrastructurePort: "Este puerto está reservado para Paseo.",
+      invalidInput: "Introduce un nombre y un puerto entre 1 y 65535.",
+      storageError: "No se pudo guardar el registro. Comprueba el almacenamiento del host.",
+      unknownResult: "Se desconoce el resultado. Revisa el catálogo antes de intentarlo de nuevo.",
+    },
+    openBrowserTab: "Pestaña del navegador",
+    openBrowserTabReady: "Abrir pestaña ahora",
+    closeBrowserPreview: "Cerrar vista previa del navegador",
+    previewCloseError:
+      "No se pudo confirmar el cierre de la vista previa. El acceso puede seguir activo.",
+    openPreview: "Abrir vista previa",
+    reloadPreview: "Recargar vista previa",
+    recoverPreview: "Restablecer sesión de vista previa",
+    previewEnded: "La conexión cambió. Abre de nuevo la vista previa para reconectar.",
+    previewError:
+      "No se pudo abrir la vista previa. Comprueba el servicio y la conexión e inténtalo de nuevo.",
+    previewReady: "Abre este servicio en una pestaña del espacio de trabajo.",
+    preferenceLoadError:
+      "No se pudo cargar la vista guardada. Reintenta cargarla o elige otra vista.",
+    preferenceSaveError: "No se pudo guardar la vista. Vuelve a elegirla para reintentar.",
+    refreshError:
+      "No se pudieron actualizar los servicios. Pulsa Actualizar para intentarlo de nuevo.",
+    catalogUnavailable: "Este host no admite el catálogo de servicios. Actualiza Paseo en el host.",
+    stale:
+      "Se muestra el último estado conocido. Los controles estarán disponibles tras actualizar correctamente.",
+    refresh: "Actualizar",
+    title: "Servicios",
+    description: "Servicios de los espacios de trabajo en este host.",
+    grid: "Cuadrícula",
+    list: "Lista",
+    search: "Buscar servicios",
+    clearSearch: "Borrar búsqueda",
+    offline: "Host desconectado. Se muestra el último estado conocido; acciones no disponibles.",
+    noMatches: "No hay servicios coincidentes.",
+    empty:
+      "No hay servicios configurados. Añade un servicio a la configuración de Paseo de un espacio de trabajo.",
+    previewUnavailable: "Vista previa no disponible",
+    started: "Iniciado",
+    stopped: "Detenido",
+    noPort: "Sin puerto asignado",
+    port: "Puerto {{port}}",
+    cached: "Último estado conocido",
+    reachable: "Accesible",
+    unreachable: "No accesible",
+    unknown: "Estado de salud desconocido",
+    stop: "Detener",
+    start: "Iniciar",
+    logs: "Registros",
+    readOnly: "Este host no admite controles de servicios.",
+    changed:
+      "El servicio o la conexión ha cambiado. Comprueba su estado antes de volver a intentarlo.",
+    actionError:
+      "No se pudo confirmar la acción. Comprueba el estado del servicio antes de volver a intentarlo.",
+  },
   common: {
     hostRecovery: {
       title: "La recuperación está en pausa en {{hostName}}",

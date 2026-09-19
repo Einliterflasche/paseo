@@ -107,6 +107,16 @@ export interface DirectoryConnection {
   source: DirectorySourceToken;
 }
 
+export interface WorkspaceDirectoryReady {
+  status: "ready";
+  source: DirectorySourceToken;
+}
+
+export type WorkspaceDirectoryState =
+  | WorkspaceDirectoryReady
+  | { status: "loading" | "unavailable"; source: DirectorySourceToken }
+  | { status: "error"; source: DirectorySourceToken; error: string };
+
 export interface DirectoryCheckpointStorage {
   readAgent(serverId: string, agentId: string): Promise<Agent | undefined>;
   readWorkspace(serverId: string, workspaceId: string): Promise<CachedWorkspace | undefined>;
@@ -165,6 +175,7 @@ export class DirectorySync {
       markAgentLoading: () => void;
       markAgentReady: () => void;
       markAgentError: (error: string) => void;
+      onWorkspaceState?: (state: WorkspaceDirectoryState) => void;
     },
     private readonly checkpoints?: DirectoryCheckpointStorage,
   ) {
@@ -526,17 +537,19 @@ export class DirectorySync {
     }
   }
 
-  async refreshWorkspaces(input?: { subscribe?: boolean }): Promise<void> {
+  async refreshWorkspaces(input?: {
+    subscribe?: boolean;
+  }): Promise<WorkspaceDirectoryReady | null> {
     return this.refreshWorkspacesInternal(input, true);
   }
 
   private async refreshWorkspacesInternal(
     input: { subscribe?: boolean } | undefined,
     loadDirectoryCache: boolean,
-  ): Promise<void> {
+  ): Promise<WorkspaceDirectoryReady | null> {
     if (loadDirectoryCache) await this.loadCachedDirectory();
     const onlineConnection = this.getOnlineConnection();
-    if (!onlineConnection) return;
+    if (!onlineConnection) return null;
     const { client, source } = onlineConnection;
     const transaction = this.workspaceTransactions.begin(source, () => ({
       workspaces: new Map(useSessionStore.getState().sessions[this.serverId]?.workspaces),
@@ -546,13 +559,13 @@ export class DirectorySync {
       touchedWorkspaceIds: new Set(),
       touchedProjectIds: new Set(),
     }));
+    this.callbacks.onWorkspaceState?.({ status: "loading", source });
     try {
       await this.waitForSessionMetadata(client, source);
       const serverInfo = useSessionStore.getState().sessions[this.serverId]?.serverInfo;
       if (serverInfo?.features?.workspaceMultiplicity !== true) {
-        const deltas = this.workspaceTransactions.fail(transaction);
-        if (deltas) for (const delta of deltas) this.applyWorkspaceDelta(delta);
-        return;
+        this.failWorkspaceRefresh(transaction, { status: "unavailable", source });
+        return null;
       }
       const supportsProjectList = serverInfo.features?.projectList === true;
       const supportsDirectorySync = serverInfo.features?.directorySync === true;
@@ -572,11 +585,29 @@ export class DirectorySync {
           transaction.snapshot.syncModes?.workspaces;
       }
       this.completeWorkspaceRefresh(client, source, transaction);
+      const ready: WorkspaceDirectoryReady = { status: "ready", source };
+      this.callbacks.onWorkspaceState?.(ready);
+      return ready;
     } catch (error) {
-      const deltas = this.workspaceTransactions.fail(transaction);
-      if (deltas) for (const delta of deltas) this.applyWorkspaceDelta(delta);
+      this.failWorkspaceRefresh(transaction, {
+        status: "error",
+        source,
+        error: error instanceof Error ? error.message : String(error),
+      });
       throw error;
     }
+  }
+
+  private failWorkspaceRefresh(
+    transaction: DirectoryTransaction<WorkspaceDirectorySnapshot, WorkspaceDirectoryDelta>,
+    state: WorkspaceDirectoryState,
+  ): void {
+    const deltas = this.workspaceTransactions.fail(transaction);
+    // Disconnect aborts this transaction; an older completion cannot replace
+    // the state of a newer connection or refresh.
+    if (!deltas) return;
+    for (const delta of deltas) this.applyWorkspaceDelta(delta);
+    this.callbacks.onWorkspaceState?.(state);
   }
 
   private async fetchWorkspaceSnapshot(

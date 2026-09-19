@@ -287,6 +287,11 @@ export function parseHostAgentRouteFromPathname(
   return { serverId, agentId };
 }
 
+export function parseSettingsHostServerIdFromPathname(pathname: string): string | null {
+  const match = stripSearchAndHash(pathname).match(/^\/settings\/hosts\/([^/]+)(?:\/|$)/);
+  return match ? trimNonEmpty(decodeSegment(match[1])) : null;
+}
+
 export function parseHostWorkspaceRouteFromPathname(
   pathname: string,
 ): { serverId: string; workspaceId: string } | null {
@@ -586,4 +591,8 @@ export function buildProjectSettingsRoute(serverId: string, projectId: string) {
 export function normalizeProjectSettingsRouteId(value: string | string[] | undefined): string {
   const id = Array.isArray(value) ? value[0] : value;
   return typeof id === "string" ? id : "";
+}
+
+export function buildHostServicesRoute(serverId: string) {
+  return `/h/${encodeSegment(serverId)}/services` as const;
 }

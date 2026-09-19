@@ -13,11 +13,22 @@
 // node_modules populated (the Nix build invokes this post-configHook).
 
 import { nodeFileTrace } from "@vercel/nft";
+import { createRequire } from "node:module";
 import { glob } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "..");
+const serverRequire = createRequire(path.join(REPO_ROOT, "packages/server/package.json"));
+const nodePtyDirectory = path.relative(
+  REPO_ROOT,
+  path.dirname(serverRequire.resolve("node-pty/package.json")),
+);
+const nodePtyBinary = process.platform === "win32" ? "conpty.node" : "pty.node";
+const nodePtyRuntimeDirectories = [
+  `${nodePtyDirectory}/build/Release`,
+  `${nodePtyDirectory}/prebuilds/${process.platform}-${process.arch}`,
+];
 
 const { sherpaPlatformPackageName } = await import(
   pathToFileURL(
@@ -39,6 +50,8 @@ const entries = [
   "packages/server/dist/scripts/supervisor-entrypoint.js",
   "packages/server/dist/server/terminal/terminal-worker-process.js",
   "packages/server/dist/server/server/speech/providers/local/worker-process.js",
+  "packages/server/dist/server/server/service-preview/worker-process.js",
+  "packages/server/dist/server/server/service-preview/front-config.js",
   ...(traceDesktop
     ? [
         "packages/desktop/dist/main.js",
@@ -63,12 +76,9 @@ const additionalInputs = [
   "packages/server/.env.example",
   // CLI shebang script wrapping dist/index.js
   "packages/cli/bin/paseo",
-  // node-pty's compiled native addon. nft can't trace it because
-  // node-pty loads it via `require(path.join(__dirname, 'prebuilds/<plat>/pty.node'))`
-  // with a runtime-computed platform suffix. Pin to the host platform —
-  // the Nix derivation builds for one platform at a time and ships only
-  // its own binaries.
-  `node_modules/node-pty/prebuilds/${process.platform}-${process.arch}/**`,
+  // node-pty resolves native binaries dynamically from its workspace-owned
+  // package. Include both its compiled output and the host's shipped prebuild.
+  ...nodePtyRuntimeDirectories.map((directory) => `${directory}/**`),
   // sherpa-onnx-node dynamically resolves a platform-specific native package.
   // Copy the wrapper plus the host platform package explicitly.
   "node_modules/sherpa-onnx-node/**",
@@ -135,6 +145,9 @@ for (const pattern of additionalInputs) {
 }
 
 // Emit sorted, deduplicated.
+if (!nodePtyRuntimeDirectories.some((directory) => expanded.has(`${directory}/${nodePtyBinary}`))) {
+  throw new Error("Daemon runtime trace omitted node-pty's native binary");
+}
 for (const p of [...expanded].sort()) {
   console.log(p);
 }

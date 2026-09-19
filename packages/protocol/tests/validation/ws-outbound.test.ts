@@ -62,6 +62,43 @@ async function compileInlineSchema(sourceSchema: string): Promise<GeneratedSchem
 }
 
 describe("WS outbound zod-aot validation", () => {
+  it.each([
+    {
+      type: "service.preview.prepare.response",
+      result: {
+        status: "prepared",
+        attemptId: "tab-attempt",
+        bootstrapId: "opaque-bootstrap",
+        ticket: "fixture-ticket",
+        serviceId: "atlas",
+        mode: "iframe",
+      },
+    },
+    { type: "service.preview.prepare.response", result: { status: "error", code: "unavailable" } },
+    {
+      type: "service.preview.close.response",
+      result: { status: "closed", attemptId: "tab-attempt" },
+    },
+  ])("compiles the tagged preview result for $type / $result.status", ({ type, result }) => {
+    const envelope = {
+      type: "session",
+      message: { type, payload: { requestId: "preview-request", result } },
+    };
+    expect(GeneratedWSOutboundMessageSchema.safeParse(envelope)).toEqual({
+      success: true,
+      data: envelope,
+    });
+    expect(
+      GeneratedWSOutboundMessageSchema.safeParse({
+        ...envelope,
+        message: {
+          ...envelope.message,
+          payload: { requestId: "preview-request", result: { status: "prepared" } },
+        },
+      }).success,
+    ).toBe(false);
+  });
+
   it("applies defaults inside discriminated-union branches", async () => {
     const schema = await compileInlineSchema(`
 const SourceSchema = z.discriminatedUnion("type", [

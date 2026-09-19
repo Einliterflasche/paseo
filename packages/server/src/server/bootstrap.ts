@@ -15,16 +15,117 @@ import { constants, existsSync, unlinkSync } from "fs";
 import { open } from "fs/promises";
 import { randomUUID } from "node:crypto";
 import { hostname as getHostname } from "node:os";
+import type { Socket } from "node:net";
 import path from "node:path";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { Logger } from "pino";
 import { z } from "zod";
 import { createBranchChangeRouteHandler } from "./script-route-branch-handler.js";
+import { createPreviewIngress, type PreviewIngressTarget } from "./service-preview/ingress.js";
+import { openConfiguredPreviewFeature } from "./service-preview/configured-feature.js";
+import type { PreviewTransportConfiguration } from "./service-preview/transport-config.js";
+import { admitControlRequest, controlAuthorities } from "./service-preview/control-transport.js";
 
 export type ListenTarget =
   | { type: "tcp"; host: string; port: number }
   | { type: "socket"; path: string }
   | { type: "pipe"; path: string };
+
+interface DaemonHttpServerOptions {
+  application: express.Express;
+  serviceProxy: Pick<ServiceProxySubsystem, "upgradeHandler">;
+  preview: PreviewIngressTarget | null | undefined;
+  daemonUpgrade(request: IncomingMessage, socket: Socket, head: Buffer): void;
+  controlAdmission?(request: IncomingMessage): boolean;
+}
+
+function createDaemonHttpServer({
+  application,
+  serviceProxy,
+  preview,
+  daemonUpgrade,
+  controlAdmission,
+}: DaemonHttpServerOptions) {
+  const legacyUpgrade = serviceProxy.upgradeHandler({ passthroughUnknown: true });
+  const previewIngress =
+    preview === undefined
+      ? null
+      : createPreviewIngress({
+          preview,
+          application,
+          legacyUpgrade,
+          daemonUpgrade,
+          controlAdmission,
+        });
+  const httpServer = createHTTPServer(previewIngress?.handle ?? application);
+  httpServer.on("upgrade", previewIngress?.upgrade ?? legacyUpgrade);
+  if (previewIngress) httpServer.on("connect", previewIngress.connect);
+  return { httpServer, previewIngress };
+}
+
+function resolvePreviewIngressOwner(
+  config: PaseoDaemonConfig,
+  dependencies: PaseoDaemonDependencies,
+): PreviewIngressTarget | null | undefined {
+  if (!config.servicePreviewTransport) return dependencies.previewIngress;
+  if (dependencies.previewBroker || dependencies.previewIngress !== undefined) {
+    throw new Error("Service preview transport already has an owner");
+  }
+  return null;
+}
+
+function assertControlListenerOwnership(config: PaseoDaemonConfig): void {
+  if (
+    config.servicePreviewTransport &&
+    config.serviceProxy?.publicBaseUrl &&
+    !config.serviceProxy.standaloneListen
+  ) {
+    throw new Error(
+      "Control-only transport requires a separate listener for public service routes",
+    );
+  }
+}
+
+function createControlAdmission({
+  transport,
+  getListenTarget,
+}: {
+  transport: PreviewTransportConfiguration | undefined;
+  getListenTarget(): ListenTarget;
+}) {
+  if (!transport) return undefined;
+  const origin = transport.status === "configured" ? transport.controlOrigin : null;
+  const frontPorts = transport.status === "configured" ? [transport.frontPort] : [];
+  return (request: IncomingMessage) => {
+    const listen = getListenTarget();
+    const ports = [...frontPorts, ...(listen.type === "tcp" ? [listen.port] : [])];
+    return admitControlRequest(request, controlAuthorities(origin, ports));
+  };
+}
+
+async function shutdownPreviews({
+  previewIngress,
+  previewFeature,
+  previewBroker,
+  logger,
+}: {
+  previewIngress: { close(): void } | null;
+  previewFeature: { shutdown(): Promise<void> } | null;
+  previewBroker: PreviewBroker | undefined;
+  logger: Logger;
+}): Promise<void> {
+  try {
+    previewIngress?.close();
+  } catch (error) {
+    logger.error({ err: error }, "Service preview ingress retirement failed during shutdown");
+  }
+  try {
+    if (previewFeature) await previewFeature.shutdown();
+    else await previewBroker?.shutdown();
+  } catch (error) {
+    logger.error({ err: error }, "Service preview drain failed during shutdown");
+  }
+}
 
 function resolveBoundListenTarget(
   listenTarget: ListenTarget,
@@ -128,6 +229,7 @@ export async function fanOutReconciledWorkspaceUpdates(input: {
 }
 
 import { VoiceAssistantWebSocketServer } from "./websocket-server.js";
+import type { PreviewBroker } from "./service-preview/broker.js";
 import { WorkspaceSetupRuntime } from "./workspace-setup-runtime.js";
 import { createWorkspaceLabelService } from "./workspace-labels/index.js";
 import { createGitHubService } from "../services/github-service.js";
@@ -453,6 +555,7 @@ export interface PaseoDaemonConfig {
   voiceLlmModel?: string | null;
   dictationFinalTimeoutMs?: number;
   downloadTokenTtlMs?: number;
+  servicePreviewTransport?: PreviewTransportConfiguration;
   agentProviderSettings?: AgentProviderRuntimeSettingsMap;
   providerCatalogRefreshTimeoutMs?: number;
   metadataGeneration?: {
@@ -496,6 +599,11 @@ export interface PaseoDaemon {
 }
 
 export interface PaseoDaemonDependencies {
+  resolveSkillTargets?: Parameters<typeof createOrchestrationSkills>[1];
+  /** Explicit isolated fixture owner; cannot be combined with configured transport. */
+  previewBroker?: PreviewBroker;
+  /** Undefined preserves existing ingress; null reserves previews but denies them. */
+  previewIngress?: PreviewIngressTarget | null;
   speechService?: SpeechService;
   hubRelationshipRemote?: HubRelationshipRemote;
   hubRelationshipClock?: HubRelationshipClock;
@@ -548,6 +656,10 @@ function resolveExpressTrustProxySetting(config: PaseoDaemonConfig): true | stri
   return config.trustedProxies ?? ["loopback"];
 }
 
+function resolveServiceProxyPublicBaseUrl(config: PaseoDaemonConfig): string | null {
+  return config.serviceProxy?.publicBaseUrl ? config.serviceProxy.publicBaseUrl : null;
+}
+
 function createInitialMutableDaemonConfig(config: PaseoDaemonConfig): MutableDaemonConfig {
   const providers = config.providerOverrides ?? {};
 
@@ -594,6 +706,7 @@ export async function createPaseoDaemon(
   rootLogger: Logger,
   dependencies: PaseoDaemonDependencies = {},
 ): Promise<PaseoDaemon> {
+  assertControlListenerOwnership(config);
   configureGitProcessPolicy(config.git ?? resolveGitProcessPolicy({ env: process.env }));
   const logger = rootLogger.child({ module: "bootstrap" });
   // Older transcript stores remain available for inspection or deliberate recovery.
@@ -618,7 +731,10 @@ export async function createPaseoDaemon(
       },
     },
   });
-  const orchestrationSkills = createOrchestrationSkills(daemonConfigStore);
+  const orchestrationSkills = createOrchestrationSkills(
+    daemonConfigStore,
+    dependencies.resolveSkillTargets,
+  );
   void orchestrationSkills.autoUpdate().catch((error) => {
     logger.error({ err: error }, "Failed to maintain orchestration skills at startup");
   });
@@ -658,6 +774,8 @@ export async function createPaseoDaemon(
   const agentMcpAuthToken = randomUUID();
 
   const listenTarget = parseListenString(config.listen);
+  const previewIngressOwner = resolvePreviewIngressOwner(config, dependencies);
+  let previewFeature: Awaited<ReturnType<typeof openConfiguredPreviewFeature>> = null;
 
   const app = express();
   app.set("trust proxy", resolveExpressTrustProxySetting(config));
@@ -671,12 +789,11 @@ export async function createPaseoDaemon(
   });
   applyTerminalAgentHookSetting({ store: daemonConfigStore, logger });
 
-  const serviceProxyPublicBaseUrl = config.serviceProxy?.publicBaseUrl
-    ? config.serviceProxy.publicBaseUrl
-    : null;
+  const serviceProxyPublicBaseUrl = resolveServiceProxyPublicBaseUrl(config);
   const serviceProxy = createServiceProxySubsystem({
     logger,
     publicBaseUrl: serviceProxyPublicBaseUrl,
+    controlOnly: config.servicePreviewTransport !== undefined,
   });
   const scriptRuntimeStore = new WorkspaceScriptRuntimeStore();
   const workspaceSetupRuntime = new WorkspaceSetupRuntime();
@@ -717,11 +834,11 @@ export async function createPaseoDaemon(
   // Service proxy classifies service hosts before daemon auth/route fallthrough.
   // Registered service hosts proxy directly; known service namespaces without a
   // route return 404 and never reach daemon APIs.
-  app.use(serviceProxy.middleware());
+  if (!config.servicePreviewTransport) app.use(serviceProxy.middleware());
 
   // Host allowlist / DNS rebinding protection (vite-like semantics).
   // For non-TCP (unix sockets), skip host validation.
-  if (listenTarget.type === "tcp") {
+  if (listenTarget.type === "tcp" && !config.servicePreviewTransport) {
     app.use((req, res, next) => {
       const hostHeader = typeof req.headers.host === "string" ? req.headers.host : undefined;
       if (!isHostnameAllowed(hostHeader, configuredHostnames)) {
@@ -864,13 +981,19 @@ export async function createPaseoDaemon(
 
   app.get("/api/files/preview", createFilePreviewRouteHandler({ previewGrantStore, logger }));
 
-  const httpServer = createHTTPServer(app);
-
-  // Script proxy WebSocket upgrade handler — must be registered before the
-  // VoiceAssistantWebSocketServer attaches its own "upgrade" listener so that
-  // script-bound upgrades are forwarded first. The handler is a no-op for
-  // requests that don't match a registered script route.
-  httpServer.on("upgrade", serviceProxy.upgradeHandler({ passthroughUnknown: true }));
+  const { httpServer, previewIngress } = createDaemonHttpServer({
+    preview: previewIngressOwner,
+    application: app,
+    serviceProxy,
+    controlAdmission: createControlAdmission({
+      transport: config.servicePreviewTransport,
+      getListenTarget: () => boundListenTarget ?? listenTarget,
+    }),
+    daemonUpgrade: (request, socket, head) => {
+      if (wsServer) wsServer.handleUpgrade(request, socket, head);
+      else socket.destroy();
+    },
+  });
 
   if (config.serviceProxy?.standaloneListen) {
     serviceProxyListenTarget = parseListenString(config.serviceProxy.standaloneListen);
@@ -1651,6 +1774,31 @@ export async function createPaseoDaemon(
 
   logger.info({ elapsed: elapsed() }, "Bootstrap complete, ready to start listening");
 
+  async function startServicePreviews(
+    target: ListenTarget,
+    workspaces: FileBackedWorkspaceRegistry,
+  ) {
+    if (!config.servicePreviewTransport) return null;
+    try {
+      return await openConfiguredPreviewFeature({
+        transport: config.servicePreviewTransport,
+        paseoHome: config.paseoHome,
+        auth: config.auth,
+        listenTarget: target,
+        serviceProxyListenTarget,
+        workspaces,
+        runtime: scriptRuntimeStore,
+        endpoints: serviceProxy,
+        onFailure: () => logger.error("Service preview component failed"),
+      });
+    } catch {
+      // Invalid feature state stays on disk and the reserved ingress stays
+      // closed. Ordinary sessions can still reach this daemon.
+      logger.error("Service previews unavailable; inspect transport and policy settings");
+      return null;
+    }
+  }
+
   const start = async () => {
     let mainStarted = false;
     try {
@@ -1729,6 +1877,8 @@ export async function createPaseoDaemon(
               logger.info("Daemon password authentication enabled");
             }
 
+            previewFeature = await startServicePreviews(boundListenTarget, workspaceRegistry);
+
             wsServer = new VoiceAssistantWebSocketServer(
               httpServer,
               logger,
@@ -1745,6 +1895,8 @@ export async function createPaseoDaemon(
                 getHostnames: () => configuredHostnames,
                 daemonStatusRpc: dependencies.serverFeatureOverrides?.daemonStatusRpc,
                 relayConfig: dependencies.serverFeatureOverrides?.relayConfig,
+                previewBroker: previewFeature?.broker ?? dependencies.previewBroker,
+                externallyDispatched: previewIngress !== null,
                 startPaused: true,
                 getRestartStatus: () => restartController.status,
               },
@@ -1897,6 +2049,9 @@ export async function createPaseoDaemon(
         }
       }
     } catch (error) {
+      await previewFeature?.shutdown().catch(() => {
+        logger.error("Service preview cleanup failed during startup");
+      });
       unsubscribePluginProviders();
       await pluginRuntime.stopAllPlugins().catch(() => undefined);
       await serviceProxy.stopStandalone().catch(() => undefined);
@@ -1910,13 +2065,25 @@ export async function createPaseoDaemon(
   };
 
   const stop = async () => {
+    // Revoke immediately, but preserve accepted agent work before waiting for
+    // optional preview persistence or child exit. Observe failures immediately.
+    const previewStopped = shutdownPreviews({
+      previewIngress,
+      previewFeature,
+      previewBroker: dependencies.previewBroker,
+      logger,
+    });
     await pluginRuntime.stopAllPlugins();
     unsubscribePluginProviders();
     await hubRelationships.stop();
     workspaceReconciliation.dispose();
     scriptHealthMonitor.stop();
     // Freeze both ingress and registration before taking the agent closure snapshot.
-    wsServer?.prepareForShutdown();
+    try {
+      wsServer?.prepareForShutdown();
+    } catch (error) {
+      logger.error({ err: error }, "Service preview retirement failed during shutdown");
+    }
     agentManager.prepareForShutdown();
     await agentManager.closeAgentsForShutdown();
     await agentManager.flushForShutdown().catch(() => undefined);
@@ -1946,6 +2113,9 @@ export async function createPaseoDaemon(
     if (listenTarget.type === "socket" && existsSync(listenTarget.path)) {
       unlinkSync(listenTarget.path);
     }
+    // Report optional feature errors above without turning an intentional stop
+    // into a supervisor crash/restart. Its resources still belong to this stop.
+    await previewStopped;
   };
 
   return {

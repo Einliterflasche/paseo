@@ -2,6 +2,94 @@ import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const fr: TranslationResources = {
+  services: {
+    managed: {
+      settings: "Paramètres de l’aperçu",
+      disable: "Désactiver l’aperçu",
+      unavailable: "Les paramètres de l’aperçu ne sont pas disponibles sur cette connexion.",
+      alreadyEnabled: "L’aperçu est déjà activé. Vérifiez ses paramètres actuels.",
+      invalidInput: "Choisissez un mode de chemin du serveur.",
+      enableHelp:
+        "Configurez votre application pour utiliser le chemin de base de l’aperçu après son activation.",
+      disableHelp:
+        "La désactivation ferme l’accès à l’aperçu et laisse le service en cours d’exécution.",
+    },
+    registration: {
+      basePath: "Chemin de base de l’aperçu",
+      title: "Enregistrer un service",
+      register: "Enregistrer",
+      name: "Nom",
+      localPort: "Port local",
+      workspace: "Espace de travail",
+      hostOnly: "Hôte uniquement",
+      mount: "Chemin en amont",
+      preservePath: "Conserver le préfixe du service",
+      stripPath: "Retirer le préfixe du service",
+      external: "Service enregistré",
+      enabled: "Aperçu activé",
+      disabled: "Aperçu désactivé",
+      connect: "Activer l’aperçu",
+      remove: "Retirer l’enregistrement",
+      unavailable: "L’enregistrement de services n’est pas disponible sur cette connexion.",
+      restarting:
+        "La configuration des aperçus est suspendue pendant le redémarrage ou la récupération de l’hôte. Résolvez toute erreur de récupération signalée, puis réessayez lorsque l’hôte est prêt.",
+      unknownRegistration: "Cet enregistrement n’est plus disponible.",
+      unknownWorkspace: "Cet espace de travail n’est plus disponible.",
+      duplicate: "Ce port est déjà enregistré.",
+      infrastructurePort: "Ce port est réservé à Paseo.",
+      invalidInput: "Saisissez un nom et un port entre 1 et 65535.",
+      storageError: "Impossible d’enregistrer le service. Vérifiez le stockage de l’hôte.",
+      unknownResult: "Le résultat est inconnu. Vérifiez le catalogue avant de réessayer.",
+    },
+    openBrowserTab: "Onglet du navigateur",
+    openBrowserTabReady: "Ouvrir l’onglet",
+    closeBrowserPreview: "Fermer l’aperçu du navigateur",
+    previewCloseError:
+      "Impossible de confirmer la fermeture de l’aperçu. L’accès peut être encore actif.",
+    openPreview: "Ouvrir l’aperçu",
+    reloadPreview: "Recharger l’aperçu",
+    recoverPreview: "Réinitialiser la session d’aperçu",
+    previewEnded: "La connexion a changé. Rouvrez l’aperçu pour vous reconnecter.",
+    previewError:
+      "Impossible d’ouvrir l’aperçu. Vérifiez le service et la connexion, puis réessayez.",
+    previewReady: "Ouvrez ce service dans un onglet de l’espace de travail.",
+    preferenceLoadError:
+      "Impossible de charger la vue enregistrée. Réessayez ou choisissez une autre vue.",
+    preferenceSaveError:
+      "Impossible d’enregistrer la vue. Sélectionnez-la à nouveau pour réessayer.",
+    refreshError: "Impossible d’actualiser les services. Réessayez avec Actualiser.",
+    catalogUnavailable:
+      "Cet hôte ne prend pas en charge le catalogue de services. Mettez Paseo à jour sur l’hôte.",
+    stale:
+      "Dernier état connu affiché. Les commandes seront disponibles après une actualisation réussie.",
+    refresh: "Actualiser",
+    title: "Services",
+    description: "Services des espaces de travail sur cet hôte.",
+    grid: "Grille",
+    list: "Liste",
+    search: "Rechercher des services",
+    clearSearch: "Effacer la recherche",
+    offline: "Hôte déconnecté. Dernier état connu affiché ; actions indisponibles.",
+    noMatches: "Aucun service correspondant.",
+    empty:
+      "Aucun service configuré. Ajoutez un service à la configuration Paseo d’un espace de travail.",
+    previewUnavailable: "Aperçu indisponible",
+    started: "Démarré",
+    stopped: "Arrêté",
+    noPort: "Aucun port attribué",
+    port: "Port {{port}}",
+    cached: "Dernier état connu",
+    reachable: "Accessible",
+    unreachable: "Inaccessible",
+    unknown: "État de santé inconnu",
+    stop: "Arrêter",
+    start: "Démarrer",
+    logs: "Journaux",
+    readOnly: "Cet hôte ne prend pas en charge les commandes de service.",
+    changed: "Le service ou la connexion a changé. Vérifiez son état actuel avant de réessayer.",
+    actionError:
+      "Impossible de confirmer l’action. Vérifiez l’état actuel du service avant de réessayer.",
+  },
   common: {
     hostRecovery: {
       title: "La récupération est en pause sur {{hostName}}",

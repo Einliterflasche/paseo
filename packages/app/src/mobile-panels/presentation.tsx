@@ -9,6 +9,7 @@ import { getMobilePanelFrame } from "./model";
 import { useIsMobilePanelActive, useMobilePanelsRuntime } from "./provider";
 
 type OverlayPanel = Exclude<MobilePanelView, "agent">;
+const overlaySurfaceData = { surfaceOcclusion: "compact-panel" };
 
 interface MobilePanelOverlayProps {
   children: ReactNode;
@@ -81,6 +82,7 @@ export function MobilePanelOverlay({
       >
         <Animated.View
           pointerEvents={overlayPointerEvents}
+          dataSet={overlaySurfaceData}
           style={[styles.overlay, overlayAnimatedStyle]}
         >
           <Pressable

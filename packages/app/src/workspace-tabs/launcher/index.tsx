@@ -8,6 +8,7 @@ import {
 } from "react";
 import { useRouter, type Href } from "expo-router";
 import { useTranslation } from "react-i18next";
+import { servicesCatalogEnabled } from "@/services/feature";
 import { Globe, SquarePen, SquareTerminal } from "lucide-react-native";
 import invariant from "tiny-invariant";
 import { useDaemonConfig } from "@/hooks/use-daemon-config";
@@ -84,6 +85,7 @@ const BUILT_IN_SELECTIONS = {
   diff: { kind: "target", target: { kind: "working_diff" } },
   files: { kind: "target", target: { kind: "files" } },
   browser: { kind: "browser" },
+  services: { kind: "target", target: { kind: "services" } },
   pullRequest: { kind: "target", target: { kind: "pull_request" } },
 } satisfies Record<BuiltInLaunchItemId, NewTabSelection>;
 
@@ -173,6 +175,16 @@ export function useWorkspaceTabLaunchCatalog(input: {
         panelKind: "files",
         toggleTarget: BUILT_IN_SELECTIONS.files.target,
         launch: launchSelection(BUILT_IN_SELECTIONS.files),
+      },
+      services: {
+        id: "services",
+        label: t("services.title"),
+        Icon: getLaunchPresentation("services").icon,
+        disabled: false,
+        panelKind: "services",
+        toggleTarget: BUILT_IN_SELECTIONS.services.target,
+        hidden: !servicesCatalogEnabled,
+        launch: launchSelection(BUILT_IN_SELECTIONS.services),
       },
       browser: {
         id: "browser",

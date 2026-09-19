@@ -1093,7 +1093,14 @@ export function collectAllPanes(root: SplitNode): SplitPane[] {
 }
 
 function isEphemeralTab(tab: WorkspaceTab): boolean {
-  return tab.target.kind === "commit_diff" || tab.target.kind === "new_tab";
+  // Services is intentionally absent from the legacy persisted tab schema.
+  // Older clients delete the entire layout entry on an unknown target kind.
+  return (
+    tab.target.kind === "commit_diff" ||
+    tab.target.kind === "new_tab" ||
+    tab.target.kind === "services" ||
+    tab.target.kind === "service_preview"
+  );
 }
 
 function stripEphemeralTabsFromNode(node: SplitNodeInternal): SplitNodeInternal {

@@ -22,6 +22,7 @@ import { KeyboardProvider } from "react-native-keyboard-controller";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { StyleSheet, useUnistyles } from "react-native-unistyles";
 import { AppearanceProvider } from "@/appearance/provider";
+import { ServicePreviewHost } from "@/services/preview-host";
 import { CommandCenter } from "@/command-center/command-center";
 import { CommandCenterRootActions } from "@/command-center/root-registration";
 import { CommandCenterProvider } from "@/command-center/provider";
@@ -1004,7 +1005,9 @@ function RootAppTree() {
       <View style={layoutStyles.surfaceFill}>
         <RootProviders>
           <RuntimeProviders>
-            <AppShell />
+            <ServicePreviewHost>
+              <AppShell />
+            </ServicePreviewHost>
           </RuntimeProviders>
         </RootProviders>
       </View>

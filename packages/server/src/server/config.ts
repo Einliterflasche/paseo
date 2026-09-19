@@ -24,6 +24,7 @@ import { resolveSpeechConfig } from "./speech/speech-config-resolver.js";
 import type { RequestedSpeechProviders } from "./speech/speech-types.js";
 import { mergeHostnames, parseHostnamesEnv, type HostnamesConfig } from "./hostnames.js";
 import { resolveGitProcessPolicy } from "../utils/git-process-scheduler.js";
+import { resolvePreviewTransportEnvironment } from "./service-preview/transport-config.js";
 
 const DEFAULT_PORT = 6767;
 const DEFAULT_RELAY_ENDPOINT = "relay.paseo.sh:443";
@@ -628,6 +629,7 @@ export function resolveConfigFromPersisted(
     relayUseTls: relay.useTls,
     relayPublicUseTls: relay.publicUseTls,
     serviceProxy,
+    servicePreviewTransport: resolvePreviewTransportEnvironment(env),
     webUi,
     appBaseUrl,
     auth: resolveAuthConfig(env, persisted),
