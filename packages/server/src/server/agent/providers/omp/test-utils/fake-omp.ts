@@ -137,6 +137,8 @@ export class FakeOmpSession implements OmpRuntimeSession {
   readonly branchRequests: string[] = [];
   activeBranchEntryId?: string;
   closed = false;
+  closeError: Error | null = null;
+  closeCalls = 0;
   state: OmpSessionState;
 
   private readonly subscribers = new Set<(event: OmpRuntimeEvent) => void>();
@@ -403,6 +405,8 @@ export class FakeOmpSession implements OmpRuntimeSession {
   }
 
   async close(): Promise<void> {
+    this.closeCalls += 1;
+    if (this.closeError) throw this.closeError;
     this.closed = true;
   }
 

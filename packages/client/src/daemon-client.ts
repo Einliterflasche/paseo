@@ -1,9 +1,12 @@
 import { ProviderSnapshotUpdates } from "./provider-snapshots/index.js";
-import type { SessionEventSubscription } from "@getpaseo/protocol/messages";
+import { TimelineRequestError } from "./timeline-request-error.js";
+export { TimelineRequestError, type TimelineRequestErrorCode } from "./timeline-request-error.js";
+import type { ProviderSubagentTarget, SessionEventSubscription } from "@getpaseo/protocol/messages";
 import {
   ConnectionSubscriptions,
   DEFAULT_CLIENT_CAPABILITIES,
   type TimelineSubscription,
+  type ProviderSubagentTimelineSubscription,
 } from "./connection/index.js";
 import type { z } from "zod";
 import { CLIENT_CAPS, type ClientCapability } from "@getpaseo/protocol/client-capabilities";
@@ -592,6 +595,7 @@ export type ProviderSubagentTimelinePayload = Extract<
   { type: "agent.provider_subagents.timeline.get.response" }
 >["payload"];
 export interface FetchProviderSubagentTimelineOptions {
+  projection?: "projected" | "canonical";
   direction?: ProviderSubagentTimelinePayload["direction"];
   cursor?: FetchAgentTimelineCursor;
   limit?: number;
@@ -1093,7 +1097,8 @@ export class DaemonClient {
     failed: (error) => this.logger.error({ err: error }, "Failed to resolve provider snapshot"),
   });
   private readonly subscriptions = new ConnectionSubscriptions({
-    timelines: (agentIds) => (this.isConnected ? this.sendTimelineSubscription(agentIds) : null),
+    timelines: (agentIds, providerSubagents) =>
+      this.isConnected ? this.sendTimelineSubscription(agentIds, providerSubagents) : null,
     events: (events) => this.sendEventSubscription(events),
     failed: (error) =>
       this.logger.error({ err: error }, "Failed to update connection subscriptions"),
@@ -2963,7 +2968,7 @@ export class DaemonClient {
     });
 
     if (payload.error) {
-      throw new Error(payload.error);
+      throw new TimelineRequestError(payload.error, payload.errorCode, payload.epoch);
     }
 
     return payload;
@@ -3047,6 +3052,7 @@ export class DaemonClient {
       parentAgentId,
       subagentId,
       requestId,
+      ...(options.projection ? { projection: options.projection } : {}),
       ...(options.direction ? { direction: options.direction } : {}),
       ...(options.cursor ? { cursor: options.cursor } : {}),
       ...(typeof options.limit === "number" ? { limit: options.limit } : {}),
@@ -3063,7 +3069,7 @@ export class DaemonClient {
           : null,
     });
     if (payload.error) {
-      throw new Error(payload.error);
+      throw new TimelineRequestError(payload.error, payload.errorCode, payload.epoch);
     }
     return payload;
   }
@@ -3095,6 +3101,33 @@ export class DaemonClient {
         release();
       },
       { ready: release.ready },
+    );
+  }
+
+  subscribeProviderSubagentTimeline(
+    target: ProviderSubagentTarget,
+    handler: (
+      message: Extract<SessionOutboundMessage, { type: "agent.provider_subagents.update" }>,
+    ) => void,
+    onReady?: () => void,
+    onError?: (error: unknown) => void,
+  ): ProviderSubagentTimelineSubscription {
+    const unsubscribe = this.on("agent.provider_subagents.update", (message) => {
+      const payload = message.payload;
+      if (
+        payload.kind === "timeline" &&
+        payload.parentAgentId === target.parentAgentId &&
+        payload.subagentId === target.subagentId
+      )
+        handler(message);
+    });
+    const release = this.subscriptions.observeProviderSubagent(target, onReady, onError);
+    return Object.assign(
+      () => {
+        unsubscribe();
+        release();
+      },
+      { ready: release.ready, refresh: () => release.refresh() },
     );
   }
 
@@ -3130,7 +3163,10 @@ export class DaemonClient {
     });
   }
 
-  private async sendTimelineSubscription(agentIds: string[]): Promise<void> {
+  private async sendTimelineSubscription(
+    agentIds: string[],
+    providerSubagents: ProviderSubagentTarget[],
+  ): Promise<void> {
     if (this.connectionState.status !== "connected") return;
     // COMPAT(selectiveAgentTimeline): added in v0.1.106. Old daemons keep their
     // legacy global stream and do not understand this RPC. Remove after
@@ -3144,6 +3180,9 @@ export class DaemonClient {
     const message = SessionInboundMessageSchema.parse({
       type: "agent.timeline.set_subscription.request",
       agentIds: normalizedAgentIds,
+      ...(this.lastServerInfoMessage.features.projectedProviderSubagents
+        ? { providerSubagents }
+        : {}),
       requestId,
     });
 
@@ -3569,6 +3608,53 @@ export class DaemonClient {
     requestId?: string,
   ): Promise<RestartRequestedStatusPayload> {
     return this.restartServer(reason, requestId, { prepareOnly: true });
+  }
+
+  async retryRecovery(reason?: string): Promise<RestartRequestedStatusPayload> {
+    // COMPAT(restartRecoveryRetry): added in fork v0.8.0; remove after 2027-03-19.
+    if (this.lastServerInfoMessage?.features?.restartRecoveryRetry !== true) {
+      throw new Error("Update the host to retry a paused recovery attempt.");
+    }
+    const requestId = this.createRequestId();
+    return this.sendRequest({
+      requestId,
+      message: SessionInboundMessageSchema.parse({
+        type: "restart_server_request",
+        requestId,
+        reason,
+        retryRecovery: true,
+      }),
+      options: { skipQueue: true },
+      select: (message) => {
+        if (message.type !== "status") return null;
+        const result = RestartRequestedStatusPayloadSchema.safeParse(message.payload);
+        return result.success && result.data.requestId === requestId ? result.data : null;
+      },
+    });
+  }
+
+  async acknowledgeCrash(
+    generationId: string,
+    orphanExecutionReconciled: true,
+  ): Promise<RestartRequestedStatusPayload> {
+    // COMPAT(restartCrashAcknowledgment): added in fork v0.8.0; remove gate after 2027-03-19.
+    if (this.lastServerInfoMessage?.features?.restartCrashAcknowledgment !== true)
+      throw new Error("Update the host to acknowledge an unexpected crash.");
+    const requestId = this.createRequestId();
+    return this.sendRequest({
+      requestId,
+      message: SessionInboundMessageSchema.parse({
+        type: "restart_server_request",
+        requestId,
+        acknowledgeCrash: { generationId, orphanExecutionReconciled },
+      }),
+      options: { skipQueue: true },
+      select: (message) => {
+        if (message.type !== "status") return null;
+        const result = RestartRequestedStatusPayloadSchema.safeParse(message.payload);
+        return result.success && result.data.requestId === requestId ? result.data : null;
+      },
+    });
   }
 
   async shutdownServer(options?: ShutdownServerOptions): Promise<ShutdownRequestedStatusPayload> {

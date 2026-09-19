@@ -76,6 +76,10 @@ export type {
 // Agent activity curator for CLI logs
 export { curateAgentActivity } from "./agent/activity-curator.js";
 export {
+  READABLE_CHECKPOINT_FORMATS,
+  validateReadyCheckpoint,
+} from "./restart/checkpoint-compatibility.js";
+export {
   getStructuredAgentResponse,
   StructuredAgentResponseError,
   StructuredAgentFallbackError,

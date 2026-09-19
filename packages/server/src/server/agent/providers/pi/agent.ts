@@ -1,3 +1,5 @@
+import { JsonlRpcTransportClosedError } from "../jsonl-rpc-process.js";
+import { ProviderInitializationCleanupError } from "../../provider-initialization-cleanup-error.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -9,6 +11,8 @@ import { z } from "zod";
 import {
   type AgentCapabilityFlags,
   type AgentClient,
+  type AgentCreateSessionOptions,
+  type AgentProbeContext,
   type AgentFeature,
   type AgentLaunchContext,
   type AgentMetadata,
@@ -1258,6 +1262,10 @@ export class PiRpcAgentSession implements AgentSession {
   private readonly logger: Logger;
   private readonly usagePoller: PiUsagePoller;
   private closed = false;
+  private cancellationGeneration = 0;
+  private promptDispatch: Promise<unknown> | null = null;
+  private interruptCompletion: Promise<void> | null = null;
+  private closePromise: Promise<void> | null = null;
   // Pi publishes the terminal before acknowledging abort. Autonomous runs have no
   // turn ID; retain their errors too until the cancellation request settles.
   private interruptingTurn: { turnId: string | undefined; error: string | null } | null = null;
@@ -1319,6 +1327,13 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   async startTurn(prompt: AgentPromptInput, options?: AgentRunOptions): Promise<StartTurnResult> {
+    if (this.closed) throw new Error("Pi session is closed");
+    const generation = this.cancellationGeneration;
+    if (this.interruptCompletion) throw new Error("Pi is still stopping the previous turn");
+    await this.promptDispatch;
+    if (this.closed || generation !== this.cancellationGeneration) {
+      throw new Error("Pi turn canceled before dispatch");
+    }
     if (this.activeTurnId) {
       throw new Error("A Pi turn is already active");
     }
@@ -1338,9 +1353,26 @@ export class PiRpcAgentSession implements AgentSession {
     this.activeNoTurnPromptText = payload.text;
     const shouldProbeForNoTurnPrompt = this.parseSlashCommandInput(payload.text) !== null;
 
+    const dispatch = (async () => this.runtimeSession.prompt(payload.text, payload.images))();
+    // The provider can await extension preflight before becoming busy. Retain
+    // that handoff until its acknowledgement so abort cannot overtake it.
+    this.promptDispatch = dispatch;
+    void dispatch.then(
+      () => {
+        if (this.promptDispatch === dispatch) this.promptDispatch = null;
+        return undefined;
+      },
+      () => {
+        // An ordinary rejected prompt may be retried. If Stop was relying on
+        // this handoff, retain the uncertainty until certified session cleanup.
+        if (this.promptDispatch === dispatch && !this.interruptCompletion)
+          this.promptDispatch = null;
+      },
+    );
     void (async () => {
       try {
-        const ack = await this.runtimeSession.prompt(payload.text, payload.images);
+        const ack = await dispatch;
+        if (this.activeTurnId !== turnId) return;
         this.activePromptRequestId = ack.requestId ?? null;
         const correlatedResult = ack.requestId
           ? this.pendingPromptResults.get(ack.requestId)
@@ -1357,6 +1389,7 @@ export class PiRpcAgentSession implements AgentSession {
           await this.completePromptIfHandledWithoutTurn(turnId);
         }
       } catch (error) {
+        if (this.closed && error instanceof JsonlRpcTransportClosedError) return;
         if (this.activeTurnId !== turnId) {
           return;
         }
@@ -1533,7 +1566,30 @@ export class PiRpcAgentSession implements AgentSession {
     };
   }
 
-  async interrupt(): Promise<void> {
+  interrupt(): Promise<void> {
+    ++this.cancellationGeneration;
+    if (!this.interruptCompletion) {
+      const dispatch = this.promptDispatch;
+      const completion = (async () => {
+        await dispatch;
+        await this.interruptDispatchedTurn();
+      })();
+      this.interruptCompletion = completion;
+      void completion.then(
+        () => {
+          if (this.interruptCompletion === completion) this.interruptCompletion = null;
+          return undefined;
+        },
+        () => {
+          if (this.interruptCompletion === completion) this.interruptCompletion = null;
+          return undefined;
+        },
+      );
+    }
+    return this.interruptCompletion;
+  }
+
+  private async interruptDispatchedTurn(): Promise<void> {
     const turnId = this.activeTurnId ?? undefined;
     const interruption: typeof this.interruptingTurn =
       this.activeTurnId || this.activeTurnStarted ? { turnId, error: null } : null;
@@ -1628,18 +1684,43 @@ export class PiRpcAgentSession implements AgentSession {
     return await resultPromise;
   }
 
-  async close(): Promise<void> {
-    if (this.closed) {
-      return;
+  close(): Promise<void> {
+    if (!this.closePromise) {
+      const attempt = this.closeSession();
+      this.closePromise = attempt;
+      void attempt.catch(() => {
+        if (this.closePromise === attempt) this.closePromise = null;
+      });
     }
+    return this.closePromise;
+  }
+
+  private async closeSession(): Promise<void> {
     this.closed = true;
     this.usagePoller.close();
-    try {
-      await this.runtimeSession.close();
-    } finally {
-      this.rejectAllExtensionResults(new Error("Pi session closed"));
-      this.cleanup?.();
+    this.rejectAllExtensionResults(new JsonlRpcTransportClosedError("Pi session closed"));
+    // Keep runtime listeners and generated resources until cessation is proven.
+    // A subsequent close retries the failed runtime stop instead of reporting success.
+    await this.runtimeSession.close();
+    if (this.activeTurnId || this.activeTurnStarted) {
+      const turnId = this.activeTurnId ?? undefined;
+      this.interruptingTurn = null;
+      this.activeTurnId = null;
+      this.activeClientMessageId = null;
+      this.activeTurnStarted = false;
+      this.activeTurnStartedEmitted = false;
+      this.pendingSettledMessages = null;
+      this.activeAssistantMessageId = null;
+      this.pendingSteerSubmissions.length = 0;
+      this.clearNoTurnBuffers();
+      this.emit({
+        type: "turn_canceled",
+        provider: this.provider,
+        turnId,
+        reason: "session closed",
+      });
     }
+    this.cleanup?.();
   }
 
   async listCommands(): Promise<AgentSlashCommand[]> {
@@ -2163,6 +2244,9 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   private handleProcessExit(error: string): void {
+    // During owned teardown, exit is cessation evidence for close(), not a
+    // model failure. Keep attribution for final stdout until runtime drain.
+    if (this.closed) return;
     this.rejectAllExtensionResults(new Error(error));
     this.interruptingTurn = null;
     if (!this.activeTurnId && !this.activeTurnStarted) {
@@ -2457,6 +2541,9 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   private completeTurn(turnId: string | undefined, messages: PiAgentMessage[]): void {
+    // Native abort is expected during owned shutdown. Only certified close
+    // cancels the turn; an uncertain stop must retain its ownership.
+    if (this.closed && isPiAbortedTerminalResponse(messages)) return;
     const errorMessage = latestPiErrorMessage(messages);
     if (
       this.interruptingTurn &&
@@ -2528,19 +2615,26 @@ export class PiRpcAgentClient implements AgentClient {
   async createSession(
     config: AgentSessionConfig,
     launchContext?: AgentLaunchContext,
+    options?: AgentCreateSessionOptions,
   ): Promise<AgentSession> {
+    const probe = options?.probe;
+    probe?.signal.throwIfAborted();
     const mcpEnv = {
       ...this.runtimeSettings?.env,
       ...launchContext?.env,
     };
-    const mcpConfig = await this.prepareMcpConfig(config.cwd, config.mcpServers, mcpEnv);
+    const mcpConfig = await this.prepareMcpConfig(config.cwd, config.mcpServers, mcpEnv, probe);
     const paseoExtension = createPiPaseoExtensionFile(
       composeSystemPromptParts(config.systemPrompt, config.daemonAppendSystemPrompt),
     );
+    const releaseFiles = combineCleanup([mcpConfig?.cleanup, paseoExtension?.cleanup]);
     let runtimeSession: PiRuntimeSession;
     try {
+      probe?.signal.throwIfAborted();
       runtimeSession = await this.runtime.startSession({
         cwd: config.cwd,
+        signal: probe?.signal,
+        probe,
         model: config.model,
         thinkingOptionId:
           normalizePiThinkingOption(config.thinkingOptionId) ?? DEFAULT_PI_THINKING_LEVEL,
@@ -2550,25 +2644,46 @@ export class PiRpcAgentClient implements AgentClient {
         extensionPaths: paseoExtension ? [paseoExtension.path] : undefined,
       });
     } catch (error) {
-      mcpConfig?.cleanup();
-      paseoExtension?.cleanup();
+      if (error instanceof ProviderInitializationCleanupError) {
+        throw new ProviderInitializationCleanupError(
+          {
+            close: async () => {
+              await error.cleanup.close();
+              releaseFiles?.();
+            },
+          },
+          error.initializationError,
+          error.cleanupError,
+        );
+      }
+      releaseFiles?.();
       throw error;
     }
+    probe?.own(runtimeSession);
     try {
+      probe?.signal.throwIfAborted();
       return new PiRpcAgentSession({
         runtimeSession,
         config,
         initialState: await runtimeSession.getState(),
         capabilities: capabilitiesForSession(mcpConfig !== null),
-        cleanup: combineCleanup([mcpConfig?.cleanup, paseoExtension?.cleanup]),
+        cleanup: releaseFiles,
         extensionTimeoutMs: this.providerParams.extensionTimeoutMs,
         logger: this.logger,
         usagePollScheduler: this.usagePollScheduler,
       });
     } catch (error) {
-      await runtimeSession.close().catch(() => undefined);
-      mcpConfig?.cleanup();
-      paseoExtension?.cleanup();
+      const cleanup = {
+        close: async () => {
+          await runtimeSession.close();
+          releaseFiles?.();
+        },
+      };
+      try {
+        await cleanup.close();
+      } catch (cleanupError) {
+        throw new ProviderInitializationCleanupError(cleanup, error, cleanupError);
+      }
       throw error;
     }
   }
@@ -2613,6 +2728,19 @@ export class PiRpcAgentClient implements AgentClient {
         }),
       );
     } catch (error) {
+      if (error instanceof ProviderInitializationCleanupError) {
+        throw new ProviderInitializationCleanupError(
+          {
+            close: async () => {
+              await error.cleanup.close();
+              mcpConfig?.cleanup();
+              paseoExtension?.cleanup();
+            },
+          },
+          error.initializationError,
+          error.cleanupError,
+        );
+      }
       mcpConfig?.cleanup();
       paseoExtension?.cleanup();
       throw error;
@@ -2629,9 +2757,18 @@ export class PiRpcAgentClient implements AgentClient {
         usagePollScheduler: this.usagePollScheduler,
       });
     } catch (error) {
-      await runtimeSession.close().catch(() => undefined);
-      mcpConfig?.cleanup();
-      paseoExtension?.cleanup();
+      const cleanup = {
+        close: async () => {
+          await runtimeSession.close();
+          mcpConfig?.cleanup();
+          paseoExtension?.cleanup();
+        },
+      };
+      try {
+        await cleanup.close();
+      } catch (cleanupError) {
+        throw new ProviderInitializationCleanupError(cleanup, error, cleanupError);
+      }
       throw error;
     }
   }
@@ -2641,12 +2778,7 @@ export class PiRpcAgentClient implements AgentClient {
     context?: ProviderRefreshContext,
   ): Promise<ProviderCatalog> {
     let runtimeSession: PiRuntimeSession | undefined;
-    let closePromise: Promise<void> | undefined;
-    const closeSession = () => {
-      if (!runtimeSession) return Promise.resolve();
-      closePromise ??= runtimeSession.close();
-      return closePromise;
-    };
+    const closeSession = () => runtimeSession?.close() ?? Promise.resolve();
     const handleAbort = () => void closeSession().catch(() => undefined);
     context?.signal.addEventListener("abort", handleAbort, { once: true });
     try {
@@ -2654,7 +2786,9 @@ export class PiRpcAgentClient implements AgentClient {
         runtimeSession = await this.runtime.startSession({
           cwd: options.scope === "global" ? homedir() : options.cwd,
           signal: context?.signal,
+          probe: context?.probe,
         });
+        context?.probe?.own(runtimeSession);
         if (context?.signal.aborted) await closeSession();
       });
       if (!runtimeSession) throw new Error("Pi catalog runtime did not start");
@@ -2708,7 +2842,8 @@ export class PiRpcAgentClient implements AgentClient {
     }
   }
 
-  async getDiagnostic(): Promise<{ diagnostic: string }> {
+  async getDiagnostic(probe?: AgentProbeContext): Promise<{ diagnostic: string }> {
+    probe?.signal.throwIfAborted();
     try {
       const launch = await this.resolvePiLaunch();
       const availability = await checkProviderLaunchAvailable(launch);
@@ -2718,8 +2853,9 @@ export class PiRpcAgentClient implements AgentClient {
         diagnostic: formatProviderDiagnostic("Pi", [
           ...(await buildCommandResolutionDiagnosticRows(launch, {
             knownBinaryNames: [launch.command],
+            probe,
           })),
-          ...(await buildBinaryDiagnosticRows(launch, availability)),
+          ...(await buildBinaryDiagnosticRows(launch, availability, { probe })),
           {
             label: "Auth config (~/.pi/agent/auth.json)",
             value: existsSync(authConfigPath) ? "found" : "not found",
@@ -2727,6 +2863,8 @@ export class PiRpcAgentClient implements AgentClient {
         ]),
       };
     } catch (error) {
+      probe?.signal.throwIfAborted();
+      if (error instanceof ProviderInitializationCleanupError) throw error;
       this.logger.debug({ err: error }, "Pi diagnostic lookup failed");
       return {
         diagnostic: formatProviderDiagnosticError("Pi", error),
@@ -2738,32 +2876,55 @@ export class PiRpcAgentClient implements AgentClient {
     cwd: string,
     servers: Record<string, McpServerConfig> | undefined,
     env: Record<string, string> | undefined,
+    probe?: AgentProbeContext,
   ): Promise<PiMcpConfigFile | null> {
     if (!servers || Object.keys(servers).length === 0) {
       return null;
     }
-    if (!(await this.detectMcpAdapter(cwd, env))) {
+    if (!(await this.detectMcpAdapter(cwd, env, probe))) {
       return null;
     }
     return createPiMcpConfigFile(servers, { piGlobalConfigEnv: env });
   }
 
-  private async detectMcpAdapter(cwd: string, env?: Record<string, string>): Promise<boolean> {
-    const runtimeSession = await this.runtime.startSession({ cwd, env }).catch((error) => {
-      this.logger.debug({ err: error, cwd }, "Pi MCP adapter probe failed to start");
-      return null;
-    });
+  private async detectMcpAdapter(
+    cwd: string,
+    env?: Record<string, string>,
+    probe?: AgentProbeContext,
+  ): Promise<boolean> {
+    probe?.signal.throwIfAborted();
+    const runtimeSession = await this.runtime
+      .startSession({ cwd, env, signal: probe?.signal, probe })
+      .catch((error) => {
+        if (error instanceof ProviderInitializationCleanupError || probe?.signal.aborted)
+          throw error;
+        this.logger.debug({ err: error, cwd }, "Pi MCP adapter probe failed to start");
+        return null;
+      });
     if (!runtimeSession) {
       return false;
     }
+    probe?.own(runtimeSession);
+    let available = false;
+    let failure: unknown;
     try {
-      return (await runtimeSession.getCommands()).some(isPiMcpAdapterCommand);
+      probe?.signal.throwIfAborted();
+      available = (await runtimeSession.getCommands()).some(isPiMcpAdapterCommand);
     } catch (error) {
+      failure = error;
       this.logger.debug({ err: error, cwd }, "Pi MCP adapter probe failed");
-      return false;
-    } finally {
-      await runtimeSession.close().catch(() => undefined);
     }
+    try {
+      await runtimeSession.close();
+    } catch (cleanupError) {
+      throw new ProviderInitializationCleanupError(
+        runtimeSession,
+        failure ?? new Error("Pi MCP adapter probe cleanup failed"),
+        cleanupError,
+      );
+    }
+    probe?.signal.throwIfAborted();
+    return available;
   }
 
   private async resolvePiLaunch(): Promise<ResolvedProviderLaunch> {

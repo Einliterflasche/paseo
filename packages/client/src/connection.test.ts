@@ -6,7 +6,13 @@ function connection(options: { acknowledgeSubscriptions?: boolean } = {}) {
   const sent: Array<{
     type: string;
     capabilities?: Record<string, unknown>;
-    message?: { type: string; requestId?: string; agentIds?: string[]; events?: string[] };
+    message?: {
+      type: string;
+      requestId?: string;
+      agentIds?: string[];
+      events?: string[];
+      providerSubagents?: Array<{ parentAgentId: string; subagentId: string }>;
+    };
   }> = [];
   let receive = (_data: unknown) => {};
   let open = () => {};
@@ -26,7 +32,11 @@ function connection(options: { acknowledgeSubscriptions?: boolean } = {}) {
                 serverId: "test",
                 hostname: null,
                 version: null,
-                features: { selectiveAgentTimeline: true, explicitEventSubscriptions: true },
+                features: {
+                  selectiveAgentTimeline: true,
+                  explicitEventSubscriptions: true,
+                  projectedProviderSubagents: true,
+                },
               },
             },
           }),
@@ -385,6 +395,49 @@ test("unsubscribing while disconnected discards unresolved provider demand", asy
     expect(h.sent.filter((f) => f.message?.type === "get_providers_snapshot_request")).toHaveLength(
       1,
     );
+  } finally {
+    await h.client.close();
+  }
+});
+
+test("child transcript listeners own per-child demand without subscribing the managed parent", async () => {
+  const h = connection();
+  try {
+    const connected = h.client.connect();
+    h.open();
+    await connected;
+    const first = h.client.subscribeProviderSubagentTimeline(
+      { parentAgentId: "parent", subagentId: "one" },
+      () => {},
+    );
+    const duplicate = h.client.subscribeProviderSubagentTimeline(
+      { parentAgentId: "parent", subagentId: "one" },
+      () => {},
+    );
+    const second = h.client.subscribeProviderSubagentTimeline(
+      { parentAgentId: "parent", subagentId: "two" },
+      () => {},
+    );
+    await Promise.all([first.ready, duplicate.ready, second.ready]);
+    const latest = () =>
+      h.sent.findLast((frame) => frame.message?.type === "agent.timeline.set_subscription.request")!
+        .message!;
+    expect(latest().agentIds).toEqual([]);
+    expect(latest().providerSubagents).toEqual([
+      { parentAgentId: "parent", subagentId: "one" },
+      { parentAgentId: "parent", subagentId: "two" },
+    ]);
+    first();
+    expect(latest().providerSubagents).toHaveLength(2);
+    duplicate();
+    expect(latest().providerSubagents).toEqual([{ parentAgentId: "parent", subagentId: "two" }]);
+    h.disconnect();
+    const reconnected = h.client.connect();
+    h.open();
+    await reconnected;
+    expect(latest().providerSubagents).toEqual([{ parentAgentId: "parent", subagentId: "two" }]);
+    second();
+    expect(latest().providerSubagents).toEqual([]);
   } finally {
     await h.client.close();
   }

@@ -218,6 +218,13 @@ type ScheduleAgentManager = Pick<
     | "hydrateTimelineFromProvider"
     | "resumeAgentFromPersistence"
     | "runAgent"
+    | "runRequestAdmission"
+    | "waitForAgentRunStart"
+    | "startObservedRun"
+    | "getRunIdentity"
+    | "getRunOutcome"
+    | "subscribeRunOutcome"
+    | "getLastAssistantMessage"
     | "waitForAgentEvent"
     | "waitForAgentClose"
   >;
@@ -234,10 +241,17 @@ export interface ScheduleRestartRunRecord {
   agentId: string;
   workspaceId: string | null;
   manual: boolean;
+  logicalRunId?: string;
 }
 
+interface PendingScheduleArchive {
+  scheduleId: string;
+  runId: string;
+  workspaceId: string;
+}
 export interface ScheduleRestartSnapshot {
   runs: ScheduleRestartRunRecord[];
+  archives?: PendingScheduleArchive[];
 }
 
 export const ScheduleRestartRunRecordSchema = z.object({
@@ -246,11 +260,15 @@ export const ScheduleRestartRunRecordSchema = z.object({
   agentId: z.string(),
   workspaceId: z.string().nullable(),
   manual: z.boolean(),
+  logicalRunId: z.string().optional(),
 });
 
 /** Validate a checkpointed schedule snapshot before claiming/executing it. */
 export const ScheduleRestartSnapshotSchema = z.object({
   runs: z.array(ScheduleRestartRunRecordSchema),
+  archives: z
+    .array(z.object({ scheduleId: z.string(), runId: z.string(), workspaceId: z.string() }))
+    .optional(),
 });
 
 /**
@@ -346,6 +364,15 @@ export class ScheduleService {
   // inconsistent with, whatever generation gets checkpointed. Cleared on a later
   // successful write for the same key.
   private readonly finishRunWriteFailures = new Map<string, unknown>();
+  private readonly decidedSettlements = new Map<string, FinishRunParams>();
+  private readonly pendingArchives = new Map<string, PendingScheduleArchive>();
+  private readonly pendingSettlements = new Set<Promise<unknown>>();
+  private archiveDrain: Promise<void> | null = null;
+  private readonly runCompletions = new Map<string, Promise<void>>();
+  private readonly restoredCompletions = new Set<string>();
+  private readonly logicalRunIds = new Map<string, string>();
+  private readonly terminalRunIds = new Set<string>();
+  private readonly runOutcomeWatches = new Map<string, () => void>();
 
   constructor(options: ScheduleServiceOptions) {
     this.store = new ScheduleStore(join(options.paseoHome, "schedules"));
@@ -367,9 +394,16 @@ export class ScheduleService {
   }
 
   async start(): Promise<void> {
+    await this.agentManager.runRequestAdmission(async () => {
+      await this.initializeRecoveryState();
+      this.resumeAfterRestartFailure();
+    });
+  }
+
+  /** Called by lifecycle installation after restored run identities are registered. */
+  async initializeRecoveryState(): Promise<void> {
     await this.recoverInterruptedRuns();
     await this.sweepOrphanedSchedules();
-    this.resumeTicking();
   }
 
   async stop(): Promise<void> {
@@ -392,28 +426,7 @@ export class ScheduleService {
     this.tickTimer = timer;
   }
 
-  /**
-   * Freeze admission of new schedule fires ahead of a controlled restart, then wait for
-   * every run whose SHORT admission (assignment + turn start, not the model turn itself)
-   * is still in flight to finish reaching it. Runs that are already admitted and running
-   * keep executing after this returns — the agent manager's own quiesce/suspend path is
-   * what interrupts those — this only owns the short window before that.
-   *
-   * The caller must not freeze the agent manager's own admission gate until this
-   * resolves: doing so first can only reject an admission that was already the correct
-   * outcome of racing a frozen manager, but doing it before every in-flight schedule
-   * admission has settled would make some of those a RestartInProgressError — rejected
-   * out from under a schedule that had every reason to expect to run, in ways this
-   * service can't retroactively tell apart from having stayed due. Awaiting the drain
-   * here first makes that unreachable: a schedule-triggered admission is either fully
-   * decided (this returned) or was never let through `paused` to attempt one.
-   *
-   * Clearing the tick timer alone is not enough: a `tick()` call already in its for-loop
-   * over due schedules keeps going after this returns, so the owned `paused` flag is what
-   * `tick()` and `runOnce()` actually check before admitting each run — otherwise a
-   * second due schedule could start fresh admission after the drain below has already
-   * finished waiting for it.
-   */
+  /** Stops the timer and drains service bookkeeping; the manager owns shared admission. */
   async pauseForRestart(): Promise<void> {
     this.paused = true;
     if (this.tickTimer) {
@@ -451,6 +464,7 @@ export class ScheduleService {
   resumeAfterRestartFailure(): void {
     this.paused = false;
     this.resumeTicking();
+    void this.drainPendingArchives();
   }
 
   /**
@@ -478,22 +492,7 @@ export class ScheduleService {
    * current.
    */
   async snapshotForRestart(): Promise<ScheduleRestartSnapshot> {
-    if (this.admissionFailures.size > 0) {
-      throw new AggregateError(
-        [...this.admissionFailures.values()],
-        "Schedule admission did not settle before restart",
-      );
-    }
-    while (this.pendingFinishWrites.size > 0) {
-      await Promise.allSettled(this.pendingFinishWrites);
-    }
-    if (this.finishRunWriteFailures.size > 0) {
-      const [key, error] = [...this.finishRunWriteFailures.entries()][0];
-      throw new Error(
-        `Schedule run ${key} failed to persist its terminal state and cannot be safely ` +
-          `checkpointed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
+    await this.drainOwnedSettlements();
     const runs: ScheduleRestartRunRecord[] = [];
     for (const scheduleId of this.runningScheduleIds) {
       const schedule = await this.store.get(scheduleId);
@@ -512,9 +511,45 @@ export class ScheduleService {
         agentId: runningRun.agentId,
         workspaceId: runningRun.workspaceId ?? null,
         manual: this.activeRunContext.get(scheduleId)?.manual ?? false,
+        logicalRunId:
+          this.logicalRunIds.get(scheduleId) ??
+          this.agentManager.getRunIdentity(runningRun.agentId),
       });
     }
-    return { runs };
+    return {
+      runs,
+      ...(this.pendingArchives.size ? { archives: [...this.pendingArchives.values()] } : {}),
+    };
+  }
+
+  private async drainOwnedSettlements(): Promise<void> {
+    for (const [scheduleId, completion] of this.runCompletions) {
+      const runId = this.activeRunContext.get(scheduleId)?.runId;
+      // This service owns the observed settlement. A later turn on the same
+      // agent cannot replace the evidence while terminal bookkeeping drains.
+      if (runId && this.terminalRunIds.has(runId)) await completion;
+    }
+    if (this.admissionFailures.size > 0) {
+      throw new AggregateError(
+        [...this.admissionFailures.values()],
+        "Schedule admission did not settle before restart",
+      );
+    }
+    while (this.pendingFinishWrites.size || this.pendingSettlements.size) {
+      await Promise.allSettled([...this.pendingFinishWrites, ...this.pendingSettlements]);
+    }
+    // Retry the owned decision, never infer a replacement outcome from the current agent.
+    for (const decision of this.decidedSettlements.values()) await this.settleRun(decision);
+    if (this.finishRunWriteFailures.size > 0 || this.decidedSettlements.size > 0) {
+      const [key, error] = [...this.finishRunWriteFailures.entries()][0] ?? [
+        this.decidedSettlements.keys().next().value,
+        new Error("terminal bookkeeping remains pending"),
+      ];
+      throw new Error(
+        `Schedule run ${key} failed to persist its terminal state and cannot be safely ` +
+          `checkpointed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   /**
@@ -524,12 +559,19 @@ export class ScheduleService {
    * necessarily registered with the agent manager at this point.
    */
   restoreAfterRestart(snapshot: ScheduleRestartSnapshot): void {
-    for (const run of snapshot.runs) {
+    for (const archive of snapshot.archives ?? []) this.pendingArchives.set(archive.runId, archive);
+    const added = snapshot.runs.filter(
+      (run) => !this.pendingRestoredRuns.some((pending) => pending.runId === run.runId),
+    );
+    for (const run of added) {
       this.restoredRunIds.add(run.runId);
       this.runningScheduleIds.add(run.scheduleId);
       this.activeRunContext.set(run.scheduleId, { runId: run.runId, manual: run.manual });
+      const logicalId = run.logicalRunId ?? this.agentManager.getRunIdentity(run.agentId);
+      if (logicalId) this.logicalRunIds.set(run.scheduleId, logicalId);
     }
-    this.pendingRestoredRuns.push(...snapshot.runs);
+    this.pendingRestoredRuns.push(...added);
+    this.resumeRestoredRuns();
   }
 
   /**
@@ -544,36 +586,60 @@ export class ScheduleService {
     const runs = this.pendingRestoredRuns;
     this.pendingRestoredRuns = [];
     for (const run of runs) {
-      void this.reattachRestoredRun(run).catch((error) => {
+      if (this.restoredCompletions.has(run.runId)) continue;
+      this.restoredCompletions.add(run.runId);
+      const completion = this.reattachRestoredRun(run).catch((error) => {
         this.admissionFailures.set(run.scheduleId, error);
         this.logger.error(
           { err: error, scheduleId: run.scheduleId, runId: run.runId },
           "Failed to reattach restored schedule run",
         );
       });
+      this.runCompletions.set(run.scheduleId, completion);
+      void completion
+        .finally(() => {
+          this.restoredCompletions.delete(run.runId);
+          if (this.runCompletions.get(run.scheduleId) === completion)
+            this.runCompletions.delete(run.scheduleId);
+        })
+        .catch(() => undefined);
     }
   }
 
   private async reattachRestoredRun(run: ScheduleRestartRunRecord): Promise<void> {
-    const schedule = await this.store.get(run.scheduleId);
-    const archiveOnFinish =
-      schedule?.target.type === "new-agent" ? schedule.target.config.archiveOnFinish : undefined;
-    // Only archive once the run's outcome is durably recorded — a workspace archived out
-    // from under a run whose terminal write failed would be irrecoverable, for a run the
-    // store still shows as "running" and finishRunWriteFailures is about to block
-    // checkpointing over.
-    let persisted = false;
     try {
-      const waitResult = await this.agentManager.waitForAgentEvent(run.agentId, {
-        waitForActive: true,
+      const logicalRunId = run.logicalRunId ?? this.agentManager.getRunIdentity(run.agentId);
+      if (!logicalRunId)
+        throw new Error(`Missing logical run identity for restored schedule ${run.runId}`);
+      // A logical schedule survives any number of native session suspensions.
+      const lastMessage = await new Promise<string | null>((resolve, reject) => {
+        let unsubscribe: (() => void) | undefined;
+        const observe = (
+          outcome: NonNullable<ReturnType<ScheduleAgentManager["getRunOutcome"]>>,
+        ) => {
+          if (
+            outcome.runId !== logicalRunId ||
+            outcome.type === "suspended" ||
+            outcome.type === "uncertain"
+          )
+            return;
+          this.terminalRunIds.add(run.runId);
+          unsubscribe?.();
+          if (outcome.type === "completed") resolve(outcome.lastMessage);
+          else
+            reject(
+              new Error(
+                outcome.type === "failed"
+                  ? outcome.error
+                  : `Scheduled agent ${run.agentId} was canceled`,
+              ),
+            );
+        };
+        unsubscribe = this.agentManager.subscribeRunOutcome(run.agentId, observe);
+        const current = this.agentManager.getRunOutcome(run.agentId);
+        if (current) observe(current);
       });
-      if (waitResult.permission) {
-        throw new Error(`Scheduled agent ${run.agentId} is waiting for permission`);
-      }
-      if (waitResult.status === "error") {
-        throw new Error(waitResult.lastMessage ?? `Scheduled agent ${run.agentId} failed`);
-      }
-      ({ persisted } = await this.settleRun({
+      await this.settleRun({
         scheduleId: run.scheduleId,
         runId: run.runId,
         status: "succeeded",
@@ -581,17 +647,17 @@ export class ScheduleService {
         output: buildRunOutput({
           output: null,
           timelineText: "",
-          finalText: waitResult.lastMessage ?? "",
+          finalText: lastMessage ?? "",
         }),
         error: null,
         targetGone: false,
         manual: run.manual,
-      }));
+      });
     } catch (error) {
       if (error instanceof AgentRestartSuspendedError) {
         return;
       }
-      ({ persisted } = await this.settleRun({
+      await this.settleRun({
         scheduleId: run.scheduleId,
         runId: run.runId,
         status: "failed",
@@ -600,32 +666,15 @@ export class ScheduleService {
         error: error instanceof Error ? error.message : String(error),
         targetGone: false,
         manual: run.manual,
-      }));
-    } finally {
-      if (
-        persisted &&
-        run.workspaceId &&
-        shouldArchiveScheduleRunWorkspace({ agentId: run.agentId, archiveOnFinish })
-      ) {
-        try {
-          await this.archiveWorkspace(run.workspaceId);
-        } catch (error) {
-          this.logger.warn(
-            {
-              err: error,
-              agentId: run.agentId,
-              workspaceId: run.workspaceId,
-              scheduleId: run.scheduleId,
-              runId: run.runId,
-            },
-            "Failed to archive scheduled workspace after restart reattach",
-          );
-        }
-      }
+      });
     }
   }
 
-  async create(input: CreateScheduleInput): Promise<StoredSchedule> {
+  create(input: CreateScheduleInput): Promise<StoredSchedule> {
+    return this.agentManager.runRequestAdmission(() => this.createInternal(input));
+  }
+
+  private async createInternal(input: CreateScheduleInput): Promise<StoredSchedule> {
     const prompt = normalizePrompt(input.prompt);
     validateScheduleCadence(input.cadence);
     return this.createScheduleRecord(input, {
@@ -669,7 +718,11 @@ export class ScheduleService {
   // Idempotent create for the MCP write path: repeating a create with the same
   // name and target (e.g. babysit-pr re-registering its heartbeat) refreshes the
   // existing non-completed schedule in place instead of minting a duplicate.
-  async createOrReplace(input: CreateScheduleInput): Promise<StoredSchedule> {
+  createOrReplace(input: CreateScheduleInput): Promise<StoredSchedule> {
+    return this.agentManager.runRequestAdmission(() => this.createOrReplaceInternal(input));
+  }
+
+  private async createOrReplaceInternal(input: CreateScheduleInput): Promise<StoredSchedule> {
     const name = trimOptionalName(input.name);
     const prompt = normalizePrompt(input.prompt);
     validateScheduleCadence(input.cadence);
@@ -721,7 +774,11 @@ export class ScheduleService {
     return [...schedule.runs].sort((left, right) => left.startedAt.localeCompare(right.startedAt));
   }
 
-  async pause(id: string): Promise<StoredSchedule> {
+  pause(id: string): Promise<StoredSchedule> {
+    return this.agentManager.runRequestAdmission(() => this.pauseInternal(id));
+  }
+
+  private async pauseInternal(id: string): Promise<StoredSchedule> {
     const paused = await this.store.update(id, (schedule) => {
       if (schedule.status === "completed") {
         throw new Error(`Schedule ${id} is already completed`);
@@ -741,7 +798,11 @@ export class ScheduleService {
     return requireSchedule(paused, id);
   }
 
-  async resume(id: string): Promise<StoredSchedule> {
+  resume(id: string): Promise<StoredSchedule> {
+    return this.agentManager.runRequestAdmission(() => this.resumeInternal(id));
+  }
+
+  private async resumeInternal(id: string): Promise<StoredSchedule> {
     const resumed = await this.store.update(id, (schedule) => {
       if (schedule.status === "completed") {
         throw new Error(`Schedule ${id} is already completed`);
@@ -761,7 +822,11 @@ export class ScheduleService {
     return requireSchedule(resumed, id);
   }
 
-  async update(input: UpdateScheduleInput): Promise<StoredSchedule> {
+  update(input: UpdateScheduleInput): Promise<StoredSchedule> {
+    return this.agentManager.runRequestAdmission(() => this.updateInternal(input));
+  }
+
+  private async updateInternal(input: UpdateScheduleInput): Promise<StoredSchedule> {
     const next = await this.store.update(input.id, async (schedule) => {
       const now = this.now();
       let updated: StoredSchedule = schedule;
@@ -806,11 +871,19 @@ export class ScheduleService {
     return requireSchedule(next, input.id);
   }
 
-  async delete(id: string): Promise<void> {
+  delete(id: string): Promise<void> {
+    return this.agentManager.runRequestAdmission(() => this.deleteInternal(id));
+  }
+
+  private async deleteInternal(id: string): Promise<void> {
     await this.store.delete(id);
   }
 
-  async completeForAgent(agentId: string): Promise<number> {
+  completeForAgent(agentId: string): Promise<number> {
+    return this.agentManager.runRequestAdmission(() => this.completeForAgentInternal(agentId));
+  }
+
+  private async completeForAgentInternal(agentId: string): Promise<number> {
     const now = this.now();
     const schedules = await this.store.list();
     const matches = schedules.filter(
@@ -907,7 +980,13 @@ export class ScheduleService {
     }
   }
 
-  private async completeScheduleIfDue(scheduleId: string, now: Date): Promise<void> {
+  private completeScheduleIfDue(scheduleId: string, now: Date): Promise<void> {
+    return this.agentManager.runRequestAdmission(() =>
+      this.completeScheduleIfDueAccepted(scheduleId, now),
+    );
+  }
+
+  private async completeScheduleIfDueAccepted(scheduleId: string, now: Date): Promise<void> {
     const updated = await this.store.update(scheduleId, (schedule) => {
       if (
         schedule.status !== "active" ||
@@ -991,20 +1070,11 @@ export class ScheduleService {
     if (!interruptedWorkspace) {
       return;
     }
-    try {
-      await this.archiveWorkspace(interruptedWorkspace.workspaceId);
-    } catch (error) {
-      this.logger.warn(
-        {
-          err: error,
-          agentId: interruptedWorkspace.agentId,
-          workspaceId: interruptedWorkspace.workspaceId,
-          scheduleId,
-          runId: interruptedWorkspace.runId,
-        },
-        "Failed to archive interrupted scheduled workspace after daemon restart",
-      );
-    }
+    this.pendingArchives.set(interruptedWorkspace.runId, {
+      scheduleId,
+      runId: interruptedWorkspace.runId,
+      workspaceId: interruptedWorkspace.workspaceId,
+    });
   }
 
   // Orphaned agent-target schedules (agent deleted while the daemon was down, or
@@ -1029,7 +1099,23 @@ export class ScheduleService {
     });
   }
 
-  private async runSchedule(
+  private runSchedule(
+    schedule: StoredSchedule,
+    now: Date,
+    options?: { manual?: boolean },
+  ): Promise<void> {
+    const completion = this.runScheduleOwned(schedule, now, options);
+    this.runCompletions.set(schedule.id, completion);
+    void completion
+      .finally(() => {
+        if (this.runCompletions.get(schedule.id) === completion)
+          this.runCompletions.delete(schedule.id);
+      })
+      .catch(() => undefined);
+    return completion;
+  }
+
+  private async runScheduleOwned(
     schedule: StoredSchedule,
     now: Date,
     options?: { manual?: boolean },
@@ -1039,9 +1125,8 @@ export class ScheduleService {
       throw new RestartInProgressError();
     }
     const manual = options?.manual === true;
-    this.runningScheduleIds.add(schedule.id);
     const runId = randomUUID();
-    this.activeRunContext.set(schedule.id, { runId, manual });
+    let registered = false;
     const runningRun: ScheduleRun = {
       id: runId,
       scheduledFor: manual ? now.toISOString() : (schedule.nextRunAt ?? now.toISOString()),
@@ -1058,12 +1143,18 @@ export class ScheduleService {
       // from registration, or pauseForRestart() could miss this run.
       const handle = await this.trackAdmission(
         schedule.id,
-        (async () => {
+        this.agentManager.runRequestAdmission(async () => {
+          if (this.paused) throw new RestartInProgressError();
+          this.runningScheduleIds.add(schedule.id);
+          this.activeRunContext.set(schedule.id, { runId, manual });
+          this.logicalRunIds.set(schedule.id, runId);
+          registered = true;
           const scheduleWithRun = await this.appendRunningRun(schedule.id, runningRun);
           return this.runner(scheduleWithRun, runId);
-        })(),
+        }),
       );
       const result = await handle.completion;
+      this.terminalRunIds.add(runId);
       // A failed save must not reach the execution-error handler and rewrite success
       // as failure. Retain ownership until the actual outcome is durable.
       await this.settleRun({
@@ -1077,7 +1168,10 @@ export class ScheduleService {
         manual,
       });
     } catch (error) {
+      if (!registered) throw error;
       if (error instanceof AgentRestartSuspendedError) {
+        this.runOutcomeWatches.get(runId)?.();
+        this.runOutcomeWatches.delete(runId);
         // Restart interruption, not a real failure: leave the run "running"
         // in the store and this schedule in runningScheduleIds so
         // snapshotForRestart() captures it instead of finishRun() failing
@@ -1098,6 +1192,7 @@ export class ScheduleService {
         );
         return;
       }
+      this.terminalRunIds.add(runId);
       // A genuine execution failure (not a persistence failure — see settleRun() above,
       // which never rethrows, so this catch only ever sees execution/admission errors).
       await this.settleRun({
@@ -1126,12 +1221,44 @@ export class ScheduleService {
   }
 
   /** Save the decided outcome without reclassifying a write failure as execution failure. */
-  private async settleRun(params: FinishRunParams): Promise<{ persisted: boolean }> {
+  private settleRun(params: FinishRunParams): Promise<{ persisted: boolean }> {
+    this.decidedSettlements.set(`${params.scheduleId}:${params.runId}`, params);
+    const settlement = this.settleRunOwned(params);
+    this.pendingSettlements.add(settlement);
+    void settlement
+      .finally(() => this.pendingSettlements.delete(settlement))
+      .catch(() => undefined);
+    return settlement;
+  }
+
+  private async settleRunOwned(params: FinishRunParams): Promise<{ persisted: boolean }> {
     try {
       await this.finishRun(params);
+      const schedule = await this.store.get(params.scheduleId);
+      const run = schedule?.runs.find((candidate) => candidate.id === params.runId);
+      if (
+        schedule?.target.type === "new-agent" &&
+        run?.workspaceId &&
+        shouldArchiveScheduleRunWorkspace({
+          agentId: run.agentId,
+          archiveOnFinish: schedule.target.config.archiveOnFinish,
+        })
+      ) {
+        this.pendingArchives.set(params.runId, {
+          scheduleId: params.scheduleId,
+          runId: params.runId,
+          workspaceId: run.workspaceId,
+        });
+      }
       this.runningScheduleIds.delete(params.scheduleId);
       this.activeRunContext.delete(params.scheduleId);
+      this.logicalRunIds.delete(params.scheduleId);
       this.restoredRunIds.delete(params.runId);
+      this.terminalRunIds.delete(params.runId);
+      this.runOutcomeWatches.get(params.runId)?.();
+      this.runOutcomeWatches.delete(params.runId);
+      await this.drainPendingArchives();
+      this.decidedSettlements.delete(`${params.scheduleId}:${params.runId}`);
       return { persisted: true };
     } catch (error) {
       this.logger.error(
@@ -1140,6 +1267,27 @@ export class ScheduleService {
       );
       return { persisted: false };
     }
+  }
+
+  private drainPendingArchives(): Promise<void> {
+    if (this.archiveDrain) return this.archiveDrain;
+    if (this.paused) return Promise.resolve();
+    this.archiveDrain = (async () => {
+      for (const archive of this.pendingArchives.values()) {
+        try {
+          await this.agentManager.runRequestAdmission(() =>
+            this.archiveWorkspace(archive.workspaceId),
+          );
+          this.pendingArchives.delete(archive.runId);
+        } catch (error) {
+          if (!(error instanceof RestartInProgressError))
+            this.logger.warn({ err: error, ...archive }, "Schedule archive remains pending");
+        }
+      }
+    })().finally(() => {
+      this.archiveDrain = null;
+    });
+    return this.archiveDrain;
   }
 
   private async finishRun(params: FinishRunParams): Promise<void> {
@@ -1159,6 +1307,11 @@ export class ScheduleService {
 
   private async writeFinishRun(params: FinishRunParams): Promise<void> {
     const updatedSchedule = await this.store.update(params.scheduleId, (schedule) => {
+      const existing = schedule.runs.find((run) => run.id === params.runId);
+      if (!existing) throw new Error(`Schedule run ${params.runId} no longer exists`);
+      // Terminal persistence is idempotent across a subsequent bookkeeping/read
+      // failure. In particular, retry must not advance the cadence a second time.
+      if (existing.status !== "running") return schedule;
       const now = this.now();
       const completedRuns = schedule.runs.map((run) =>
         run.id === params.runId
@@ -1258,6 +1411,17 @@ export class ScheduleService {
     requireSchedule(updatedSchedule, params.scheduleId);
   }
 
+  private watchRunOutcome(agentId: string, runId: string): void {
+    this.runOutcomeWatches.get(runId)?.();
+    const observe = (outcome: NonNullable<ReturnType<ScheduleAgentManager["getRunOutcome"]>>) => {
+      if (outcome.runId === runId && outcome.type !== "suspended" && outcome.type !== "uncertain")
+        this.terminalRunIds.add(runId);
+    };
+    this.runOutcomeWatches.set(runId, this.agentManager.subscribeRunOutcome(agentId, observe));
+    const current = this.agentManager.getRunOutcome(agentId);
+    if (current) observe(current);
+  }
+
   private async executeSchedule(
     schedule: StoredSchedule,
     runId: string,
@@ -1294,29 +1458,26 @@ export class ScheduleService {
     // run's agentId already on the store row, or snapshotForRestart() has nothing to
     // checkpoint against and refuses the whole checkpoint.
     await this.recordRunAgentId({ scheduleId: schedule.id, runId, agentId: agent.id });
-    // startAgentRun() only awaits the short admission (assignment + turn start); it drains
-    // the rest of the turn in the background, so by the time it resolves, this method's
-    // own admission work is done — the caller only awaits what's returned below.
-    await startAgentRun(this.agentManager, agent.id, wrappedPrompt, this.logger, {
-      replaceRunning: true,
-      activeTurnBehavior: "steer",
-    });
+    this.watchRunOutcome(agent.id, runId);
+    const observed = await this.agentManager.startObservedRun(agent.id, runId, () =>
+      startAgentRun(this.agentManager, agent.id, wrappedPrompt, this.logger, {
+        runOptions: { clientMessageId: runId },
+      }),
+    );
     const completion = (async (): Promise<ScheduleExecutionResult> => {
-      const waitResult = await this.agentManager.waitForAgentEvent(agent.id, {
-        waitForActive: true,
-      });
-      if (waitResult.permission) {
-        throw new Error(`Scheduled agent ${agent.id} is waiting for permission`);
-      }
-      if (waitResult.status === "error") {
-        throw new Error(waitResult.lastMessage ?? `Scheduled agent ${agent.id} failed`);
-      }
+      const outcome = await observed.completion;
+      if (outcome.type === "suspended" || outcome.type === "uncertain")
+        throw new AgentRestartSuspendedError(agent.id);
+      if (outcome.type === "user_canceled")
+        throw new Error(`Scheduled agent ${agent.id} was canceled`);
+      if (outcome.type === "failed") throw new Error(outcome.error);
+      const lastMessage = outcome.lastMessage;
       return {
         agentId: agent.id,
         output: buildRunOutput({
           output: null,
           timelineText: "",
-          finalText: waitResult.lastMessage ?? "",
+          finalText: lastMessage ?? "",
         }),
       };
     })();
@@ -1334,82 +1495,59 @@ export class ScheduleService {
     await this.assertNewAgentCwdDirectory(config.cwd);
     let workspace: PersistedWorkspaceRecord | null = null;
     let agentId: string | null = null;
-    try {
-      workspace = await this.createScheduleRunWorkspace(config, schedule.prompt);
-      await this.recordRunWorkspace({
-        scheduleId: schedule.id,
-        runId,
-        workspaceId: workspace.workspaceId,
-        agentId: null,
-      });
-      const runConfig = { ...config, cwd: workspace.cwd };
-      const created = await this.createAgent({
-        kind: "mcp",
-        provider: formatScheduleProviderModel(runConfig),
-        config: buildScheduleAgentConfig(runConfig),
-        cwd: workspace.cwd,
-        workspaceId: workspace.workspaceId,
-        title: resolveScheduleAgentTitle(config, schedule.prompt),
-        labels: {
-          "paseo.schedule-id": schedule.id,
-          "paseo.schedule-run": runId,
-        },
-        mode: config.modeId,
-        thinking: config.thinkingOptionId,
-        features: config.featureValues,
-        unattended: true,
-        promptFailure: "return-error",
-        background: true,
-        notifyOnFinish: false,
-      });
-      const agent = created.snapshot;
-      agentId = agent.id;
-      await this.recordRunWorkspace({
-        scheduleId: schedule.id,
-        runId,
-        workspaceId: workspace.workspaceId,
-        agentId,
-      });
-      // Admission is done here: the agent exists and is about to dispatch. The rest
-      // (dispatch + the whole model turn) is `completion`, deliberately not awaited by
-      // this method — see runNewAgentTargetCompletion(). The archive-on-finish handling
-      // below intentionally covers only failures reaching this point (workspace/agent
-      // creation itself); runNewAgentTargetCompletion() owns it for everything after.
-      const completion = this.runNewAgentTargetCompletion({
-        schedule,
-        runId,
-        config,
-        workspace,
-        agentId,
-        created,
-        agent,
-      });
-      return { completion };
-    } catch (error) {
-      const suspendedForRestart =
-        error instanceof AgentRestartSuspendedError || error instanceof RestartInProgressError;
-      if (
-        !suspendedForRestart &&
-        workspace &&
-        shouldArchiveScheduleRunWorkspace({ agentId, archiveOnFinish: config.archiveOnFinish })
-      ) {
-        try {
-          await this.archiveWorkspace(workspace.workspaceId);
-        } catch (archiveError) {
-          this.logger.warn(
-            {
-              err: archiveError,
-              agentId,
-              workspaceId: workspace.workspaceId,
-              scheduleId: schedule.id,
-              runId,
-            },
-            "Failed to archive scheduled workspace after admission failure",
-          );
-        }
-      }
-      throw error;
-    }
+    workspace = await this.createScheduleRunWorkspace(config, schedule.prompt);
+    await this.recordRunWorkspace({
+      scheduleId: schedule.id,
+      runId,
+      workspaceId: workspace.workspaceId,
+      agentId: null,
+    });
+    const runConfig = { ...config, cwd: workspace.cwd };
+    const created = await this.createAgent({
+      kind: "mcp",
+      provider: formatScheduleProviderModel(runConfig),
+      config: buildScheduleAgentConfig(runConfig),
+      cwd: workspace.cwd,
+      workspaceId: workspace.workspaceId,
+      title: resolveScheduleAgentTitle(config, schedule.prompt),
+      labels: {
+        "paseo.schedule-id": schedule.id,
+        "paseo.schedule-run": runId,
+      },
+      mode: config.modeId,
+      thinking: config.thinkingOptionId,
+      features: config.featureValues,
+      unattended: true,
+      promptFailure: "return-error",
+      background: true,
+      notifyOnFinish: false,
+    });
+    const agent = created.snapshot;
+    agentId = agent.id;
+    await this.recordRunWorkspace({
+      scheduleId: schedule.id,
+      runId,
+      workspaceId: workspace.workspaceId,
+      agentId,
+    });
+    // Admission is done here: the agent exists and is about to dispatch. The rest
+    // (dispatch + the whole model turn) is `completion`, deliberately not awaited by
+    // this method — see runNewAgentTargetCompletion(). The archive-on-finish handling
+    // below intentionally covers only failures reaching this point (workspace/agent
+    // creation itself); runNewAgentTargetCompletion() owns it for everything after.
+    this.watchRunOutcome(agent.id, runId);
+    const completion = this.runNewAgentTargetCompletion({
+      schedule,
+      runId,
+      config,
+      workspace,
+      agentId,
+      created,
+      agent,
+    });
+    // Both assignment and actual turn handoff belong to the same short admission.
+    await Promise.race([this.agentManager.waitForAgentRunStart(agent.id), completion]);
+    return { completion };
   }
 
   private async runNewAgentTargetCompletion(input: {
@@ -1421,62 +1559,20 @@ export class ScheduleService {
     created: Awaited<ReturnType<BoundCreateAgentCommand>>;
     agent: Awaited<ReturnType<BoundCreateAgentCommand>>["snapshot"];
   }): Promise<ScheduleExecutionResult> {
-    const { schedule, runId, config, workspace, agentId, created, agent } = input;
-    // A restart suspension must not archive the workspace out from under the run it's
-    // about to be reattached to after restart.
-    let suspendedForRestart = false;
-    try {
-      if (created.initialPromptError) {
-        throw created.initialPromptError;
-      }
-      const result = await this.agentManager.runAgent(agent.id, schedule.prompt);
-      const waitResult = await this.agentManager.waitForAgentEvent(agent.id, {
-        waitForActive: true,
-      });
-      if (result.canceled) {
-        throw new Error(`Scheduled agent ${agent.id} was canceled`);
-      }
-      if (waitResult.permission) {
-        throw new Error(`Scheduled agent ${agent.id} is waiting for permission`);
-      }
-      if (waitResult.status === "error") {
-        throw new Error(waitResult.lastMessage ?? `Scheduled agent ${agent.id} failed`);
-      }
-      const timelineText = curateAgentActivity(result.timeline);
-      return {
-        agentId: agent.id,
-        output: buildRunOutput({
-          output: waitResult.lastMessage ?? null,
-          timelineText,
-          finalText: result.finalText,
-        }),
-      };
-    } catch (error) {
-      if (error instanceof AgentRestartSuspendedError || error instanceof RestartInProgressError) {
-        suspendedForRestart = true;
-      }
-      throw error;
-    } finally {
-      if (
-        !suspendedForRestart &&
-        shouldArchiveScheduleRunWorkspace({ agentId, archiveOnFinish: config.archiveOnFinish })
-      ) {
-        try {
-          await this.archiveWorkspace(workspace.workspaceId);
-        } catch (error) {
-          this.logger.warn(
-            {
-              err: error,
-              agentId,
-              workspaceId: workspace.workspaceId,
-              scheduleId: schedule.id,
-              runId,
-            },
-            "Failed to archive scheduled workspace after run",
-          );
-        }
-      }
-    }
+    const { schedule, runId, created, agent } = input;
+    if (created.initialPromptError) throw created.initialPromptError;
+    const result = await this.agentManager.runAgent(agent.id, schedule.prompt, {
+      clientMessageId: runId,
+    });
+    if (result.canceled) throw new Error(`Scheduled agent ${agent.id} was canceled`);
+    return {
+      agentId: agent.id,
+      output: buildRunOutput({
+        output: null,
+        timelineText: curateAgentActivity(result.timeline),
+        finalText: result.finalText,
+      }),
+    };
   }
 
   private async createScheduleRunWorkspace(

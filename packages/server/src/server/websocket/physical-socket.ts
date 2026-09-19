@@ -9,6 +9,24 @@ export const APPLICATION_SOCKET_LEASE_CHECK_INTERVAL_MS = 10_000;
 
 type Clock = () => number;
 
+export interface JsonResponseCapacity {
+  maximumBytes: number;
+  availableBytes: number;
+}
+
+export function physicalJsonResponseCapacity(socket: {
+  bufferedAmount?: number;
+}): JsonResponseCapacity {
+  return {
+    maximumBytes: MAX_PHYSICAL_SOCKET_BUFFERED_BYTES,
+    availableBytes: Math.max(
+      0,
+      MAX_PHYSICAL_SOCKET_BUFFERED_BYTES -
+        (typeof socket.bufferedAmount === "number" ? socket.bufferedAmount : 0),
+    ),
+  };
+}
+
 export class ApplicationSocketLease<TSocket extends object> {
   private readonly deadlines = new Map<TSocket, number>();
 

@@ -286,6 +286,9 @@ export interface DaemonServerInfo {
   restartRecoveryState?: ServerInfoStatusPayload["restartRecoveryState"];
   restartRecoveryGeneration?: string;
   restartRecoveryError?: string;
+  restartRecoveryStage?: ServerInfoStatusPayload["restartRecoveryStage"];
+  restartRecoveryPreviousGeneration?: string;
+  restartRecoveryAffectedAgents?: string[];
 }
 
 export interface AgentTimelineCursorState {
@@ -678,19 +681,30 @@ function areRecoveryDetailsEqual(
   state: DaemonServerInfo["restartRecoveryState"],
   generation: string | undefined,
   error: string | undefined,
+  stage: DaemonServerInfo["restartRecoveryStage"],
+  previousGeneration: string | undefined,
+  affectedAgents: string[] | undefined,
 ): boolean {
   return (
     current?.restartRecoveryState === state &&
     current?.restartRecoveryGeneration === generation &&
-    current?.restartRecoveryError === error
+    current?.restartRecoveryError === error &&
+    current?.restartRecoveryStage === stage &&
+    current?.restartRecoveryPreviousGeneration === previousGeneration &&
+    JSON.stringify(current?.restartRecoveryAffectedAgents) === JSON.stringify(affectedAgents)
   );
 }
 
-export function selectRecoveryPausedHostIds(state: Pick<SessionStore, "sessions">): string[] {
+export function selectRecoveryFailedHostIds(state: Pick<SessionStore, "sessions">): string[] {
   return Object.entries(state.sessions)
     .filter(([, session]) => {
       const info = session.serverInfo;
-      return info?.restartRecoveryState === "paused" && Boolean(info.restartRecoveryError?.trim());
+      return (
+        Boolean(info?.restartRecoveryError?.trim()) &&
+        (info?.restartRecoveryState === "paused" ||
+          (info?.restartRecoveryState === "restoring" &&
+            (info.restartRecoveryStage === "stopping" || info.restartRecoveryStage === "blocked")))
+      );
     })
     .map(([serverId]) => serverId);
 }
@@ -706,6 +720,9 @@ function isSessionServerInfoUnchanged(input: {
   nextRestartRecoveryState: ServerInfoStatusPayload["restartRecoveryState"] | undefined;
   nextRestartRecoveryGeneration: string | undefined;
   nextRestartRecoveryError: string | undefined;
+  nextRestartRecoveryStage: DaemonServerInfo["restartRecoveryStage"];
+  nextRestartRecoveryPreviousGeneration: string | undefined;
+  nextRestartRecoveryAffectedAgents: string[] | undefined;
 }): boolean {
   const {
     currentServerInfo,
@@ -717,6 +734,9 @@ function isSessionServerInfoUnchanged(input: {
     nextRestartRecoveryState,
     nextRestartRecoveryGeneration,
     nextRestartRecoveryError,
+    nextRestartRecoveryStage,
+    nextRestartRecoveryPreviousGeneration,
+    nextRestartRecoveryAffectedAgents,
   } = input;
   const prevHostname = currentServerInfo?.hostname?.trim() || null;
   const prevVersion = currentServerInfo?.version?.trim() || null;
@@ -732,6 +752,9 @@ function isSessionServerInfoUnchanged(input: {
       nextRestartRecoveryState,
       nextRestartRecoveryGeneration,
       nextRestartRecoveryError,
+      nextRestartRecoveryStage,
+      nextRestartRecoveryPreviousGeneration,
+      nextRestartRecoveryAffectedAgents,
     )
   );
 }
@@ -873,6 +896,9 @@ export const useSessionStore = create<SessionStore>()(
           const nextRestartRecoveryState = info.restartRecoveryState;
           const nextRestartRecoveryGeneration = info.restartRecoveryGeneration;
           const nextRestartRecoveryError = info.restartRecoveryError;
+          const nextRestartRecoveryStage = info.restartRecoveryStage;
+          const nextRestartRecoveryPreviousGeneration = info.restartRecoveryPreviousGeneration;
+          const nextRestartRecoveryAffectedAgents = info.restartRecoveryAffectedAgents;
 
           if (
             isSessionServerInfoUnchanged({
@@ -886,6 +912,9 @@ export const useSessionStore = create<SessionStore>()(
               nextRestartRecoveryState,
               nextRestartRecoveryGeneration,
               nextRestartRecoveryError,
+              nextRestartRecoveryStage,
+              nextRestartRecoveryPreviousGeneration,
+              nextRestartRecoveryAffectedAgents,
             })
           ) {
             return prev;
@@ -911,6 +940,15 @@ export const useSessionStore = create<SessionStore>()(
                     : {}),
                   ...(nextRestartRecoveryGeneration !== undefined
                     ? { restartRecoveryGeneration: nextRestartRecoveryGeneration }
+                    : {}),
+                  ...(nextRestartRecoveryStage
+                    ? { restartRecoveryStage: nextRestartRecoveryStage }
+                    : {}),
+                  ...(nextRestartRecoveryPreviousGeneration !== undefined
+                    ? { restartRecoveryPreviousGeneration: nextRestartRecoveryPreviousGeneration }
+                    : {}),
+                  ...(nextRestartRecoveryAffectedAgents !== undefined
+                    ? { restartRecoveryAffectedAgents: nextRestartRecoveryAffectedAgents }
                     : {}),
                   ...(nextRestartRecoveryError !== undefined
                     ? { restartRecoveryError: nextRestartRecoveryError }

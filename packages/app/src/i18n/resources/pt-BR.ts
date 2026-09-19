@@ -8,6 +8,13 @@ export const ptBR: TranslationResources = {
       description:
         "O Paseo pausou o trabalho dos agentes para proteger o histórico salvo. O operador do host deve resolver o erro de recuperação antes de continuar.",
       generation: "Ponto de controle: {{generation}}",
+      stoppingTitle: "A recuperação está interrompendo o trabalho em {{hostName}}",
+      stoppingDescription:
+        "A recuperação falhou. O Paseo está interrompendo os agentes afetados e preservando seus resultados. Ainda não foi confirmado que o trabalho está pausado.",
+      blockedTitle: "A recuperação precisa de atenção em {{hostName}}",
+      blockedDescription:
+        "O Paseo não conseguiu confirmar que todos os agentes afetados pararam. Novos trabalhos e a reinicialização estão bloqueados. O operador do host deve resolver o erro antes de tentar a recuperação novamente.",
+      affectedAgents: "Agentes afetados: {{agents}}",
     },
     back: "Voltar",
     loading: "Carregando...",

@@ -25,10 +25,19 @@ function createPiChild(): PiChild {
   }) as PiChild;
   child.kill = ((signal?: NodeJS.Signals | number) => {
     child.killedSignals.push(signal);
-    queueMicrotask(() => child.emit("exit", null, signal ?? null));
+    queueMicrotask(() => exitPiChild(child, null, (signal ?? "SIGTERM") as NodeJS.Signals));
     return true;
   }) as ChildProcessWithoutNullStreams["kill"];
   return child;
+}
+
+function exitPiChild(child: PiChild, code: number | null, signal: NodeJS.Signals | null): void {
+  child.exitCode = code;
+  child.signalCode = signal;
+  child.emit("exit", code, signal);
+  child.stdout.end();
+  child.stderr.end();
+  child.emit("close", code, signal);
 }
 
 function createRuntime(
@@ -278,9 +287,12 @@ describe("PiCliRuntime", () => {
 
     const state = session.getState();
     child.stderr.write("boom");
-    child.emit("exit", 1, null);
+    exitPiChild(child, 1, null);
 
     await expect(state).rejects.toThrow("boom");
+    await session.close();
+    await session.close();
+    expect(child.killedSignals).toEqual([]);
   });
 
   test("rejects pending commands when the Pi session closes", async () => {

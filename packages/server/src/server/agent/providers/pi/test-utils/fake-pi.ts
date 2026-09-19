@@ -110,6 +110,8 @@ export class FakePiSession implements PiRuntimeSession {
   readonly rawFrames: Array<object & { type: string }> = [];
   capturedUserEntries: Array<{ id: string; parentId: string | null; text: string }> = [];
   abortRequested = false;
+  closeError: Error | null = null;
+  closeCalls = 0;
   readonly canceledExtensionUiRequests: string[] = [];
   readonly extensionUiResponses: Array<{
     id: string;
@@ -368,7 +370,10 @@ export class FakePiSession implements PiRuntimeSession {
     this.respondToExtensionUiRequest(id, { cancelled: true });
   }
 
-  async close(): Promise<void> {}
+  async close(): Promise<void> {
+    this.closeCalls += 1;
+    if (this.closeError) throw this.closeError;
+  }
 
   emit(event: PiRuntimeEvent): void {
     for (const subscriber of this.subscribers) {

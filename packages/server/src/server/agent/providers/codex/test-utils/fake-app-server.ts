@@ -58,6 +58,7 @@ export interface FakeCodexAppServer {
   updatesPlan(params: { threadId: string; steps: string[] }): void;
   completeTurn(params?: {
     threadId?: string;
+    turnId?: string;
     status?: "completed" | "failed" | "interrupted";
     error?: { message: string } | null;
   }): void;
@@ -125,7 +126,13 @@ export function createCodexAppServerChildProcess(): CodexAppServerChildProcess {
     signalCode: null,
   }) as CodexAppServerChildProcess;
   child.kill = ((signal?: NodeJS.Signals | number) => {
-    queueMicrotask(() => child.emit("exit", null, signal ?? null));
+    queueMicrotask(() => {
+      child.signalCode = (signal ?? "SIGTERM") as NodeJS.Signals;
+      child.emit("exit", null, signal ?? null);
+      child.stdout.end();
+      child.stderr.end();
+      child.emit("close", null, signal ?? null);
+    });
     return true;
   }) as ChildProcessWithoutNullStreams["kill"];
   return child;
@@ -383,6 +390,7 @@ export function createFakeCodexAppServer(
           params: {
             threadId: params.threadId ?? "thread-1",
             turn: {
+              id: params.turnId,
               status: params.status ?? "completed",
               error: params.error ?? null,
             },

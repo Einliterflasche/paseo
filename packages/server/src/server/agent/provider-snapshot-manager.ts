@@ -1,3 +1,5 @@
+import { AgentProbe } from "./agent-probe.js";
+import { RestartInProgressError } from "../restart/restart-errors.js";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { homedir } from "node:os";
@@ -12,6 +14,7 @@ import { withTimeout } from "../../utils/promise-timeout.js";
 import {
   filterSelectableAgentModels,
   type AgentClient,
+  type AgentProbeContext,
   type AgentCreateConfigParent,
   type AgentMode,
   type AgentModelDefinition,
@@ -235,7 +238,26 @@ interface ProviderSnapshotTarget {
   catalogScope: ProviderCatalogScope;
 }
 
+export interface ProviderProbeAdmission {
+  isOpen(): boolean;
+  run<T>(name: string, operation: (probe: AgentProbeContext) => Promise<T>): Promise<T>;
+}
+
 export class ProviderSnapshotManager {
+  private nativeWork: ProviderProbeAdmission | null = null;
+
+  bindNativeWork(admission: ProviderProbeAdmission): void {
+    if (this.nativeWork) throw new Error("Provider native-work admission already bound");
+    this.nativeWork = admission;
+  }
+
+  private runNativeProbe<T>(
+    name: string,
+    operation: (probe: AgentProbeContext) => Promise<T>,
+  ): Promise<T> {
+    return this.nativeWork ? this.nativeWork.run(name, operation) : new AgentProbe().run(operation);
+  }
+
   private readonly catalogs = new Map<string, Map<AgentProvider, ProviderCatalog>>();
   private readonly targets = new Map<string, Target>();
   private readonly events = new EventEmitter();
@@ -549,6 +571,7 @@ export class ProviderSnapshotManager {
   }
 
   async getProviderDiagnostic(provider: AgentProvider): Promise<ProviderDiagnosticResult> {
+    if (this.nativeWork && !this.nativeWork.isOpen()) throw new RestartInProgressError();
     const definition = this.generation.definitions[provider];
     if (!definition) {
       return {
@@ -793,12 +816,14 @@ export class ProviderSnapshotManager {
       const client = this.ensureClient(provider, definition);
       if (client.getDiagnostic) {
         return (
-          await withTimeout(
-            client.getDiagnostic(),
-            this.diagnosticTimeoutMs,
-            `Timed out collecting ${definition.label ?? provider} diagnostic after ${
-              this.diagnosticTimeoutMs
-            }ms`,
+          await this.runNativeProbe(`diagnostic:${provider}`, (probe) =>
+            withTimeout(
+              client.getDiagnostic!(probe),
+              this.diagnosticTimeoutMs,
+              `Timed out collecting ${definition.label ?? provider} diagnostic after ${
+                this.diagnosticTimeoutMs
+              }ms`,
+            ),
           )
         ).diagnostic;
       }
@@ -882,7 +907,12 @@ export class ProviderSnapshotManager {
   }
 
   private loadProvider(options: ProviderLoadOptions & { provider: AgentProvider }): Promise<void> {
-    if (this.destroyed || !this.generation.definitions[options.provider]) return Promise.resolve();
+    if (
+      this.destroyed ||
+      (this.nativeWork && !this.nativeWork.isOpen()) ||
+      !this.generation.definitions[options.provider]
+    )
+      return Promise.resolve();
     const { bindings } = this.getOrCreateTarget(options.snapshotCwd);
     const binding: CatalogBinding = {
       key: bindings.get(options.provider)?.key,
@@ -957,6 +987,10 @@ export class ProviderSnapshotManager {
       .get(provider)!
       .discoveryLimit(() => {
         if (!isCurrent()) return;
+        if (this.nativeWork && !this.nativeWork.isOpen()) {
+          current.stale = true;
+          return;
+        }
         return this.refreshProvider({
           catalogOptions,
           provider,
@@ -999,23 +1033,26 @@ export class ProviderSnapshotManager {
     } = options;
 
     try {
-      const catalog = await runProviderRefreshWithDeadline({
-        label: definition.label,
-        timeoutMs: this.refreshTimeoutMs,
-        operation: async (context) => {
-          const available = await context.runActivity("availability", () =>
-            raceProviderRefreshAbort(
-              context.signal,
-              client.isAvailable(context.signal, catalogOptions),
-            ),
-          );
-          if (!available) {
-            return null;
-          }
+      const catalog = await this.runNativeProbe(`catalog:${provider}`, (probe) =>
+        runProviderRefreshWithDeadline({
+          probe,
+          label: definition.label,
+          timeoutMs: this.refreshTimeoutMs,
+          operation: async (context) => {
+            const available = await context.runActivity("availability", () =>
+              raceProviderRefreshAbort(
+                context.signal,
+                client.isAvailable(context.signal, catalogOptions),
+              ),
+            );
+            if (!available) {
+              return null;
+            }
 
-          return await definition.fetchCatalog(catalogOptions, client, context);
-        },
-      });
+            return await definition.fetchCatalog(catalogOptions, client, context);
+          },
+        }),
+      );
       if (!catalog) {
         setEntry({ ...base, status: "unavailable", enabled: true });
         return;

@@ -4,7 +4,10 @@ import type { AgentClient, AgentSession, AgentStreamEvent } from "../agent/agent
 import { createTestAgentClient } from "./fake-agent-client.js";
 
 /** Deterministic provider boundary; the daemon, sockets, and checkpoint files remain real. */
-export function createCheckpointAgentClient(logFile?: string): AgentClient {
+export function createCheckpointAgentClient(
+  logFile?: string,
+  testOptions?: { keepResumedActive?: boolean },
+): AgentClient {
   const base = createTestAgentClient("codex", { supportsMcpServers: true });
   const attach = (session: AgentSession, resumed: boolean): AgentSession => {
     const listeners = new Set<(event: AgentStreamEvent) => void>();
@@ -49,7 +52,7 @@ export function createCheckpointAgentClient(logFile?: string): AgentClient {
         turnId,
         item: { type: "assistant_message", text: resumed ? "continued-output" : "partial-output" },
       });
-      if (resumed || text === "finish") {
+      if ((resumed && !testOptions?.keepResumedActive) || text === "finish") {
         emit({ type: "turn_completed", provider: "codex", turnId });
         active = undefined;
       }

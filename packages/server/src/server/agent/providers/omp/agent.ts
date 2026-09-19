@@ -1,3 +1,5 @@
+import { JsonlRpcTransportClosedError } from "../jsonl-rpc-process.js";
+import { ProviderInitializationCleanupError } from "../../provider-initialization-cleanup-error.js";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -8,6 +10,8 @@ import stripAnsi from "strip-ansi";
 import {
   type AgentCapabilityFlags,
   type AgentClient,
+  type AgentCreateSessionOptions,
+  type AgentProbeContext,
   type AgentFeature,
   type AgentLaunchContext,
   type AgentMetadata,
@@ -875,6 +879,8 @@ export class OmpAgentSession implements AgentSession {
   private readonly noTurnScheduler: OmpNoTurnScheduler;
   private readonly usagePoller: OmpUsagePoller;
   private closed = false;
+  private interruptCompletion: Promise<void> | null = null;
+  private closePromise: Promise<void> | null = null;
   private live: boolean;
   private readonly emittedUserMessageIds = new Set<string>();
 
@@ -951,6 +957,8 @@ export class OmpAgentSession implements AgentSession {
   }
 
   async startTurn(prompt: AgentPromptInput, options?: AgentRunOptions): Promise<StartTurnResult> {
+    if (this.closed) throw new Error("OMP session is closed");
+    if (this.interruptCompletion) throw new Error("OMP is still stopping the previous turn");
     if (this.activeTurnId) {
       throw new Error("An OMP turn is already active");
     }
@@ -972,6 +980,7 @@ export class OmpAgentSession implements AgentSession {
     void (async () => {
       try {
         const ack = await this.runtimeSession.prompt(payload.text, payload.images);
+        if (this.activeTurnId !== turnId) return;
         this.activePromptRequestId = ack.requestId ?? null;
         const correlatedResult = ack.requestId
           ? this.pendingPromptResults.get(ack.requestId)
@@ -989,6 +998,7 @@ export class OmpAgentSession implements AgentSession {
           return;
         }
       } catch (error) {
+        if (this.closed && error instanceof JsonlRpcTransportClosedError) return;
         if (this.activeTurnId !== turnId) {
           return;
         }
@@ -1120,7 +1130,27 @@ export class OmpAgentSession implements AgentSession {
     };
   }
 
-  async interrupt(): Promise<void> {
+  interrupt(): Promise<void> {
+    if (!this.interruptCompletion) {
+      // OMP's abort response follows waitForIdle and invalidates its pending
+      // prompt generation. Keep successors out until that response settles.
+      const completion = Promise.resolve().then(() => this.interruptDispatchedTurn());
+      this.interruptCompletion = completion;
+      void completion.then(
+        () => {
+          if (this.interruptCompletion === completion) this.interruptCompletion = null;
+          return undefined;
+        },
+        () => {
+          if (this.interruptCompletion === completion) this.interruptCompletion = null;
+          return undefined;
+        },
+      );
+    }
+    return this.interruptCompletion;
+  }
+
+  private async interruptDispatchedTurn(): Promise<void> {
     const turnId = this.activeTurnId;
     await this.runtimeSession.abort();
     if (turnId && this.activeTurnId === turnId) {
@@ -1155,18 +1185,40 @@ export class OmpAgentSession implements AgentSession {
     this.activeToolCalls.clear();
   }
 
-  async close(): Promise<void> {
-    if (this.closed) {
-      return;
+  close(): Promise<void> {
+    if (!this.closePromise) {
+      const attempt = this.closeSession();
+      this.closePromise = attempt;
+      void attempt.catch(() => {
+        if (this.closePromise === attempt) this.closePromise = null;
+      });
     }
+    return this.closePromise;
+  }
+
+  private async closeSession(): Promise<void> {
     this.closed = true;
     this.usagePoller.close();
     this.cancelNoTurnPromptCompletion();
-    try {
-      await this.runtimeSession.close();
-    } finally {
-      this.clearOmpSessionState();
+    await this.runtimeSession.close();
+    if (this.activeTurnId || this.activeTurnStarted) {
+      const turnId = this.activeTurnId ?? undefined;
+      this.terminalizeActiveWork();
+      this.activeTurnId = null;
+      this.activeClientMessageId = null;
+      this.activeTurnStarted = false;
+      this.activeTurnHasUserMessage = false;
+      this.activeAssistantMessageId = null;
+      this.activeTurnTerminalAssistantMessage = null;
+      this.clearNoTurnBuffers();
+      this.emit({
+        type: "turn_canceled",
+        provider: this.provider,
+        turnId,
+        reason: "session closed",
+      });
     }
+    this.clearOmpSessionState();
   }
 
   private clearOmpSessionState(): void {
@@ -1778,6 +1830,8 @@ export class OmpAgentSession implements AgentSession {
   }
 
   private handleProcessExit(error: string): void {
+    // Preserve the turn through final stdout while close certifies cessation.
+    if (this.closed) return;
     this.usagePoller.stopTurn();
     this.terminalizeActiveWork();
     this.subagentIndex.clear(this.runtimeSession);
@@ -1874,28 +1928,41 @@ export class OmpAgentSession implements AgentSession {
           },
         });
         return;
-      case "agent_end": {
-        const messages = event.messages ?? [];
-        let terminalMessages: OmpAgentMessage[] | null = null;
-        if (messages.some((message) => message.role === "assistant")) {
-          terminalMessages = messages;
-        } else if (this.activeTurnTerminalAssistantMessage) {
-          terminalMessages = [this.activeTurnTerminalAssistantMessage];
-        }
-        // OMP can end an internal extension-notice cycle before it starts the
-        // model turn for the same prompt. Ignore only cycles where neither the
-        // terminal payload nor the live stream contained an assistant message.
-        if (!terminalMessages) {
-          return;
-        }
-        // A state request is processed after OMP's RPC loop becomes promptable,
-        // so do not advertise Paseo idle until it reports that transition.
-        void this.completeTurnAfterProviderIdle(turnId, terminalMessages);
+      case "agent_end":
+        this.handleAgentEnd(turnId, event.messages ?? []);
         return;
-      }
       default:
         return;
     }
+  }
+
+  private handleAgentEnd(turnId: string | undefined, messages: OmpAgentMessage[]): void {
+    let terminalMessages: OmpAgentMessage[] | null = null;
+    if (messages.some((message) => message.role === "assistant")) {
+      terminalMessages = messages;
+    } else if (this.activeTurnTerminalAssistantMessage) {
+      terminalMessages = [this.activeTurnTerminalAssistantMessage];
+    }
+    // OMP can end an internal extension-notice cycle before it starts the
+    // model turn for the same prompt. Ignore only cycles where neither the
+    // terminal payload nor the live stream contained an assistant message.
+    if (!terminalMessages) {
+      return;
+    }
+    if (this.closed) {
+      if (!this.activeTurnId && !this.activeTurnStarted) return;
+      // No successor can start during close. Preserve genuine native
+      // outcomes without an idle RPC over the closing transport; owned
+      // abort stays attributed until close actually certifies cessation.
+      const terminal = terminalMessages.findLast((message) => message.role === "assistant");
+      if (terminal?.stopReason?.toLowerCase() !== "aborted") {
+        this.completeTurn(turnId, terminalMessages);
+      }
+      return;
+    }
+    // A state request is processed after OMP's RPC loop becomes promptable,
+    // so do not advertise Paseo idle until it reports that transition.
+    void this.completeTurnAfterProviderIdle(turnId, terminalMessages);
   }
 
   private handleToolExecutionEnd(
@@ -2233,10 +2300,15 @@ export class OmpAgentClient implements AgentClient {
   async createSession(
     config: AgentSessionConfig,
     launchContext?: AgentLaunchContext,
+    options?: AgentCreateSessionOptions,
   ): Promise<AgentSession> {
+    const probe = options?.probe;
+    probe?.signal.throwIfAborted();
     const launchMode = this.resolveLaunchMode(config.modeId);
     const runtimeSession = await this.runtime.startSession({
       cwd: config.cwd,
+      signal: probe?.signal,
+      probe,
       protocolMode: "rpc-ui",
       model: config.model,
       thinkingOptionId: normalizeOmpThinkingOption(config.thinkingOptionId) ?? undefined,
@@ -2246,7 +2318,9 @@ export class OmpAgentClient implements AgentClient {
       systemPrompt: composeSystemPromptParts(config.systemPrompt, config.daemonAppendSystemPrompt),
       env: launchContext?.env,
     });
+    probe?.own(runtimeSession);
     try {
+      probe?.signal.throwIfAborted();
       await this.configureNativePaseoTools(runtimeSession, launchContext?.paseoTools);
       return new OmpAgentSession({
         runtimeSession,
@@ -2261,7 +2335,11 @@ export class OmpAgentClient implements AgentClient {
         paseoTools: launchContext?.paseoTools,
       });
     } catch (error) {
-      await runtimeSession.close().catch(() => undefined);
+      try {
+        await runtimeSession.close();
+      } catch (cleanupError) {
+        throw new ProviderInitializationCleanupError(runtimeSession, error, cleanupError);
+      }
       throw error;
     }
   }
@@ -2304,7 +2382,11 @@ export class OmpAgentClient implements AgentClient {
         live: false,
       });
     } catch (error) {
-      await runtimeSession.close().catch(() => undefined);
+      try {
+        await runtimeSession.close();
+      } catch (cleanupError) {
+        throw new ProviderInitializationCleanupError(runtimeSession, error, cleanupError);
+      }
       throw error;
     }
   }
@@ -2315,12 +2397,7 @@ export class OmpAgentClient implements AgentClient {
   ): Promise<ProviderCatalog> {
     const launchMode = this.resolveLaunchMode(undefined);
     let runtimeSession: OmpRuntimeSession | undefined;
-    let closePromise: Promise<void> | undefined;
-    const closeSession = () => {
-      if (!runtimeSession) return Promise.resolve();
-      closePromise ??= runtimeSession.close();
-      return closePromise;
-    };
+    const closeSession = () => runtimeSession?.close() ?? Promise.resolve();
     const handleAbort = () => void closeSession().catch(() => undefined);
     context?.signal.addEventListener("abort", handleAbort, { once: true });
     try {
@@ -2331,7 +2408,9 @@ export class OmpAgentClient implements AgentClient {
           modeId: launchMode.modeId,
           extraArgs: launchMode.extraArgs,
           signal: context?.signal,
+          probe: context?.probe,
         });
+        context?.probe?.own(runtimeSession);
         if (context?.signal.aborted) await closeSession();
       });
       if (!runtimeSession) throw new Error("OMP catalog runtime did not start");
@@ -2385,11 +2464,13 @@ export class OmpAgentClient implements AgentClient {
     }
   }
 
-  async getDiagnostic(): Promise<{ diagnostic: string }> {
+  async getDiagnostic(probe?: AgentProbeContext): Promise<{ diagnostic: string }> {
+    probe?.signal.throwIfAborted();
     try {
       const launch = await this.resolveOmpLaunch();
       const availability = await checkProviderLaunchAvailable(launch);
       const binaryRows = await buildBinaryDiagnosticRows(launch, availability, {
+        probe,
         versionCommand: {
           command: availability.resolvedPath ?? launch.command,
           args: [...launch.args, "--version"],
@@ -2406,6 +2487,7 @@ export class OmpAgentClient implements AgentClient {
         diagnostic: formatProviderDiagnostic("Oh My Pi (OMP)", [
           ...(await buildCommandResolutionDiagnosticRows(launch, {
             knownBinaryNames: ["omp", launch.command],
+            probe,
             pathValue: env.PATH ?? env.Path,
           })),
           ...binaryRows,
@@ -2427,6 +2509,8 @@ export class OmpAgentClient implements AgentClient {
         ]),
       };
     } catch (error) {
+      probe?.signal.throwIfAborted();
+      if (error instanceof ProviderInitializationCleanupError) throw error;
       this.logger.debug({ err: error }, "OMP diagnostic lookup failed");
       return {
         diagnostic: formatProviderDiagnosticError("Oh My Pi (OMP)", error),

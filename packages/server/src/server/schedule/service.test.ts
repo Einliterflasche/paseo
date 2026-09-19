@@ -21,6 +21,7 @@ import type {
   AgentStreamEvent,
 } from "../agent/agent-sdk-types.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
+import { createCheckpointAgentClient } from "../test-utils/checkpoint-agent-client.js";
 import { validateProviderOptions } from "../agent/provider-options.js";
 import { ClaudeProviderOptionsSchema } from "../agent/providers/claude/options.js";
 import { createTestLogger } from "../../test-utils/test-logger.js";
@@ -41,6 +42,7 @@ import {
   type ScheduleServiceOptions,
 } from "./service.js";
 import { ScheduleStore } from "./store.js";
+import type { AgentRunOutcome } from "../agent/agent-run-state.js";
 import type { ScheduleExecutionResult, StoredSchedule } from "@getpaseo/protocol/schedule/types";
 
 interface ScheduleServiceInternals {
@@ -314,6 +316,70 @@ describe("ScheduleService", () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
+  test("startup releases the shared recovery pause before due work can run", async () => {
+    const manager = new AgentManager({ logger: createTestLogger() });
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: manager,
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner: async () => ({ agentId: null, output: "started" }),
+    });
+    await manager.freezeRestartAdmissions();
+    await service.pauseForRestart();
+    manager.openRestartAdmissions();
+    await service.start();
+    try {
+      const schedule = await service.create({
+        prompt: "after fresh boot",
+        cadence: { type: "every", everyMs: 60_000 },
+        target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+      });
+      now = new Date(now.getTime() + 60_000);
+      await service.tick();
+      expect((await service.inspect(schedule.id)).runs[0]).toMatchObject({
+        status: "succeeded",
+        output: "started",
+      });
+    } finally {
+      await service.stop();
+    }
+  });
+
+  test("direct schedule mutations share the manager admission barrier", async () => {
+    const manager = new AgentManager({ logger: createTestLogger() });
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: manager,
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner: async () => ({ agentId: null, output: "must not run" }),
+    });
+    const input = {
+      prompt: "preserved",
+      cadence: { type: "every" as const, everyMs: 60_000 },
+      target: { type: "new-agent" as const, config: { provider: "claude", cwd: tempDir } },
+    };
+    const schedule = await service.create(input);
+    await manager.freezeRestartAdmissions();
+    for (const operation of [
+      () => service.create(input),
+      () => service.createOrReplace(input),
+      () => service.pause(schedule.id),
+      () => service.resume(schedule.id),
+      () => service.update({ id: schedule.id, prompt: "changed" }),
+      () => service.delete(schedule.id),
+      () => service.runOnce(schedule.id),
+    ]) {
+      await expect(operation()).rejects.toBeInstanceOf(RestartInProgressError);
+    }
+    expect(await service.inspect(schedule.id)).toEqual(schedule);
+  });
+
   test("ticks due schedules and records run history on disk", async () => {
     const service = createScheduleService({
       paseoHome: tempDir,
@@ -464,7 +530,7 @@ describe("ScheduleService", () => {
     );
   });
 
-  test("delivers agent-target schedules through the steer-or-interrupt path", async () => {
+  test("agent-target schedules start their own logical run without steering a different turn", async () => {
     const manager = new AgentManager({
       logger: createTestLogger(),
       clients: createTestAgentClients(),
@@ -474,6 +540,7 @@ describe("ScheduleService", () => {
       workspaceId: undefined,
     });
     const steerOrReplace = vi.spyOn(manager, "steerOrReplaceActiveTurn");
+    const stream = vi.spyOn(manager, "streamAgent");
     const service = createScheduleService({
       paseoHome: tempDir,
       logger: createTestLogger(),
@@ -490,11 +557,11 @@ describe("ScheduleService", () => {
 
     await service.runOnce(schedule.id);
 
-    expect(steerOrReplace).toHaveBeenCalledTimes(1);
-    expect(steerOrReplace.mock.calls[0]).toEqual([
+    expect(steerOrReplace).not.toHaveBeenCalled();
+    expect(stream.mock.calls[0]).toEqual([
       agent.id,
       expect.stringContaining(`Schedule fired (id=${schedule.id}, run=`),
-      undefined,
+      { clientMessageId: (await service.inspect(schedule.id)).runs[0]!.id },
     ]);
   });
 
@@ -750,9 +817,11 @@ describe("ScheduleService", () => {
       runOnCreate: false,
     });
 
-    await expect(
-      (service as unknown as ScheduleServiceInternals).executeSchedule(created, "run-create-fails"),
-    ).rejects.toThrow("provider misconfigured");
+    await service.runOnce(created.id);
+    expect((await service.inspect(created.id)).runs[0]).toMatchObject({
+      status: "failed",
+      error: "provider misconfigured",
+    });
 
     expect(await workspaceRegistry.list()).toEqual([
       expect.objectContaining({
@@ -875,6 +944,7 @@ describe("ScheduleService", () => {
       clients: createTestAgentClients(),
       registry: agentStorage,
     });
+    manager.waitForAgentRunStart = async () => {};
     manager.runAgent = async (_agentId, prompt) => {
       runPrompts.push(prompt);
       return {
@@ -945,6 +1015,7 @@ describe("ScheduleService", () => {
       clients: createTestAgentClients(),
       registry: agentStorage,
     });
+    manager.waitForAgentRunStart = async () => {};
     manager.runAgent = async () => {
       runCount += 1;
       return runCount === 1
@@ -1026,6 +1097,7 @@ describe("ScheduleService", () => {
       clients: createTestAgentClients(),
       registry: agentStorage,
     });
+    manager.waitForAgentRunStart = async () => {};
     manager.runAgent = async () => ({
       sessionId: "scheduled-canceled-run",
       finalText: "",
@@ -1094,6 +1166,7 @@ describe("ScheduleService", () => {
       clients: createTestAgentClients(),
       registry: agentStorage,
     });
+    manager.waitForAgentRunStart = async () => {};
     manager.runAgent = async () => {
       throw new Error("run exploded");
     };
@@ -1148,13 +1221,19 @@ describe("ScheduleService", () => {
     expect(warn).toHaveBeenCalledWith(
       expect.objectContaining({
         err: archiveError,
-        agentId,
         workspaceId: expect.stringMatching(/^wks_/),
         scheduleId: created.id,
         runId: expect.any(String),
       }),
-      expect.stringContaining("Failed to archive scheduled workspace"),
+      expect.stringContaining("Schedule archive remains pending"),
     );
+    expect((await service.snapshotForRestart()).archives).toEqual([
+      {
+        scheduleId: created.id,
+        runId: inspected.runs[0]!.id,
+        workspaceId: inspected.runs[0]!.workspaceId,
+      },
+    ]);
   });
 
   test("shows scheduled new-agent prompts as normal user turns", async () => {
@@ -1194,7 +1273,10 @@ describe("ScheduleService", () => {
         };
       }
 
-      async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+      async startTurn(
+        prompt: AgentPromptInput,
+        options?: AgentRunOptions,
+      ): Promise<{ turnId: string }> {
         const turnId = `turn-${++this.turnCount}`;
         const textPrompt = typeof prompt === "string" ? prompt : JSON.stringify(prompt);
         setImmediate(() => {
@@ -1203,7 +1285,11 @@ describe("ScheduleService", () => {
             type: "timeline",
             provider: this.provider,
             turnId,
-            item: { type: "user_message", text: textPrompt },
+            item: {
+              type: "user_message",
+              text: textPrompt,
+              clientMessageId: options?.clientMessageId,
+            },
           });
           this.emit({
             type: "timeline",
@@ -3345,6 +3431,7 @@ describe("ScheduleService", () => {
     // Go through the real executeSchedule flow (default runner) so the run
     // record has an agentId recorded before the suspension, the way a real
     // restart interruption would find it mid-turn.
+    agentManager.waitForAgentRunStart = async () => {};
     agentManager.runAgent = (async () => {
       throw new AgentRestartSuspendedError(agentId);
     }) as AgentManager["runAgent"];
@@ -3394,15 +3481,13 @@ describe("ScheduleService", () => {
     // same on-disk store, with restoreAfterRestart() called before start().
     const restoredRunner = vi.fn();
     const restoredCreateAgent = vi.fn();
-    Reflect.set(
-      agentManager,
-      "waitForAgentEvent",
-      vi.fn(async () => ({
-        status: "idle" as const,
-        permission: null,
-        lastMessage: "done after restart",
-      })),
-    );
+    let publishOutcome: ((outcome: AgentRunOutcome) => void) | undefined;
+    vi.spyOn(agentManager, "subscribeRunOutcome").mockImplementation((_agentId, callback) => {
+      publishOutcome = callback;
+      return () => {
+        publishOutcome = undefined;
+      };
+    });
     const restoredService = createScheduleService({
       paseoHome: tempDir,
       logger: createTestLogger(),
@@ -3422,6 +3507,12 @@ describe("ScheduleService", () => {
       expect(afterStart.runs[0].status).toBe("running");
 
       restoredService.resumeRestoredRuns();
+      publishOutcome?.({
+        type: "completed",
+        agentId,
+        runId: snapshot.runs[0]!.logicalRunId!,
+        lastMessage: "done after restart",
+      });
       await vi.waitFor(async () => {
         const after = await restoredService.inspect(created.id);
         expect(after.runs[0].status).toBe("succeeded");
@@ -3534,17 +3625,12 @@ describe("ScheduleService", () => {
   test("controlled restart: existing-agent target records agentId before admission so snapshotForRestart can checkpoint it", async () => {
     const manager = new AgentManager({
       logger: createTestLogger(),
-      clients: createTestAgentClients(),
+      clients: { codex: createCheckpointAgentClient() },
       registry: agentStorage,
     });
-    const agent = await manager.createAgent({ provider: "claude", cwd: tempDir }, undefined, {
+    const agent = await manager.createAgent({ provider: "codex", cwd: tempDir }, undefined, {
       workspaceId: undefined,
     });
-    Reflect.set(
-      manager,
-      "waitForAgentEvent",
-      vi.fn(() => new Promise(() => {})), // never settles: stays "mid-turn"
-    );
     const service = createScheduleService({
       paseoHome: tempDir,
       logger: createTestLogger(),
@@ -3559,16 +3645,27 @@ describe("ScheduleService", () => {
       target: { type: "agent", agentId: agent.id },
     });
 
-    void service.runOnce(created.id);
+    const completion = service.runOnce(created.id);
     await vi.waitFor(async () => {
       const inspected = await service.inspect(created.id);
       expect(inspected.runs[0]?.agentId).toBe(agent.id);
+      expect(manager.hasInFlightRun(agent.id)).toBe(true);
     });
 
+    await Promise.all([manager.freezeRestartAdmissions(), service.pauseForRestart()]);
+    await manager.quiesceRestartExecution();
+    await completion;
     const snapshot = await service.snapshotForRestart();
     expect(snapshot.runs).toEqual([
-      expect.objectContaining({ scheduleId: created.id, agentId: agent.id }),
+      expect.objectContaining({
+        scheduleId: created.id,
+        agentId: agent.id,
+        logicalRunId: manager.getRunIdentity(agent.id),
+      }),
     ]);
+    expect((await service.inspect(created.id)).runs[0]?.status).toBe("running");
+    await service.stop();
+    await manager.closeAgentsForShutdown();
   });
 
   test("controlled restart: pauseForRestart's drain covers appendRunningRun's own store write, not just runner()", async () => {
@@ -3719,10 +3816,15 @@ describe("ScheduleService", () => {
       const agentId = "55555555-5555-4555-8555-555555555555";
       const runId = "66666666-6666-4666-8666-666666666666";
       const manager = new AgentManager({ logger: createTestLogger() });
-      const wait = vi.spyOn(manager, "waitForAgentEvent").mockImplementation(async () => {
-        if (outcome === "suspended") throw new AgentRestartSuspendedError(agentId);
-        return { status: "idle", permission: null, lastMessage: "finished" };
-      });
+      let publishOutcome: ((outcome: AgentRunOutcome) => void) | undefined;
+      const wait = vi
+        .spyOn(manager, "subscribeRunOutcome")
+        .mockImplementation((_agentId, callback) => {
+          publishOutcome = callback;
+          return () => {
+            publishOutcome = undefined;
+          };
+        });
       const archiveWorkspace = vi.fn(async () => {});
       const runner = vi.fn(async () => ({ agentId, output: "unexpected second run" }));
       const service = createScheduleService({
@@ -3763,6 +3865,7 @@ describe("ScheduleService", () => {
             runId,
             agentId,
             workspaceId: "wks_restored",
+            logicalRunId: runId,
             manual: true,
           },
         ],
@@ -3770,12 +3873,18 @@ describe("ScheduleService", () => {
       service.restoreAfterRestart(snapshot);
       // A transient failure must not trigger a contradictory second write that succeeds.
       const update = vi.spyOn(ScheduleStore.prototype, "update");
-      if (outcome === "write failed") update.mockRejectedValueOnce(new Error("disk unavailable"));
+      if (outcome === "write failed") update.mockRejectedValue(new Error("disk unavailable"));
       service.resumeRestoredRuns();
+      publishOutcome?.({
+        type: outcome === "suspended" ? "suspended" : "completed",
+        agentId,
+        runId,
+        lastMessage: "finished",
+      });
       await vi.waitFor(() => expect(wait).toHaveBeenCalledOnce());
       if (outcome === "write failed") {
         await expect(service.snapshotForRestart()).rejects.toThrow(/failed to persist/);
-        expect(update).toHaveBeenCalledOnce();
+        expect(update).toHaveBeenCalled();
       } else {
         expect(await service.snapshotForRestart()).toEqual(snapshot);
         expect(update).not.toHaveBeenCalled();
@@ -3788,7 +3897,7 @@ describe("ScheduleService", () => {
     },
   );
 
-  test("controlled restart: a failed terminal write is never silently rewritten as a different outcome, and blocks snapshotForRestart", async () => {
+  test("controlled restart: a failed terminal write retains its decision and retries that same outcome before checkpointing", async () => {
     const originalUpdate = ScheduleStore.prototype.update;
     let appendSeen = false;
     const updateSpy = vi
@@ -3803,7 +3912,10 @@ describe("ScheduleService", () => {
         appendSeen = true;
         return originalUpdate.apply(this, args);
       });
-    const runner = vi.fn(async () => ({ agentId: "agent-succeeded", output: "real success" }));
+    const runner = vi.fn(async () => ({
+      agentId: "00000000-0000-0000-0000-000000000001",
+      output: "real success",
+    }));
     const service = createScheduleService({
       paseoHome: tempDir,
       logger: createTestLogger(),
@@ -3829,8 +3941,117 @@ describe("ScheduleService", () => {
     expect(inspected.runs[0]?.status).toBe("running");
     await expect(service.runOnce(created.id)).rejects.toThrow("already running");
 
-    await expect(service.snapshotForRestart()).rejects.toThrow(
-      /failed to persist its terminal state/,
-    );
+    expect(await service.snapshotForRestart()).toEqual({ runs: [] });
+    expect((await service.inspect(created.id)).runs[0]).toMatchObject({
+      status: "succeeded",
+      output: "real success",
+      error: null,
+    });
+  });
+
+  test("terminal bookkeeping retry never advances cadence twice after a committed outcome", async () => {
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner: async () => ({ agentId: null, output: "durable success" }),
+    });
+    const created = await service.create({
+      prompt: "one due run",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+    const originalGet = ScheduleStore.prototype.get;
+    let failedAfterCommit = false;
+    let committed: StoredSchedule | null = null;
+    const read = vi.spyOn(ScheduleStore.prototype, "get").mockImplementation(async function (
+      this: ScheduleStore,
+      ...args
+    ) {
+      const value = await originalGet.apply(this, args);
+      if (!failedAfterCommit && value?.runs[0]?.status === "succeeded") {
+        failedAfterCommit = true;
+        committed = value;
+        throw new Error("post-commit bookkeeping read failed");
+      }
+      return value;
+    });
+    now = new Date(created.nextRunAt!);
+    await service.tick();
+    read.mockRestore();
+    expect(failedAfterCommit).toBe(true);
+    await expect(service.runOnce(created.id)).rejects.toThrow("already running");
+    expect(await service.snapshotForRestart()).toEqual({ runs: [] });
+    expect(await service.inspect(created.id)).toEqual(committed);
+    await service.stop();
+  });
+
+  test("snapshot drains its original terminal completion after the agent starts a newer run", async () => {
+    const resultHeld = Promise.withResolvers<void>();
+    const releaseResult = Promise.withResolvers<void>();
+    class DelayedResultManager extends AgentManager {
+      override async runAgent(
+        ...args: Parameters<AgentManager["runAgent"]>
+      ): Promise<AgentRunResult> {
+        const result = await super.runAgent(...args);
+        resultHeld.resolve();
+        await releaseResult.promise;
+        return result;
+      }
+    }
+    const manager = new DelayedResultManager({
+      logger: createTestLogger(),
+      clients: { codex: createCheckpointAgentClient() },
+      registry: agentStorage,
+    });
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: manager,
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+    });
+    const created = await service.create({
+      prompt: "finish",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "new-agent", config: { provider: "codex", cwd: tempDir } },
+    });
+    const completion = service.runOnce(created.id);
+    await resultHeld.promise;
+    const run = (await service.inspect(created.id)).runs[0]!;
+    expect(run.agentId).toBeTruthy();
+    await manager
+      .streamAgent(run.agentId!, "new unrelated work", { clientMessageId: "new-run" })
+      .next();
+    await Promise.all([manager.freezeRestartAdmissions(), service.pauseForRestart()]);
+    await manager.quiesceRestartExecution();
+    expect(manager.getRunOutcome(run.agentId!)).toMatchObject({
+      type: "suspended",
+      runId: "new-run",
+    });
+    let snapshotted = false;
+    const snapshot = service.snapshotForRestart().then((value) => {
+      snapshotted = true;
+      return value;
+    });
+    await Promise.resolve();
+    expect(snapshotted).toBe(false);
+    releaseResult.resolve();
+    await completion;
+    expect(await snapshot).toEqual({
+      runs: [],
+      archives: [{ scheduleId: created.id, runId: run.id, workspaceId: run.workspaceId }],
+    });
+    expect((await service.inspect(created.id)).runs[0]).toMatchObject({
+      id: run.id,
+      status: "succeeded",
+      output: "partial-output",
+    });
+    await service.stop();
+    await manager.closeAgentsForShutdown();
   });
 });

@@ -97,15 +97,16 @@ does not update the running package; a squash with the same Git tree needs no
 service restart. Push the committed revision to `origin/fork` before deployment.
 
 What the CLI now owns is the activation step after that pin update: `paseo daemon
-deploy -- <activation argv>` prepares a checkpoint on the _running_ daemon, runs the
+deploy --target-cli <replacement-paseo> -- <activation argv>` prepares a checkpoint on the _running_ daemon, runs the
 given argv (executed directly, no shell) only once that checkpoint is ready, and only
 reports success once the replacement daemon confirms it is running that exact
 checkpoint generation. It never runs the activation command without a ready
-generation, never force-kills anything on failure, and serializes concurrent deploys
+generation validated by the replacement package, never force-kills anything on failure, and serializes concurrent deploys
 with a `deploy.lock` file in `PASEO_HOME`. Investigate its owner if a previous attempt
 failed; never delete state to force a deployment through. `scripts/deploy-nixos.sh` wraps the whole sequence for a
 NixOS host: it builds the closure with `nixos-rebuild build` (never `switch` directly),
-then hands activation of that exact closure to `paseo daemon deploy --`. Only after
+then hands activation of that exact closure to `paseo daemon deploy`, with the closure's
+own Paseo executable as `--target-cli`. Only after
 the checkpoint succeeds does activation update the system profile and switch the
 configuration. If NixOS leaves the service unchanged, activation replaces the
 paused service once; if NixOS already replaced it, activation does not restart it again.
@@ -153,7 +154,66 @@ Success means the expected checkpoint generation is restored, agents continue th
 work, and the updated web UI reconnects. A process or open port alone is insufficient.
 The guarantee covers controlled restarts, not power loss, arbitrary crashes, or
 harness-native loops. Keep prior packages and state available for an inspected,
-schema-compatible rollback.
+compatible rollback. A package must support the offline `daemon checkpoint-check`
+command and read the prepared checkpoint's format before it can be activated.
+The preflight checks advertised formats before preparation, then validates the exact
+ready generation's checksum and schema without claiming it. Older packages that
+lack this command are rejected; do not flatten history or bypass preflight to use them.
+Recovery semantics also need the isolated handoff test; format acceptance alone is
+not rollback evidence.
+
+The package deployed before the systemic memory fix does not support that preflight
+or checkpoint format 3. Keep its archive for investigation; it is not a compatible
+rollback target. Until another validated package supports the current format, recovery
+means repairing forward while preserving the paused daemon and its checkpoint.
+
+Before handing deployment ownership to another agent, record the restored generation
+and its `running` state, compare each previously active agent's native session identity,
+confirm the web client reconnects, and observe a scheduled run complete. Save the
+daemon's existing memory metrics for the five minutes before activation and at one
+and five minutes afterward. Compare worker heap and RSS separately from the service
+cgroup, which includes provider subprocesses. Keep the 6144 MiB allowance until the
+post-deployment workload has been observed; a short healthy sample is not a long-run
+memory bound.
+
+## Deliberate recovery after an unexpected crash
+
+Use this only when a reachable paused daemon reports that its exact generation
+already completed restoration. That checkpoint predates work accepted afterward.
+Ordinary `--retry-recovery` cannot reconstruct the lost runtime from it. Failed
+controlled preparations, partially claimed generations, corrupt data, and incompatible
+formats do not qualify; keep them paused for repair.
+
+Inspect the retained checkpoint, daemon logs, current agent registry, native provider
+sessions, and schedule records first. Reconcile effects already performed by providers
+and confirm orphan provider execution has stopped. The command cannot discover or stop
+unknown workers from the dead process on your behalf.
+
+After accepting the unexpected-crash data loss, use the generation reported by the
+paused daemon and its actual state directory:
+
+```sh
+PASEO_HOME=/path/to/live-state paseo daemon restart \
+  --acknowledge-crash <reported-generation> --orphan-execution-reconciled
+```
+
+The acknowledgment also accepts these consequences: old checkpoint continuations are
+not replayed; native history is loaded when agents are later opened; Paseo-only system
+rows, client message identities, child descriptors, and pending finish notifications
+may be missing. Persisted running schedules are marked failed during reconciliation,
+even if their orphaned provider had completed. This is a manual recovery decision,
+not controlled-restart restoration.
+
+The same daemon stays running. It verifies the exact consumed generation, writes an
+attributed audit receipt, initializes current owners, and commits a successor containing
+that audit provenance before opening admissions. Check its reported `running` state and successor generation. All
+old checkpoint files remain available. A failed initialization uses ordinary
+`--retry-recovery` with the retained current state. A process death before the successor
+requires a fresh operator decision: audit receipts never authorize boot recovery.
+Another crash after success blocks against the new consumed generation.
+
+Never delete or rename `ready.json`, `claimed.json`, or `restored.json` to get past a
+failure, and never combine this operation with raw stop/start or `--force`.
 
 The migration requirements and release acceptance criteria are in
 [fork-requirements.md](fork-requirements.md). The checkpoint format and controlled-restart

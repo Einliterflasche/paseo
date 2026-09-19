@@ -8,6 +8,13 @@ export const ko: TranslationResources = {
       description:
         "저장된 기록을 보호하기 위해 Paseo가 에이전트 작업을 일시 중지했습니다. 작업을 계속하려면 호스트 운영자가 복구 오류를 해결해야 합니다.",
       generation: "체크포인트: {{generation}}",
+      stoppingTitle: "{{hostName}}의 복구 과정에서 작업을 중지하고 있습니다",
+      stoppingDescription:
+        "복구에 실패했습니다. Paseo가 영향을 받은 에이전트를 중지하고 출력을 보존하고 있습니다. 작업이 일시 중지되었는지는 아직 확인되지 않았습니다.",
+      blockedTitle: "{{hostName}}의 복구에 조치가 필요합니다",
+      blockedDescription:
+        "Paseo가 영향을 받은 모든 에이전트의 중지를 확인하지 못했습니다. 새 작업과 재시작이 차단되었습니다. 호스트 운영자가 오류를 해결한 후 복구를 다시 시도해야 합니다.",
+      affectedAgents: "영향을 받은 에이전트: {{agents}}",
     },
     back: "뒤로",
     loading: "불러오는 중...",

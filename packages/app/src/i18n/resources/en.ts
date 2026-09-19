@@ -5,6 +5,13 @@ export const en = {
       description:
         "Paseo has paused agent work to protect saved history. The host operator must resolve the recovery error before work can continue.",
       generation: "Checkpoint: {{generation}}",
+      stoppingTitle: "Recovery is stopping work on {{hostName}}",
+      stoppingDescription:
+        "Recovery failed. Paseo is stopping affected agents and preserving their output. Work is not yet confirmed paused.",
+      blockedTitle: "Recovery needs attention on {{hostName}}",
+      blockedDescription:
+        "Paseo could not confirm that all affected agents stopped. New work and restart are blocked. The host operator must resolve the error before retrying recovery.",
+      affectedAgents: "Affected agents: {{agents}}",
     },
     back: "Back",
     loading: "Loading...",

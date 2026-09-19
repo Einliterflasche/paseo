@@ -6,7 +6,12 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { once } from "node:events";
 import { expect, onTestFinished, test } from "vitest";
-import { runDeployCommand, type DeployCommandDependencies } from "./deploy.js";
+import {
+  runDeployCommand,
+  readTargetCheckpointFormats,
+  validateTargetCheckpoint,
+  type DeployCommandDependencies,
+} from "./deploy.js";
 import { tryConnectToDaemon } from "../../utils/client.js";
 import type { LocalDaemonState } from "./local-daemon.js";
 
@@ -112,6 +117,8 @@ function makeDeps(home: string, port: number): DeployCommandDependencies {
     connectReadiness: (target, timeoutMs) =>
       tryConnectToDaemon({ host: target, timeout: timeoutMs }),
     spawnActivation,
+    targetFormats: readTargetCheckpointFormats,
+    validateTarget: validateTargetCheckpoint,
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     now: () => Date.now(),
   };
@@ -148,7 +155,7 @@ test("deploy activation observes the ready generation before stopping, and the r
       // in through spawnActivation below.
       "__GENERATION__",
     ],
-    { home },
+    { home, targetCli: fileURLToPath(new URL("../../../bin/paseo", import.meta.url)) },
     {} as never,
     {
       ...deps,
@@ -197,7 +204,7 @@ test("deploy activation observes the ready generation before stopping, and the r
   } finally {
     await verify!.close();
   }
-});
+}, 60_000);
 
 test("a checkpoint generation mismatch aborts activation before the old process is touched", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-deploy-activation-mismatch-"));
@@ -224,7 +231,7 @@ test("a checkpoint generation mismatch aborts activation before the old process 
         String(daemon.child.pid),
         "generation-that-was-never-prepared",
       ],
-      { home },
+      { home, targetCli: fileURLToPath(new URL("../../../bin/paseo", import.meta.url)) },
       {} as never,
       deps,
     ),
@@ -242,7 +249,7 @@ test("a checkpoint generation mismatch aborts activation before the old process 
   } finally {
     await verify!.close();
   }
-});
+}, 60_000);
 
 test("a failed checkpoint never runs activation", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-deploy-activation-prepare-failure-"));
@@ -284,7 +291,7 @@ test("a failed checkpoint never runs activation", async () => {
         String(daemon.child.pid),
         "n/a",
       ],
-      { home },
+      { home, targetCli: fileURLToPath(new URL("../../../bin/paseo", import.meta.url)) },
       {} as never,
       deps,
     ),
@@ -300,4 +307,4 @@ test("a failed checkpoint never runs activation", async () => {
   } finally {
     await verify!.close();
   }
-});
+}, 60_000);

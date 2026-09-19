@@ -29,7 +29,7 @@ function createOmpChild(options?: {
   }) as OmpChild;
   child.kill = ((signal?: NodeJS.Signals | number) => {
     child.killedSignals.push(signal);
-    queueMicrotask(() => child.emit("exit", null, signal ?? null));
+    queueMicrotask(() => exitOmpChild(child, null, (signal ?? "SIGTERM") as NodeJS.Signals));
     return true;
   }) as ChildProcessWithoutNullStreams["kill"];
   // Real OMP writes a `ready` frame immediately after launch; the runtime waits
@@ -47,6 +47,15 @@ function createOmpChild(options?: {
     );
   }
   return child;
+}
+
+function exitOmpChild(child: OmpChild, code: number | null, signal: NodeJS.Signals | null): void {
+  child.exitCode = code;
+  child.signalCode = signal;
+  child.emit("exit", code, signal);
+  child.stdout.end();
+  child.stderr.end();
+  child.emit("close", code, signal);
 }
 
 function createRuntime(
@@ -99,6 +108,15 @@ function withoutRequestId(command: Record<string, unknown>): Record<string, unkn
 }
 
 describe("OMP CLI runtime", () => {
+  test("certifies an already-exited OMP process after pipe closure", async () => {
+    const child = createOmpChild();
+    const session = await createRuntime(child).startSession({ cwd: "/workspace/project" });
+    exitOmpChild(child, 7, null);
+    await session.close();
+    await session.close();
+    expect(child.killedSignals).toEqual([]);
+  });
+
   test("uses the configured RPC timeout and attributes the pending phase", async () => {
     vi.useFakeTimers();
     const child = createOmpChild();
@@ -336,7 +354,7 @@ describe("OMP CLI runtime", () => {
     const startup = createRuntime(child).startSession({ cwd: "/workspace/project" });
 
     child.stderr.write("startup exploded");
-    child.emit("exit", 7, null);
+    exitOmpChild(child, 7, null);
 
     await expect(startup).rejects.toThrow("startup exploded");
   });
@@ -345,7 +363,7 @@ describe("OMP CLI runtime", () => {
     const child = createOmpChild({ supportedProtocolVersions: [1, 2] });
     child.stdin.on("data", () => {
       child.stderr.write("negotiation exploded");
-      child.emit("exit", 8, null);
+      exitOmpChild(child, 8, null);
     });
 
     await expect(createRuntime(child).startSession({ cwd: "/workspace/project" })).rejects.toThrow(

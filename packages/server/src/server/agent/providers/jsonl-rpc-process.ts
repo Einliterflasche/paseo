@@ -2,7 +2,8 @@ import { type ChildProcess, type ChildProcessWithoutNullStreams } from "node:chi
 import type { Logger } from "pino";
 
 import { spawnProcess } from "../../../utils/spawn.js";
-import { terminateWithTreeKill } from "../../../utils/tree-kill.js";
+import { withTimeout } from "../../../utils/promise-timeout.js";
+import { terminateWithTreeKill, type ProcessTerminator } from "../../../utils/tree-kill.js";
 import { JsonlFrameDecoder } from "./jsonl-frame-decoder.js";
 export { supportsJsonlRpcProtocolV2 } from "./jsonl-frame-decoder.js";
 
@@ -17,6 +18,14 @@ export const JSONL_RPC_NO_TIMEOUT = null;
 const STDERR_BUFFER_LIMIT = 8192;
 const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 2_000;
 const FORCE_SHUTDOWN_TIMEOUT_MS = 1_000;
+
+/** Transport shutdown rejects RPC waits; it is not a provider turn-failure result. */
+export class JsonlRpcTransportClosedError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "JsonlRpcTransportClosedError";
+  }
+}
 
 export interface JsonlRpcLaunch {
   command: string;
@@ -52,6 +61,7 @@ export interface JsonlRpcProcessOptions {
   diagnosticName?: string;
   defaultRequestTimeoutMs?: number;
   spawn?: (launch: JsonlRpcLaunch) => ChildProcessWithoutNullStreams;
+  terminateProcess?: ProcessTerminator;
 }
 
 function assertChildWithPipes(
@@ -81,6 +91,9 @@ export class JsonlRpcProcess {
   private stderrBuffer = "";
   private nextRequestId = 1;
   private disposed = false;
+  private shutdownError: Error | null = null;
+  private closePromise: Promise<void> | null = null;
+  private readonly processClosed: Promise<void>;
   private readonly frameDecoder: JsonlFrameDecoder;
 
   constructor(private readonly options: JsonlRpcProcessOptions) {
@@ -95,6 +108,14 @@ export class JsonlRpcProcess {
       },
     });
     this.child = (options.spawn ?? spawnJsonlRpcProcess)(options.launch);
+    // exit certifies execution stopped; close additionally certifies that the
+    // inherited pipes have drained, including final timeline frames.
+    this.processClosed = new Promise((resolve) =>
+      this.child.once("close", () => {
+        if (this.shutdownError) this.failAll(this.shutdownError);
+        resolve();
+      }),
+    );
     this.child.stdout.on("data", (chunk) => {
       this.handleStdoutChunk(chunk.toString());
     });
@@ -111,14 +132,14 @@ export class JsonlRpcProcess {
       this.failAll(error instanceof Error ? error : new Error(String(error)));
     });
     this.child.on("exit", (code, signal) => {
-      const error = new Error(
+      const error = new JsonlRpcTransportClosedError(
         `${this.diagnosticName} process exited with code ${code ?? "null"} and signal ${signal ?? "null"}\n${this.stderrBuffer}`.trim(),
       );
       const exit = { code, signal, error };
       for (const subscriber of this.exitSubscribers) {
         subscriber(exit);
       }
-      this.failAll(error);
+      if (!this.shutdownError) this.failAll(error);
     });
   }
 
@@ -143,7 +164,9 @@ export class JsonlRpcProcess {
     if (this.disposed) {
       return {
         id: "",
-        promise: Promise.reject(new Error(`${this.diagnosticName} process is closed`)),
+        promise: Promise.reject(
+          new JsonlRpcTransportClosedError(`${this.diagnosticName} process is closed`),
+        ),
       };
     }
     const id = `req_${this.nextRequestId}`;
@@ -190,15 +213,33 @@ export class JsonlRpcProcess {
     }
   }
 
-  async close(error = new Error(`${this.diagnosticName} process is closed`)): Promise<void> {
-    if (this.disposed) return;
-    this.failAll(error);
+  close(shutdownReason = new Error(`${this.diagnosticName} process is closed`)): Promise<void> {
+    if (!this.closePromise) {
+      const attempt = this.closeProcess(shutdownReason);
+      this.closePromise = attempt;
+      void attempt.catch(() => {
+        if (this.closePromise === attempt) this.closePromise = null;
+      });
+    }
+    return this.closePromise;
+  }
+
+  private async closeProcess(error: Error): Promise<void> {
+    // Stop admission immediately, but let final native responses settle their
+    // own RPCs before transport shutdown rejects the remaining waits. An exit
+    // notification can precede final stdout; close is the pipe-drain boundary.
+    this.disposed = true;
+    this.shutdownError = error;
+    for (const pending of this.pending.values()) {
+      if (pending.timer) clearTimeout(pending.timer);
+      pending.timer = null;
+    }
     try {
       this.child.stdin.end();
     } catch {
       // Ignore cleanup races.
     }
-    const result = await terminateWithTreeKill(this.child, {
+    const result = await (this.options.terminateProcess ?? terminateWithTreeKill)(this.child, {
       gracefulTimeoutMs: GRACEFUL_SHUTDOWN_TIMEOUT_MS,
       forceTimeoutMs: FORCE_SHUTDOWN_TIMEOUT_MS,
       onForceSignal: () => {
@@ -209,11 +250,14 @@ export class JsonlRpcProcess {
       },
     });
     if (result === "kill-timeout") {
-      this.options.logger.warn(
-        { timeoutMs: FORCE_SHUTDOWN_TIMEOUT_MS },
-        `${this.diagnosticName} process did not report exit after SIGKILL`,
-      );
+      throw new Error(`${this.diagnosticName} process did not report exit after SIGKILL`);
     }
+    await withTimeout(
+      this.processClosed,
+      FORCE_SHUTDOWN_TIMEOUT_MS,
+      `${this.diagnosticName} process output drain`,
+    );
+    this.failAll(error);
   }
 
   private handleStdoutChunk(chunk: string): void {
@@ -264,15 +308,16 @@ export class JsonlRpcProcess {
   }
 
   private failAll(error: Error): void {
-    if (this.disposed) {
-      return;
-    }
     this.disposed = true;
+    const transportError =
+      error instanceof JsonlRpcTransportClosedError
+        ? error
+        : new JsonlRpcTransportClosedError(error.message, { cause: error });
     for (const pending of this.pending.values()) {
       if (pending.timer) {
         clearTimeout(pending.timer);
       }
-      pending.reject(error);
+      pending.reject(transportError);
     }
     this.pending.clear();
   }

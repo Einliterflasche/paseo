@@ -1427,6 +1427,7 @@ describe("OpenCode adapter startTurn error handling", () => {
         }),
       },
       session: {
+        ...new TestOpenCodeClient().asSdkClient().session,
         promptAsync: vi.fn().mockImplementation(async () => {
           eventsGate.resolve();
           return { data: {}, error: undefined };
@@ -1537,6 +1538,7 @@ describe("OpenCode adapter startTurn error handling", () => {
         }),
       },
       session: {
+        ...new TestOpenCodeClient().asSdkClient().session,
         promptAsync: vi.fn().mockImplementation(async () => {
           eventsGate.resolve();
           return { data: {}, error: undefined };
@@ -1619,7 +1621,9 @@ describe("OpenCode adapter startTurn error handling", () => {
         }),
       },
       session: {
+        ...new TestOpenCodeClient().asSdkClient().session,
         abort: vi.fn().mockResolvedValue({ error: null }),
+        status: vi.fn().mockResolvedValue({ data: {} }),
         update: vi.fn().mockResolvedValue({ error: null }),
         promptAsync: vi.fn().mockImplementation(async () => {
           eventsGate.resolve();
@@ -1663,7 +1667,9 @@ describe("OpenCode adapter startTurn error handling", () => {
   test("deletes provider session on close when persistence is disabled", async () => {
     const fakeClient = {
       session: {
+        ...new TestOpenCodeClient().asSdkClient().session,
         abort: vi.fn().mockResolvedValue({ error: null }),
+        status: vi.fn().mockResolvedValue({ data: {} }),
         update: vi.fn().mockResolvedValue({ error: null }),
         delete: vi.fn().mockResolvedValue({ error: null }),
       },
@@ -1691,7 +1697,9 @@ describe("OpenCode adapter startTurn error handling", () => {
   test("does not delete provider session on close by default", async () => {
     const fakeClient = {
       session: {
+        ...new TestOpenCodeClient().asSdkClient().session,
         abort: vi.fn().mockResolvedValue({ error: null }),
+        status: vi.fn().mockResolvedValue({ data: {} }),
         update: vi.fn().mockResolvedValue({ error: null }),
         delete: vi.fn().mockResolvedValue({ error: null }),
       },
@@ -1717,7 +1725,9 @@ describe("OpenCode adapter startTurn error handling", () => {
     };
     const fakeClient = {
       session: {
+        ...new TestOpenCodeClient().asSdkClient().session,
         abort: vi.fn().mockResolvedValue({ error: null }),
+        status: vi.fn().mockResolvedValue({ data: {} }),
         update: vi.fn().mockResolvedValue({ error: null }),
       },
     } as never;
@@ -1738,6 +1748,7 @@ describe("OpenCode adapter startTurn error handling", () => {
   test("streamHistory preserves OpenCode replay timestamps from message and part times", async () => {
     const fakeClient = {
       session: {
+        ...new TestOpenCodeClient().asSdkClient().session,
         get: vi.fn().mockResolvedValue({
           data: { revert: undefined },
           error: undefined,
@@ -1838,6 +1849,7 @@ describe("OpenCode adapter startTurn error handling", () => {
   test("streamHistory omits replay timestamps when OpenCode omits times", async () => {
     const fakeClient = {
       session: {
+        ...new TestOpenCodeClient().asSdkClient().session,
         get: vi.fn().mockResolvedValue({
           data: { revert: undefined },
           error: undefined,
@@ -1900,6 +1912,7 @@ describe("OpenCode adapter startTurn error handling", () => {
 
     const fakeClient = {
       session: {
+        ...new TestOpenCodeClient().asSdkClient().session,
         get: vi.fn().mockResolvedValue({
           data: { revert: undefined },
           error: undefined,
@@ -2088,6 +2101,7 @@ describe("OpenCode adapter startTurn error handling", () => {
         event: vi.fn().mockResolvedValue({ stream: neverYieldingStream }),
       },
       session: {
+        ...new TestOpenCodeClient().asSdkClient().session,
         promptAsync: vi.fn(() => {
           throw new Error("boom: synchronous throw");
         }),
@@ -2288,7 +2302,7 @@ describe("OpenCode adapter startTurn error handling", () => {
           },
         })),
       },
-      session: { promptAsync },
+      session: { ...new TestOpenCodeClient().asSdkClient().session, promptAsync },
     } as never;
     const session = new __openCodeInternals.OpenCodeAgentSession(
       {
@@ -2675,6 +2689,7 @@ describe("OpenCode adapter startTurn error handling", () => {
       expect(openCode.calls.sessionPromptAsync).toHaveLength(1);
       expect(events.map((event) => event.type)).toEqual(["turn_started"]);
     } finally {
+      openCode.sessionAbortImplementation = null;
       await session.close();
     }
   });
@@ -2739,6 +2754,7 @@ describe("OpenCode adapter startTurn error handling", () => {
       await vi.waitFor(() => expect(openCode.calls.sessionAbort).toHaveLength(1));
 
       replacement = session.startTurn("replacement");
+      void replacement.catch(() => undefined);
       openCode.emitEvent({
         type: "session.idle",
         properties: { sessionID: "ses_stop_during_wait" },
@@ -2755,8 +2771,8 @@ describe("OpenCode adapter startTurn error handling", () => {
 
       settleSecondAbort.resolve();
       await secondStop;
-      await replacement;
-      expect(openCode.calls.sessionPromptAsync).toHaveLength(2);
+      await expect(replacement).rejects.toThrow("canceled before dispatch");
+      expect(openCode.calls.sessionPromptAsync).toHaveLength(1);
     } finally {
       settleFirstAbort.resolve();
       settleSecondAbort.resolve();
@@ -2811,8 +2827,9 @@ describe("OpenCode adapter startTurn error handling", () => {
         }),
       );
 
-      await session.interrupt();
-      expect(openCode.calls.sessionAbort).toHaveLength(2);
+      const secondStop = session.interrupt();
+      void secondStop.catch(() => undefined);
+      await vi.waitFor(() => expect(openCode.calls.sessionAbort).toHaveLength(2));
       openCode.emitEvent({
         type: "session.idle",
         properties: { sessionID: "ses_carried_abort" },
@@ -2824,6 +2841,7 @@ describe("OpenCode adapter startTurn error handling", () => {
 
       settleFirstAbort.resolve();
       await firstStop;
+      await secondStop;
       await replacement;
       expect(openCode.calls.sessionPromptAsync).toHaveLength(2);
     } finally {
@@ -2851,8 +2869,9 @@ describe("OpenCode adapter startTurn error handling", () => {
       void firstStop.catch(() => undefined);
       await vi.waitFor(() => expect(openCode.calls.sessionAbort).toHaveLength(1));
 
-      await session.interrupt();
-      expect(openCode.calls.sessionAbort).toHaveLength(2);
+      const secondStop = session.interrupt();
+      void secondStop.catch(() => undefined);
+      await vi.waitFor(() => expect(openCode.calls.sessionAbort).toHaveLength(2));
       openCode.emitEvent({
         type: "session.idle",
         properties: { sessionID: "ses_overlapping_stops" },
@@ -2864,6 +2883,7 @@ describe("OpenCode adapter startTurn error handling", () => {
 
       settleFirstAbort.resolve();
       await firstStop;
+      await secondStop;
       await replacement;
       expect(openCode.calls.sessionPromptAsync).toHaveLength(2);
     } finally {
@@ -2937,6 +2957,7 @@ describe("OpenCode adapter startTurn error handling", () => {
       expect(openCode.calls.sessionAbort).toHaveLength(2);
       expect(openCode.calls.sessionPromptAsync).toHaveLength(0);
     } finally {
+      openCode.sessionAbortImplementation = null;
       await session.close();
     }
   });
@@ -2951,7 +2972,11 @@ describe("OpenCode adapter startTurn error handling", () => {
 
     try {
       await session.startTurn("first");
-      await session.interrupt();
+      const interrupted = expect(session.interrupt()).rejects.toThrow(
+        "OpenCode interrupt completion",
+      );
+      await vi.advanceTimersByTimeAsync(10_000);
+      await interrupted;
 
       const secondTurn = expect(session.startTurn("second")).rejects.toThrow(
         "OpenCode previous turn to stop",
@@ -2961,6 +2986,7 @@ describe("OpenCode adapter startTurn error handling", () => {
       expect(openCode.calls.sessionPromptAsync).toHaveLength(1);
     } finally {
       vi.useRealTimers();
+      openCode.sessionStatusResponse = { data: {} };
       await session.close();
     }
   });
@@ -3117,6 +3143,7 @@ describe("OpenCode adapter startTurn error handling", () => {
       expect(countEvents(events, "turn_failed")).toBe(0);
     } finally {
       vi.useRealTimers();
+      openCode.sessionStatusImplementation = null;
       await session.close();
     }
   });
@@ -3432,6 +3459,7 @@ describe("OpenCode adapter startTurn error handling", () => {
         : [],
     );
     expect(recoveredStatuses.at(-1)).toBe("failed");
+    openCode.sessionStatusImplementation = null;
     await parent.close();
   });
 
@@ -3491,6 +3519,7 @@ describe("OpenCode adapter startTurn error handling", () => {
         : [],
     );
     expect(recoveredStatuses).toEqual(["running", "completed"]);
+    openCode.sessionStatusImplementation = null;
     await parent.close();
   });
 
@@ -3503,7 +3532,9 @@ describe("OpenCode adapter startTurn error handling", () => {
 
     try {
       await session.startTurn("first");
-      await session.interrupt();
+      const interrupt = session.interrupt();
+      void interrupt.catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(0);
       openCode.emitEvent({ type: "server-exited", error: new Error("OpenCode exited") });
       await vi.advanceTimersByTimeAsync(0);
 
@@ -3698,7 +3729,12 @@ describe("OpenCode adapter startTurn error handling", () => {
         openCode.sessionChildrenImplementation = waitForRequestAbort;
       if (requestClass === "child status") {
         openCode.sessionChildrenResponses = [{ data: [child] }, { data: [] }];
-        openCode.sessionStatusImplementation = waitForRequestAbort;
+        let held = false;
+        openCode.sessionStatusImplementation = (parameters, options) => {
+          if (held) return Promise.resolve({ data: {} });
+          held = true;
+          return waitForRequestAbort(parameters, options);
+        };
       }
       if (requestClass === "child messages") {
         openCode.sessionChildrenResponses = [{ data: [child] }, { data: [] }];
@@ -3710,9 +3746,14 @@ describe("OpenCode adapter startTurn error handling", () => {
         openCode.questionListImplementation = waitForRequestAbort;
       if (requestClass === "root status" || requestClass === "root messages") {
         openCode.sessionPromptAsyncEvents = [];
-        if (requestClass === "root status")
-          openCode.sessionStatusImplementation = waitForRequestAbort;
-        else {
+        if (requestClass === "root status") {
+          let held = false;
+          openCode.sessionStatusImplementation = (parameters, options) => {
+            if (held) return Promise.resolve({ data: {} });
+            held = true;
+            return waitForRequestAbort(parameters, options);
+          };
+        } else {
           openCode.sessionStatusResponse = { data: { [session.id ?? ""]: { type: "busy" } } };
           openCode.sessionMessagesImplementation = waitForRequestAbort;
         }
@@ -3726,6 +3767,7 @@ describe("OpenCode adapter startTurn error handling", () => {
           setTimeout(() => reject(new Error(`request did not start: ${requestClass}`)), 500),
         ),
       ]);
+      openCode.sessionStatusResponse = { data: {} };
       await expect(session.close()).resolves.toBeUndefined();
     }
   });
@@ -3754,16 +3796,12 @@ describe("OpenCode adapter startTurn error handling", () => {
     try {
       await session.startTurn("first");
       const interrupt = session.interrupt();
+      await vi.waitFor(() => expect(openCode.calls.sessionAbort).toHaveLength(1));
       const replacement = session.startTurn("second");
-      await vi.waitFor(() => expect(openCode.calls.sessionStatus).toHaveLength(1));
-
       settleAbort.resolve();
-      await interrupt;
-      await new Promise<void>((resolve) => setImmediate(resolve));
-
-      expect(openCode.calls.sessionStatus).toHaveLength(1);
-
+      await vi.waitFor(() => expect(openCode.calls.sessionStatus.length).toBeGreaterThanOrEqual(1));
       releaseIdle.resolve();
+      await interrupt;
       await expect(replacement).resolves.toEqual({ turnId: "opencode-turn-1" });
       expect(openCode.calls.sessionPromptAsync).toHaveLength(2);
       expect(openCode.calls.sessionStatus.length).toBeGreaterThanOrEqual(2);
@@ -3787,9 +3825,8 @@ describe("OpenCode adapter startTurn error handling", () => {
     openCode.sessionPromptAsyncEvents = [];
     try {
       await session.startTurn("first");
-      await session.interrupt();
-      const replacement = session.startTurn("second");
-      const rejection = expect(replacement).rejects.toThrow("OpenCode previous turn to stop");
+      const interrupt = session.interrupt();
+      const rejection = expect(interrupt).rejects.toThrow("OpenCode interrupt completion");
       await vi.advanceTimersByTimeAsync(99);
       expect(openCode.calls.sessionStatus).toHaveLength(0);
       await vi.advanceTimersByTimeAsync(1);
@@ -3803,6 +3840,7 @@ describe("OpenCode adapter startTurn error handling", () => {
       expect(openCode.calls.sessionStatus.length).toBeLessThanOrEqual(13);
     } finally {
       vi.useRealTimers();
+      openCode.sessionStatusImplementation = null;
       await session.close();
     }
   });
@@ -3843,7 +3881,7 @@ describe("OpenCode adapter startTurn error handling", () => {
       firstStreamEnd.resolve();
       await session.close();
 
-      await expect(replacement).rejects.toThrow("OpenCode session is closed");
+      await expect(replacement).rejects.toThrow("canceled before dispatch");
       expect(openCode.calls.globalEvent).toHaveLength(0);
     } finally {
       for (const signal of streamSignals) {
@@ -4513,6 +4551,7 @@ describe("OpenCode provider subagent contract", () => {
         }
 
         await completed.promise;
+        childClient.sessionStatusResponse = { data: {} };
 
         expect(childClient.calls.sessionStatus).toEqual([{ directory: "/workspace/repo" }]);
         expect(turnEventSignatures(events)).toEqual([
@@ -4576,6 +4615,7 @@ describe("OpenCode provider subagent contract", () => {
       expect(events.some((event) => event.type === "turn_started")).toBe(false);
     } finally {
       releaseStatus.resolve();
+      childClient.sessionStatusImplementation = null;
       await child.close();
       await parent.close();
     }
@@ -5313,7 +5353,9 @@ describe("OpenCode provider subagent contract", () => {
         }),
       },
       session: {
+        ...new TestOpenCodeClient().asSdkClient().session,
         abort: vi.fn().mockResolvedValue({ error: null }),
+        status: vi.fn().mockResolvedValue({ data: {} }),
         update: vi.fn().mockResolvedValue({ error: null }),
       },
     } as never;
@@ -5471,7 +5513,9 @@ describe("OpenCode provider subagent contract", () => {
         }),
       },
       session: {
+        ...new TestOpenCodeClient().asSdkClient().session,
         abort: vi.fn().mockResolvedValue({ error: null }),
+        status: vi.fn().mockResolvedValue({ data: {} }),
         update: vi.fn().mockResolvedValue({ error: null }),
       },
     } as never;
@@ -6442,12 +6486,19 @@ describe("OpenCode provider subagent contract", () => {
     await session.close();
   });
 
-  test("closes without waiting for child hydration", async () => {
+  test("aborts and joins child hydration before certifying close", async () => {
     const hydration = createTestDeferred<{ data: [] }>();
     const runtime = new TestOpenCodeHarness();
     const openCodeClient = new TestOpenCodeClient();
     openCodeClient.sessionCreateResponse = { data: { id: "ses_parent_close" } };
-    openCodeClient.sessionChildrenImplementation = async () => await hydration.promise;
+    let hydrationAborted = false;
+    openCodeClient.sessionChildrenImplementation = async (_parameters, options) => {
+      const signal = (options as { signal: AbortSignal }).signal;
+      await waitForAbort(signal);
+      hydrationAborted = true;
+      hydration.reject(signal.reason);
+      return await hydration.promise;
+    };
     runtime.enqueueClient(openCodeClient);
     const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
       serverManager: runtime,
@@ -6459,8 +6510,8 @@ describe("OpenCode provider subagent contract", () => {
 
     await session.close();
 
+    expect(hydrationAborted).toBe(true);
     expect(runtime.acquisitions[0]?.releaseCount).toBe(1);
-    hydration.resolve({ data: [] });
   });
 
   test("does not fold child tool parts into the parent sub_agent action log", () => {

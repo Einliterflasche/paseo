@@ -1026,6 +1026,9 @@ describe("Codex app-server provider", () => {
       if (signal === "SIGKILL") {
         child.signalCode = "SIGKILL";
         child.emit("exit", null, "SIGKILL");
+        child.stdout.end();
+        child.stderr.end();
+        child.emit("close", null, "SIGKILL");
       }
       return true;
     }) as ChildProcessWithoutNullStreams["kill"];
@@ -3610,10 +3613,10 @@ describe("Codex app-server provider", () => {
 
       const interruptPromise = session.interrupt();
       appServer.startsTurn({ threadId: "thread-1", turnId: "turn-identified-late" });
-      await interruptPromise;
-
+      await appServer.waitForRequest("turn/interrupt");
       expect(interruptedTurns).toEqual([{ threadId: "thread-1", turnId: "turn-identified-late" }]);
       appServer.completeTurn();
+      await interruptPromise;
       await resultPromise;
       appServer.assertNoErrors();
     } finally {
@@ -3714,6 +3717,12 @@ describe("Codex app-server provider", () => {
     session.client = {
       request: async (method, params) => {
         requests.push({ method, params });
+        queueMicrotask(() =>
+          asInternals(session).handleNotification("turn/completed", {
+            threadId: "test-thread",
+            turn: { id: "autonomous-turn", status: "interrupted" },
+          }),
+        );
         return {};
       },
     };

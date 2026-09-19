@@ -22,8 +22,21 @@ test("legacy checkpoints remain readable, while shared text requires a new forma
   });
   const timeline = store.exportSnapshot("agent");
   const compact = { ...legacy, agents: { ...legacy.agents, timelines: { agent: timeline } } };
-  expect(() => DaemonCheckpointSchema.parse(compact)).toThrow("requires checkpoint version 2");
-  expect(DaemonCheckpointSchema.parse({ ...compact, version: 2 }).version).toBe(2);
+  expect(() => DaemonCheckpointSchema.parse(compact)).toThrow(
+    "Checkpoint text encoding does not match its declared version",
+  );
+  expect(() => DaemonCheckpointSchema.parse({ ...compact, version: 2 })).toThrow(
+    "Checkpoint text encoding does not match its declared version",
+  );
+  expect(DaemonCheckpointSchema.parse({ ...compact, version: 3 }).version).toBe(3);
+  const { textBackings: _backings, ...v2Timeline } = timeline;
+  v2Timeline.textNodes = ["complete historical log"];
+  const v2 = {
+    ...legacy,
+    version: 2,
+    agents: { ...legacy.agents, timelines: { agent: v2Timeline } },
+  };
+  expect(DaemonCheckpointSchema.parse(v2)).toEqual(v2);
   const child = {
     ...legacy,
     agents: {
@@ -31,5 +44,7 @@ test("legacy checkpoints remain readable, while shared text requires a new forma
       children: [{ parentAgentId: "parent", subagentId: "child", descriptor: null, timeline }],
     },
   };
-  expect(() => DaemonCheckpointSchema.parse(child)).toThrow("requires checkpoint version 2");
+  expect(() => DaemonCheckpointSchema.parse(child)).toThrow(
+    "Checkpoint text encoding does not match its declared version",
+  );
 });

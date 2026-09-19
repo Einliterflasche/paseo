@@ -4,7 +4,12 @@ import { PassThrough } from "node:stream";
 import pino from "pino";
 import { describe, expect, test } from "vitest";
 
-import { JsonlRpcProcess, type JsonlRpcExit } from "./jsonl-rpc-process.js";
+import type { ProcessTerminator } from "../../../utils/tree-kill.js";
+import {
+  JsonlRpcProcess,
+  JsonlRpcTransportClosedError,
+  type JsonlRpcExit,
+} from "./jsonl-rpc-process.js";
 
 const CHILD_SOURCE = String.raw`
 const readline = require("node:readline");
@@ -72,6 +77,7 @@ interface StartProcessOptions {
   child?: ChildProcessWithoutNullStreams;
   defaultRequestTimeoutMs?: number;
   source?: string;
+  terminateProcess?: ProcessTerminator;
 }
 
 function createInMemoryChildProcess(): InMemoryChildProcess {
@@ -83,7 +89,13 @@ function createInMemoryChildProcess(): InMemoryChildProcess {
     signalCode: null,
   }) as InMemoryChildProcess;
   child.kill = ((signal?: NodeJS.Signals | number) => {
-    queueMicrotask(() => child.emit("exit", null, signal ?? null));
+    queueMicrotask(() => {
+      child.signalCode = (signal ?? "SIGTERM") as NodeJS.Signals;
+      child.emit("exit", null, signal ?? null);
+      child.stdout.end();
+      child.stderr.end();
+      child.emit("close", null, signal ?? null);
+    });
     return true;
   }) as ChildProcessWithoutNullStreams["kill"];
   return child;
@@ -100,6 +112,7 @@ function startProcess(options: StartProcessOptions = {}): JsonlRpcProcess {
     },
     logger: pino({ level: "silent" }),
     defaultRequestTimeoutMs: options.defaultRequestTimeoutMs,
+    terminateProcess: options.terminateProcess,
     ...(child ? { spawn: () => child } : {}),
   });
 }
@@ -114,6 +127,94 @@ function nextExit(transport: JsonlRpcProcess): Promise<JsonlRpcExit> {
 }
 
 describe("JsonlRpcProcess", () => {
+  test("close drains native responses before rejecting unanswered requests as transport closure", async () => {
+    const child = createInMemoryChildProcess();
+    const transport = startProcess({
+      child,
+      terminateProcess: async () => {
+        child.exitCode = 0;
+        child.emit("exit", 0, null);
+        return "terminated";
+      },
+    });
+    const native = transport.startRequest({ type: "prompt" }, null);
+    const unanswered = transport.request({ type: "hang" }, null).catch((error: unknown) => error);
+    const nativeResult = native.promise.catch((error: unknown) => error);
+    const close = transport.close();
+    await expect(transport.request({ type: "successor" })).rejects.toBeInstanceOf(
+      JsonlRpcTransportClosedError,
+    );
+    child.stdout.write(
+      `${JSON.stringify({ type: "response", id: native.id, success: false, error: "native final failure" })}\n`,
+    );
+    const failure = await nativeResult;
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(JsonlRpcTransportClosedError);
+    expect(failure).toMatchObject({ message: "native final failure" });
+    child.stdout.end();
+    child.stderr.end();
+    child.emit("close", 0, null);
+    await close;
+    expect(await unanswered).toBeInstanceOf(JsonlRpcTransportClosedError);
+  });
+
+  test("retries uncertain termination and delivers output through pipe closure", async () => {
+    const child = createInMemoryChildProcess();
+    let terminations = 0;
+    const transport = startProcess({
+      child,
+      terminateProcess: async () => {
+        terminations += 1;
+        if (terminations === 1) return "kill-timeout";
+        child.signalCode = "SIGTERM";
+        child.emit("exit", null, "SIGTERM");
+        child.stdout.write('{"type":"notice","text":"final frame"}\n');
+        child.emit("close", null, "SIGTERM");
+        return "terminated";
+      },
+    });
+    const messages: Record<string, unknown>[] = [];
+    transport.onMessage((message) => messages.push(message));
+    const first = transport.close();
+    expect(transport.close()).toBe(first);
+    await expect(first).rejects.toThrow("did not report exit");
+    await transport.close();
+    await transport.close();
+    expect(terminations).toBe(2);
+    expect(messages).toEqual([{ type: "notice", text: "final frame" }]);
+  });
+
+  test("already-exited processes still wait for final stdout before close certifies", async () => {
+    const child = createInMemoryChildProcess();
+    const transport = startProcess({ child });
+    const messages: unknown[] = [];
+    transport.onMessage((message) => messages.push(message));
+    child.exitCode = 7;
+    child.emit("exit", 7, null);
+    let certified = false;
+    const close = transport.close().then(() => {
+      certified = true;
+      return undefined;
+    });
+    await Promise.resolve();
+    expect(certified).toBe(false);
+    child.stdout.write('{"type":"last-output"}\n');
+    child.stdout.end();
+    child.stderr.end();
+    child.emit("close", 7, null);
+    await close;
+    await transport.close();
+    expect(messages).toEqual([{ type: "last-output" }]);
+  });
+
+  test("a failed stdin does not exempt its live child from close", async () => {
+    const child = createInMemoryChildProcess();
+    const transport = startProcess({ child });
+    child.stdin.emit("error", new Error("write EPIPE"));
+    await transport.close();
+    expect(child.signalCode).toBe("SIGTERM");
+  });
+
   test("spawns a resolved command and correlates concurrent requests", async () => {
     const transport = startProcess();
 

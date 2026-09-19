@@ -1,5 +1,9 @@
 import { EventEmitter } from "node:events";
-import { MAX_PHYSICAL_SOCKET_BUFFERED_BYTES } from "./physical-socket.js";
+import { maxBase64EncryptedPlaintextByteLength, RELAY_MAX_FRAME_BYTES } from "@getpaseo/relay";
+import {
+  MAX_PHYSICAL_SOCKET_BUFFERED_BYTES,
+  type JsonResponseCapacity,
+} from "./physical-socket.js";
 
 export interface EncryptedRelayChannel {
   setState: (state: "open") => void;
@@ -9,6 +13,7 @@ export interface EncryptedRelayChannel {
 }
 
 export interface EncryptedRelaySocket {
+  getJsonResponseCapacity(): JsonResponseCapacity;
   readonly readyState: number;
   readonly bufferedAmount: number;
   send: (data: string | Uint8Array | ArrayBuffer) => void | Promise<void>;
@@ -46,6 +51,21 @@ export function createEncryptedRelaySocket(params: {
   });
 
   return {
+    getJsonResponseCapacity: () => ({
+      maximumBytes: maxBase64EncryptedPlaintextByteLength(
+        Math.min(RELAY_MAX_FRAME_BYTES, MAX_PHYSICAL_SOCKET_BUFFERED_BYTES),
+      ),
+      // bufferedAmount is the underlying transport's encoded wire bytes.
+      availableBytes: Math.max(
+        0,
+        maxBase64EncryptedPlaintextByteLength(
+          Math.min(
+            RELAY_MAX_FRAME_BYTES,
+            MAX_PHYSICAL_SOCKET_BUFFERED_BYTES - (getTransportBufferedAmount() ?? 0),
+          ),
+        ),
+      ),
+    }),
     get readyState() {
       return readyState;
     },

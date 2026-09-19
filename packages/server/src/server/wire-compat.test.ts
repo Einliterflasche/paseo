@@ -20,6 +20,12 @@ import { InMemoryAgentTimelineStore } from "./agent/agent-timeline-store.js";
 import type { AgentTimelineFetchOptions } from "./agent/agent-timeline-store-types.js";
 import { handleCreatePaseoWorktreeRequest } from "./worktree-session.js";
 import { createPersistedProjectRecord } from "./workspace-registry.js";
+import { PreviewGrantStore } from "./file-preview/grant-store.js";
+import {
+  MAX_PHYSICAL_SOCKET_BUFFERED_BYTES,
+  physicalJsonResponseCapacity,
+  sendBoundedPhysicalFrameAndWait,
+} from "./websocket/physical-socket.js";
 
 const LegacyTimelineEntryPayloadSchema = z.object({
   provider: z.enum(["claude", "codex", "opencode"]),
@@ -55,6 +61,10 @@ interface SessionInternals {
 
 class InMemoryAgentManager {
   private readonly timeline = new InMemoryAgentTimelineStore();
+
+  hasInstalledHistory() {
+    return false;
+  }
 
   constructor(rows: AgentTimelineRow[]) {
     this.timeline.initialize("agent-1", {
@@ -185,8 +195,10 @@ function createSessionForWireCompatTest(options?: {
   clientCapabilities?: Record<string, unknown> | null;
   directorySync?: DirectorySyncService;
   messages?: SessionOutboundMessage[];
+  onMessage?: SessionOptions["onMessage"];
   onMessageToSource?: SessionOptions["onMessageToSource"];
   rows?: AgentTimelineRow[];
+  getJsonResponseCapacity?: SessionOptions["getJsonResponseCapacity"];
 }): Session {
   const messages = options?.messages ?? [];
   const rows: AgentTimelineRow[] = [
@@ -212,10 +224,12 @@ function createSessionForWireCompatTest(options?: {
     clientId: "wire-compat-client",
     permissions: OWNER_PERMISSIONS,
     clientCapabilities: options?.clientCapabilities ?? null,
-    onMessage: (message) => messages.push(message),
+    onMessage: options?.onMessage ?? ((message) => messages.push(message)),
     onMessageToSource: options?.onMessageToSource,
+    getJsonResponseCapacity: options?.getJsonResponseCapacity,
     logger: pino({ level: "silent" }),
     downloadTokenStore: {} as SessionOptions["downloadTokenStore"],
+    previewGrantStore: new PreviewGrantStore(),
     pushNotifications: {} as SessionOptions["pushNotifications"],
     paseoHome: "/tmp/paseo-home",
     agentManager: new InMemoryAgentManager(
@@ -283,6 +297,7 @@ function createSessionForWireCompatTest(options?: {
 async function emitTimelineResponse(options?: {
   clientCapabilities?: Record<string, unknown> | null;
   rows?: AgentTimelineRow[];
+  getJsonResponseCapacity?: SessionOptions["getJsonResponseCapacity"];
   request?: Partial<
     Extract<z.infer<typeof SessionInboundMessageSchema>, { type: "fetch_agent_timeline_request" }>
   >;
@@ -291,6 +306,7 @@ async function emitTimelineResponse(options?: {
   const session = createSessionForWireCompatTest({
     clientCapabilities: options?.clientCapabilities,
     rows: options?.rows,
+    getJsonResponseCapacity: options?.getJsonResponseCapacity,
     messages,
   });
   const internals = session as unknown as SessionInternals;
@@ -312,6 +328,97 @@ async function emitTimelineResponse(options?: {
 }
 
 describe("wire compatibility", () => {
+  test.each([-1, 0, 1])(
+    "timeline response and physical send share the same budget at offset %i",
+    async (offset) => {
+      const rows: AgentTimelineRow[] = [
+        {
+          seq: 1,
+          timestamp: "2026-09-19T00:00:00.000Z",
+          item: { type: "assistant_message", text: "x".repeat(2048) },
+        },
+      ];
+      const ready = await emitTimelineResponse({ rows });
+      const responseBytes = Buffer.byteLength(JSON.stringify({ type: "session", message: ready }));
+      const frames: string[] = [];
+      let closes = 0;
+      const socket = {
+        readyState: 1,
+        bufferedAmount: MAX_PHYSICAL_SOCKET_BUFFERED_BYTES - responseBytes + offset,
+        send(frame: string | Uint8Array | ArrayBuffer, callback?: (error?: Error) => void) {
+          frames.push(String(frame));
+          callback?.();
+        },
+      };
+      const pending: Promise<boolean>[] = [];
+      const session = createSessionForWireCompatTest({
+        rows,
+        getJsonResponseCapacity: () => physicalJsonResponseCapacity(socket),
+        onMessage: (message) => {
+          pending.push(
+            sendBoundedPhysicalFrameAndWait({
+              socket,
+              frame: JSON.stringify({ type: "session", message }),
+              onHighWater: () => {
+                closes++;
+              },
+            }),
+          );
+        },
+      });
+      try {
+        await (session as unknown as SessionInternals).handleFetchAgentTimelineRequest({
+          type: "fetch_agent_timeline_request",
+          requestId: "req-timeline",
+          agentId: "agent-1",
+          projection: "projected",
+        });
+        expect(await Promise.all(pending)).toEqual([true]);
+        expect(closes).toBe(0);
+        expect(frames).toHaveLength(1);
+        const response = JSON.parse(frames[0]!).message;
+        expect(response.payload.errorCode).toBe(offset > 0 ? "TIMELINE_BUSY" : undefined);
+        expect(response.payload.entries).toEqual(offset > 0 ? [] : ready.payload.entries);
+      } finally {
+        await session.cleanup();
+      }
+    },
+  );
+  test("timeline overload errors distinguish backlog from a permanent frame limit", async () => {
+    const rows: AgentTimelineRow[] = [
+      {
+        seq: 1,
+        timestamp: "2026-09-19T00:00:00.000Z",
+        item: { type: "assistant_message", text: "x".repeat(2048) },
+      },
+    ];
+    const ready = await emitTimelineResponse({ rows });
+    expect(ready.payload.error).toBeNull();
+    const maximumBytes = Buffer.byteLength(JSON.stringify({ type: "session", message: ready }));
+    const busy = await emitTimelineResponse({
+      rows,
+      getJsonResponseCapacity: () => ({ maximumBytes, availableBytes: 1024 }),
+    });
+    expect(busy.payload.errorCode).toBe("TIMELINE_BUSY");
+    expect(busy.payload.entries).toEqual([]);
+    expect(busy.payload.epoch).toBe(ready.payload.epoch);
+    const large = await emitTimelineResponse({
+      rows,
+      getJsonResponseCapacity: () => ({ maximumBytes: maximumBytes - 1, availableBytes: 1024 }),
+    });
+    expect(large.payload.errorCode).toBe("TIMELINE_ITEM_TOO_LARGE");
+    expect(large.payload.entries).toEqual([]);
+    expect(large.payload.epoch).toBe(ready.payload.epoch);
+    const legacy = FetchAgentTimelineResponseMessageSchema.extend({
+      payload: FetchAgentTimelineResponseMessageSchema.shape.payload.omit({ errorCode: true }),
+    });
+    expect(legacy.parse(busy).payload.error).toBe(busy.payload.error);
+    const drained = await emitTimelineResponse({
+      rows,
+      getJsonResponseCapacity: () => ({ maximumBytes, availableBytes: maximumBytes }),
+    });
+    expect(drained).toEqual(ready);
+  });
   test("sends project updates only to clients that declare support", async () => {
     const project = createPersistedProjectRecord({
       projectId: "project-1",

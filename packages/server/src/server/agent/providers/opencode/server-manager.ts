@@ -1,3 +1,4 @@
+import { ProviderInitializationCleanupError } from "../../provider-initialization-cleanup-error.js";
 import type { ChildProcess } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { stat } from "node:fs/promises";
@@ -178,7 +179,18 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
       await server.ready;
       return acquisition;
     } catch (error) {
-      await acquisition.release();
+      try {
+        await acquisition.release();
+      } catch (cleanupError) {
+        // The startup path may already have failed to stop this generation.
+        // Keep the acquisition's retryable release, including its refcount
+        // bookkeeping, reachable through the error handed to the caller.
+        throw new ProviderInitializationCleanupError(
+          { close: acquisition.release },
+          error,
+          cleanupError,
+        );
+      }
       throw error;
     }
   }
@@ -207,6 +219,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   private acquireServer(server: OpenCodeServerGeneration): OpenCodeServerAcquisition {
     server.refCount += 1;
     let releasePromise: Promise<void> | null = null;
+    let released = false;
     return {
       server: { port: server.port, url: server.url },
       events: server.events,
@@ -214,14 +227,21 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
         if (releasePromise) {
           return releasePromise;
         }
-        releasePromise = this.releaseServer(server);
-        return releasePromise;
+        if (!released) {
+          released = true;
+          server.refCount = Math.max(0, server.refCount - 1);
+        }
+        const attempt = this.releaseServer(server);
+        releasePromise = attempt;
+        void attempt.catch(() => {
+          if (releasePromise === attempt) releasePromise = null;
+        });
+        return attempt;
       },
     };
   }
 
   private async releaseServer(server: OpenCodeServerGeneration): Promise<void> {
-    server.refCount = Math.max(0, server.refCount - 1);
     if (server.refCount > 0) {
       return;
     }
@@ -234,9 +254,10 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
       return;
     }
 
+    this.retiredServers.add(server);
+    await this.killServer(server);
     this.retiredServers.delete(server);
     this.logger.info(generationLogContext(server), "OpenCode server generation released");
-    await this.killServer(server);
   }
 
   private async getNewServer(): Promise<OpenCodeServerGeneration> {
@@ -459,11 +480,18 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     });
 
     server.ready = ready.catch(async (error) => {
-      await this.killServer(server);
-      if (this.currentServer === server) {
-        this.currentServer = null;
+      const cleanup = {
+        close: async () => {
+          await this.killServer(server);
+          if (this.currentServer === server) this.currentServer = null;
+          this.retiredServers.delete(server);
+        },
+      };
+      try {
+        await cleanup.close();
+      } catch (cleanupError) {
+        throw new ProviderInitializationCleanupError(cleanup, error, cleanupError);
       }
-      this.retiredServers.delete(server);
       throw error;
     });
 
@@ -487,19 +515,23 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     const cleanup: Promise<void>[] = [];
     for (const server of Array.from(this.retiredServers)) {
       if (server.refCount === 0) {
-        this.retiredServers.delete(server);
-        cleanup.push(this.killServer(server));
+        cleanup.push(
+          this.killServer(server).then(() => {
+            this.retiredServers.delete(server);
+            return undefined;
+          }),
+        );
       }
     }
     await Promise.all(cleanup);
   }
 
   private async killServer(server: OpenCodeServerGeneration): Promise<void> {
-    await server.events.close();
     if (
       (server.process.exitCode !== null && server.process.exitCode !== undefined) ||
       (server.process.signalCode !== null && server.process.signalCode !== undefined)
     ) {
+      await server.events.close();
       return;
     }
     const result = await this.terminateProcess(server.process, {
@@ -513,11 +545,9 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
       },
     });
     if (result === "kill-timeout") {
-      this.logger.warn(
-        { timeoutMs: OPENCODE_SERVER_FORCE_SHUTDOWN_TIMEOUT_MS },
-        "OpenCode server did not report exit after SIGKILL",
-      );
+      throw new Error("OpenCode server did not report exit after SIGKILL");
     }
+    await server.events.close();
     if (server.managedProcessId) {
       await this.removeManagedProcessId(server.managedProcessId);
       server.managedProcessId = undefined;

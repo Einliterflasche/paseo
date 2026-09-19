@@ -3,36 +3,48 @@ import type {
   ProviderSubagentDescriptorPayload,
   SessionOutboundMessage,
 } from "@getpaseo/protocol/messages";
-import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { create } from "zustand";
 import { applyStreamEvent } from "@/types/stream";
 import type { StreamItem } from "@/types/stream";
 import type { AgentLifecycleStatus } from "@getpaseo/protocol/agent-lifecycle";
+import type {
+  FetchProviderSubagentTimelineOptions,
+  TimelineRequestErrorCode,
+} from "@getpaseo/client/internal/daemon-client";
 
-type ProviderSubagentTimelineItem = Extract<
-  Extract<SessionOutboundMessage, { type: "agent.provider_subagents.update" }>["payload"],
-  { kind: "timeline" }
->["item"];
-
-interface ProviderSubagentTimelineRow {
-  provider: ProviderSubagentDescriptorPayload["provider"];
-  item: ProviderSubagentTimelineItem;
-  timestamp: string;
-}
+import {
+  processAgentStreamEvent,
+  processTimelineResponse,
+  type TimelineCursor,
+} from "@/timeline/session-stream-reducers";
 
 export interface ProviderSubagentTimelineState {
   tail: StreamItem[];
   head: StreamItem[];
-  epoch: string | null;
-  lastSeq: number;
+  cursor: TimelineCursor | undefined;
+  hasAuthoritativeBaseline: boolean;
   hasOlder: boolean;
-  rows: Map<number, ProviderSubagentTimelineRow>;
+  error: string | null;
+  failedPage?: {
+    code?: TimelineRequestErrorCode;
+    epoch?: string;
+    request: FetchProviderSubagentTimelineOptions;
+  };
 }
 
 interface ProviderSubagentState {
   descriptors: Map<string, ProviderSubagentDescriptorPayload>;
   timelines: Map<string, ProviderSubagentTimelineState>;
   hiddenFromTrack: Set<string>;
+  clearHost(serverId: string): void;
+  clearHostErrors(serverId: string): void;
+  setTimelineError(
+    serverId: string,
+    parentAgentId: string,
+    subagentId: string,
+    error: string | null,
+    failedPage?: ProviderSubagentTimelineState["failedPage"],
+  ): void;
   hideFromTrack(serverId: string, parentAgentId: string, subagentIds: readonly string[]): void;
   replaceList(
     serverId: string,
@@ -45,14 +57,14 @@ interface ProviderSubagentState {
       SessionOutboundMessage,
       { type: "agent.provider_subagents.update" }
     >["payload"],
-  ): void;
+  ): boolean;
   replaceTimeline(
     serverId: string,
     payload: Extract<
       SessionOutboundMessage,
       { type: "agent.provider_subagents.timeline.get.response" }
     >["payload"],
-  ): void;
+  ): boolean;
 }
 
 export function providerSubagentKey(
@@ -71,37 +83,6 @@ export function providerSubagentLifecycleStatus(
   return "idle";
 }
 
-type ProviderSubagentListClient = Pick<DaemonClient, "listProviderSubagents">;
-
-const pendingListRequests = new WeakMap<ProviderSubagentListClient, Map<string, Promise<void>>>();
-
-export function refreshProviderSubagents(
-  client: ProviderSubagentListClient,
-  serverId: string,
-  parentAgentId: string,
-): Promise<void> {
-  const requestKey = `${serverId}\0${parentAgentId}`;
-  let clientRequests = pendingListRequests.get(client);
-  if (!clientRequests) {
-    clientRequests = new Map();
-    pendingListRequests.set(client, clientRequests);
-  }
-  const pending = clientRequests.get(requestKey);
-  if (pending) return pending;
-
-  const request = client
-    .listProviderSubagents(parentAgentId)
-    .then((payload) => {
-      useProviderSubagentStore.getState().replaceList(serverId, parentAgentId, payload.subagents);
-      return undefined;
-    })
-    .finally(() => {
-      clientRequests?.delete(requestKey);
-    });
-  clientRequests.set(requestKey, request);
-  return request;
-}
-
 function parentPrefix(serverId: string, parentAgentId: string): string {
   return `${serverId}\0${parentAgentId}\0`;
 }
@@ -109,10 +90,10 @@ function parentPrefix(serverId: string, parentAgentId: string): string {
 const EMPTY_TIMELINE: ProviderSubagentTimelineState = {
   tail: [],
   head: [],
-  epoch: null,
-  lastSeq: 0,
+  cursor: undefined,
+  hasAuthoritativeBaseline: false,
+  error: null,
   hasOlder: false,
-  rows: new Map(),
 };
 
 function providerSubagentTerminalEvent(
@@ -130,72 +111,55 @@ function providerSubagentTerminalEvent(
   return { type: "turn_completed", provider: subagent.provider };
 }
 
-function buildTimelineState(
-  rows: ProviderSubagentTimelineState["rows"],
-  epoch: string | null,
+function applyTerminal(
+  current: ProviderSubagentTimelineState,
   descriptor?: ProviderSubagentDescriptorPayload,
-  hasOlder = false,
 ): ProviderSubagentTimelineState {
-  let timeline = { tail: [] as StreamItem[], head: [] as StreamItem[] };
-  for (const [, row] of [...rows].sort(([left], [right]) => left - right)) {
-    timeline = applyStreamEvent({
-      ...timeline,
-      event: { type: "timeline", provider: row.provider, item: row.item },
-      timestamp: new Date(row.timestamp),
-    });
-  }
-  const terminalEvent = descriptor ? providerSubagentTerminalEvent(descriptor) : null;
-  if (terminalEvent && descriptor) {
-    timeline = applyStreamEvent({
-      ...timeline,
-      event: terminalEvent,
-      timestamp: new Date(descriptor.updatedAt),
-    });
-  }
-  return {
-    ...timeline,
-    epoch,
-    lastSeq: rows.size ? Math.max(...rows.keys()) : 0,
-    hasOlder,
-    rows,
-  };
-}
-
-function buildTimelineResponseRows(
-  existing: ProviderSubagentTimelineState | undefined,
-  payload: Extract<
-    SessionOutboundMessage,
-    { type: "agent.provider_subagents.timeline.get.response" }
-  >["payload"],
-  provider: ProviderSubagentDescriptorPayload["provider"],
-): ProviderSubagentTimelineState["rows"] {
-  const rows = new Map<number, ProviderSubagentTimelineRow>();
-  for (const row of payload.rows) {
-    rows.set(row.seq, { provider, item: row.item, timestamp: row.timestamp });
-  }
-  if (payload.reset || existing?.epoch !== payload.epoch) {
-    return rows;
-  }
-  if (payload.direction !== "tail") {
-    return new Map([...existing.rows, ...rows]);
-  }
-
-  let nextSeq = payload.rows.length
-    ? Math.max(...payload.rows.map((row) => row.seq)) + 1
-    : payload.window.maxSeq + 1;
-  for (const [seq, row] of [...existing.rows].sort(([left], [right]) => left - right)) {
-    if (seq < nextSeq) continue;
-    if (seq !== nextSeq) break;
-    rows.set(seq, row);
-    nextSeq += 1;
-  }
-  return rows;
+  const event = descriptor ? providerSubagentTerminalEvent(descriptor) : null;
+  if (!event || !descriptor) return current;
+  const next = applyStreamEvent({
+    tail: current.tail,
+    head: current.head,
+    event,
+    timestamp: new Date(descriptor.updatedAt),
+  });
+  return { ...current, tail: next.tail, head: next.head };
 }
 
 export const useProviderSubagentStore = create<ProviderSubagentState>((set) => ({
   descriptors: new Map(),
   timelines: new Map(),
   hiddenFromTrack: new Set(),
+  clearHost(serverId) {
+    const prefix = `${serverId}\0`;
+    set((state) => ({
+      descriptors: new Map([...state.descriptors].filter(([key]) => !key.startsWith(prefix))),
+      timelines: new Map([...state.timelines].filter(([key]) => !key.startsWith(prefix))),
+      hiddenFromTrack: new Set([...state.hiddenFromTrack].filter((key) => !key.startsWith(prefix))),
+    }));
+  },
+  clearHostErrors(serverId) {
+    set((state) => ({
+      timelines: new Map(
+        [...state.timelines].map(([key, value]) => [
+          key,
+          key.startsWith(`${serverId}\0`)
+            ? { ...value, error: null, failedPage: undefined }
+            : value,
+        ]),
+      ),
+    }));
+  },
+  setTimelineError(serverId, parentAgentId, subagentId, error, failedPage) {
+    const key = providerSubagentKey(serverId, parentAgentId, subagentId);
+    set((state) => ({
+      timelines: new Map(state.timelines).set(key, {
+        ...(state.timelines.get(key) ?? EMPTY_TIMELINE),
+        error,
+        failedPage,
+      }),
+    }));
+  },
   hideFromTrack(serverId, parentAgentId, subagentIds) {
     set((state) => {
       const hiddenFromTrack = new Set(state.hiddenFromTrack);
@@ -229,16 +193,14 @@ export const useProviderSubagentStore = create<ProviderSubagentState>((set) => (
         const current = timelines.get(key);
         const previous = state.descriptors.get(key);
         if (current && previous?.status !== subagent.status) {
-          timelines.set(
-            key,
-            buildTimelineState(current.rows, current.epoch, subagent, current.hasOlder),
-          );
+          timelines.set(key, applyTerminal(current, subagent));
         }
       }
       return { descriptors, timelines, hiddenFromTrack };
     });
   },
   applyUpdate(serverId, payload) {
+    let catchUp = false;
     set((state) => {
       if (payload.kind === "upsert") {
         const key = providerSubagentKey(
@@ -257,10 +219,7 @@ export const useProviderSubagentStore = create<ProviderSubagentState>((set) => (
         const current = state.timelines.get(key);
         if (current && previous?.status !== payload.subagent.status) {
           timelines = new Map(state.timelines);
-          timelines.set(
-            key,
-            buildTimelineState(current.rows, current.epoch, payload.subagent, current.hasOlder),
-          );
+          timelines.set(key, applyTerminal(current, payload.subagent));
         }
         return { descriptors, timelines, hiddenFromTrack };
       }
@@ -273,54 +232,108 @@ export const useProviderSubagentStore = create<ProviderSubagentState>((set) => (
         return { descriptors, timelines };
       }
       const key = providerSubagentKey(serverId, payload.parentAgentId, payload.subagentId);
-      const existing = state.timelines.get(key);
-      if (existing?.epoch && existing.epoch !== payload.epoch) {
-        return state;
-      }
-      const current = existing ?? EMPTY_TIMELINE;
-      if (payload.seq <= current.lastSeq) {
-        return state;
-      }
-      const rows = new Map(current.rows);
-      rows.set(payload.seq, {
-        provider: payload.provider,
-        item: payload.item,
-        timestamp: payload.timestamp,
-      });
-      const descriptor = state.descriptors.get(key);
-      const next =
-        descriptor && descriptor.status !== "running"
-          ? buildTimelineState(rows, payload.epoch, descriptor, current.hasOlder)
-          : applyStreamEvent({
-              tail: current.tail,
-              head: current.head,
-              event: { type: "timeline", provider: payload.provider, item: payload.item },
-              timestamp: new Date(payload.timestamp),
-            });
-      const timelines = new Map(state.timelines);
-      timelines.set(key, {
-        ...next,
+      const current = state.timelines.get(key) ?? EMPTY_TIMELINE;
+      const next = processAgentStreamEvent({
+        event: { type: "timeline", provider: payload.provider, item: payload.item },
+        seq: payload.seq,
         epoch: payload.epoch,
-        lastSeq: payload.seq,
-        hasOlder: current.hasOlder,
-        rows,
+        currentTail: current.tail,
+        currentHead: current.head,
+        currentCursor: current.cursor,
+        hasAuthoritativeBaseline: current.hasAuthoritativeBaseline,
+        timestamp: new Date(payload.timestamp),
       });
+      catchUp =
+        next.sideEffects.length > 0 || !current.cursor || current.cursor.epoch !== payload.epoch;
+      const timelines = new Map(state.timelines);
+      timelines.set(
+        key,
+        applyTerminal(
+          {
+            ...current,
+            tail: next.tail,
+            head: next.head,
+            cursor: next.cursor ?? current.cursor,
+            hasOlder:
+              next.cursor && current.cursor?.epoch !== next.cursor.epoch ? false : current.hasOlder,
+            ...(payload.seq === 1 &&
+            current.failedPage?.epoch &&
+            current.failedPage.epoch !== payload.epoch
+              ? { error: null, failedPage: undefined }
+              : {}),
+          },
+          state.descriptors.get(key),
+        ),
+      );
       return { timelines };
     });
+    return catchUp;
   },
   replaceTimeline(serverId, payload) {
-    const provider = payload.provider;
-    if (!provider) {
-      return;
+    if (
+      payload.projection !== "projected" ||
+      !payload.entries ||
+      payload.startCursor === undefined ||
+      payload.endCursor === undefined
+    ) {
+      throw new Error("Host did not return a projected child timeline");
     }
+    const entries = payload.entries;
+    const startCursor = payload.startCursor;
+    const endCursor = payload.endCursor;
+    let catchUp = false;
     set((state) => {
       const key = providerSubagentKey(serverId, payload.parentAgentId, payload.subagentId);
-      const existing = state.timelines.get(key);
-      const rows = buildTimelineResponseRows(existing, payload, provider);
-      const descriptor = state.descriptors.get(key);
+      const current = state.timelines.get(key) ?? EMPTY_TIMELINE;
+      const next = processTimelineResponse({
+        payload: {
+          ...payload,
+          projection: "projected",
+          agentId: payload.subagentId,
+          entries,
+          startCursor,
+          endCursor,
+        },
+        currentTail: current.tail,
+        currentHead: current.head,
+        currentCursor: current.cursor,
+        isInitializing: !current.hasAuthoritativeBaseline,
+        hasActiveInitDeferred: !current.hasAuthoritativeBaseline,
+        initRequestDirection: "tail",
+        sendingClientMessageIds: [],
+      });
+      catchUp =
+        next.sideEffects.some((effect) => effect.type === "catch_up") ||
+        (payload.direction === "after" && payload.hasNewer);
+      if (next.commit === "discard")
+        return current.error === null
+          ? state
+          : {
+              timelines: new Map(state.timelines).set(key, {
+                ...current,
+                error: null,
+                failedPage: undefined,
+              }),
+            };
       const timelines = new Map(state.timelines);
-      timelines.set(key, buildTimelineState(rows, payload.epoch, descriptor, payload.hasOlder));
+      let hasOlder = next.older === "unchanged" ? current.hasOlder : next.older === "available";
+      if (!current.cursor && payload.direction === "tail") hasOlder = payload.hasOlder;
+      timelines.set(
+        key,
+        applyTerminal(
+          {
+            tail: next.tail,
+            head: next.head,
+            cursor: next.cursor ?? undefined,
+            hasAuthoritativeBaseline: true,
+            hasOlder,
+            error: next.error,
+          },
+          state.descriptors.get(key),
+        ),
+      );
       return { timelines };
     });
+    return catchUp;
   },
 }));

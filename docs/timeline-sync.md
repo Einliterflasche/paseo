@@ -61,6 +61,25 @@ the anchored page still leaves the viewport at history start, as with short or c
 that case pagination continues as one loading operation until the page fills the viewport or history
 is exhausted.
 
+## Provider child transcripts
+
+Descriptor demand and transcript demand are separate. The subagent track may observe
+all child descriptors; only an explicitly observed `(parentAgentId, subagentId)`
+receives live transcript events. Subscription acknowledgement precedes reconciliation,
+including after reconnect. Hiding a retained pane releases live demand without erasing
+its existing display; reopening reconciles authoritative history. The host owns those
+replicas and fences late replies after removal or client replacement.
+
+Capable clients request projected child pages using the main timeline entry contract.
+Legacy raw pages remain readable. Both raw and projected history responses account
+for JSON escaping, the complete envelope, relay encoding, and available socket capacity
+before expanding shared log strings. Byte paging preserves contiguous source coverage
+in the requested direction. A single indivisible item that cannot fit returns an
+explicit sequence-specific error; the client must not interpret it as history ending.
+Temporary backlog uses a distinct error and retries the same page after backoff.
+An oversized item stops automatic retries and remains visible as an error. Live
+streams retain the existing high-water disconnect policy; reconnect reconciles history.
+
 ## Durable item anchors
 
 Provider message IDs are not guaranteed for every displayed item. Paseo-generated system errors are one example. Rendered item indices are not durable either because pagination and projection can merge source rows.

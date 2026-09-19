@@ -15,5 +15,6 @@ export {
   createDaemonChannel,
   EncryptedChannel,
   maxBase64EncryptedPlaintextByteLength,
+  RELAY_MAX_FRAME_BYTES,
 } from "./encrypted-channel.js";
 export type { Transport, EncryptedChannelEvents } from "./encrypted-channel.js";

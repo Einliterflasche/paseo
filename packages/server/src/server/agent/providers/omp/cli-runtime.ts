@@ -1,3 +1,4 @@
+import { ProviderInitializationCleanupError } from "../../provider-initialization-cleanup-error.js";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { Logger } from "pino";
 
@@ -64,6 +65,8 @@ export class OmpCliRuntime implements OmpRuntime {
   }
 
   async startSession(input: OmpStartSessionInput): Promise<OmpRuntimeSession> {
+    input.signal?.throwIfAborted();
+    input.probe?.signal.throwIfAborted();
     const launch = buildOmpLaunch({
       command: this.command,
       runtimeSettings: this.options.runtimeSettings,
@@ -85,6 +88,7 @@ export class OmpCliRuntime implements OmpRuntime {
       ...(spawn ? { spawn: () => spawn(launch) } : {}),
     };
     const process = new JsonlRpcProcess(processOptions);
+    input.probe?.own(process);
     const handleAbort = () => void process.close(input.signal?.reason).catch(() => undefined);
     input.signal?.addEventListener("abort", handleAbort, { once: true });
     try {
@@ -96,7 +100,11 @@ export class OmpCliRuntime implements OmpRuntime {
       return new OmpCliRuntimeSession(process, this.commandsRpcName);
     } catch (error) {
       const startupError = error instanceof Error ? error : new Error(String(error));
-      await process.close(startupError);
+      try {
+        await process.close(startupError);
+      } catch (cleanupError) {
+        throw new ProviderInitializationCleanupError(process, startupError, cleanupError);
+      }
       throw startupError;
     } finally {
       input.signal?.removeEventListener("abort", handleAbort);

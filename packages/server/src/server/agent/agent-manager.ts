@@ -1,10 +1,16 @@
+import { AgentNotFoundError } from "./agent-not-found-error.js";
+import { AgentProbe } from "./agent-probe.js";
 import type { PluginLifecycle } from "../plugins/lifecycle/index.js";
 import { describeHookAgent, publishAgentStream } from "../plugins/lifecycle/index.js";
 import type { PluginSessionOpenRequest } from "@getpaseo/plugin/server";
 import { randomUUID } from "node:crypto";
+import {
+  ProviderInitializationCleanupError,
+  type ProviderCleanupOwner,
+} from "./provider-initialization-cleanup-error.js";
 import { AdmissionGate } from "../restart/admission-gate.js";
-import { AgentRestartSuspendedError } from "../restart/restart-errors.js";
-import { AgentCheckpointSchema, type AgentCheckpoint } from "../restart/agent-checkpoint.js";
+import { AgentRestartSuspendedError, RestartInProgressError } from "../restart/restart-errors.js";
+import { type AgentCheckpoint } from "../restart/agent-checkpoint.js";
 import {
   continuationPrompt,
   verifyRecoveryInputFiles,
@@ -38,6 +44,7 @@ import {
   getAgentStreamEventTurnId,
   type AgentCapabilityFlags,
   type AgentClient,
+  type AgentProbeContext,
   type AgentCreateSessionOptions,
   type AgentResumeSessionOptions,
   type AgentFeature,
@@ -86,6 +93,8 @@ import {
 import { limitAgentTimelineItemContent } from "./agent-timeline-content.js";
 import {
   AgentRunState,
+  type AgentRunOutcome,
+  type AgentRunOutcomeInput,
   type ForegroundTurnWaiter,
   type PendingForegroundRun,
 } from "./agent-run-state.js";
@@ -720,14 +729,34 @@ export class AgentManager {
   private readonly suspendedForRestart = new Map<string, RecoveryInput[]>();
   private readonly quiescedSessions = new Set<string>();
   private readonly eventFailures = new Map<string, unknown>();
-  private restartPhase: "running" | "preparing" | "paused" | "restoring" = "running";
+  private readonly recoveryInventory = new Map<string, AgentCheckpoint["agents"][number]>();
+  private readonly failedSessionStops = new Map<string, unknown>();
+  private readonly failedUnregisteredStops = new Map<
+    ProviderCleanupOwner,
+    { agentId: string; error: unknown }
+  >();
+  private readonly sessionStops = new Map<string, Promise<void>>();
+  private readonly explicitStops = new Set<string>();
+  private readonly recoveryRegistrations = new Map<string, Promise<ManagedAgent>>();
+  private readonly activeDraftProbes = new Map<AgentProbe, string>();
+  private readonly outOfBandCompletions = new Map<string, Set<Promise<void>>>();
+  private readonly uncertainStarts = new Set<string>();
+  private recoveryLifecycle: {
+    status: { state: "running" | "preparing" | "paused" | "restoring" };
+    control: <T>(operation: () => Promise<T>) => Promise<T>;
+  } | null = null;
+
+  bindRecoveryLifecycle(lifecycle: NonNullable<AgentManager["recoveryLifecycle"]>): void {
+    if (this.recoveryLifecycle) throw new Error("Recovery lifecycle already bound");
+    this.recoveryLifecycle = lifecycle;
+  }
 
   get recoveryPhase() {
-    return this.restartPhase;
+    return this.recoveryLifecycle?.status.state ?? (this.admissions.isOpen ? "running" : "paused");
   }
 
   isRestartSuspended(agentId?: string): boolean {
-    return agentId ? this.suspendedForRestart.has(agentId) : this.restartPhase !== "running";
+    return agentId ? this.suspendedForRestart.has(agentId) : this.recoveryPhase !== "running";
   }
 
   assertAcceptingWork(): void {
@@ -738,106 +767,219 @@ export class AgentManager {
     return this.admissions.run(operation);
   }
 
+  async freezeRestartAdmissions(): Promise<void> {
+    const drainingAdmissions = this.admissions.freeze();
+    // An accepted command may itself await a catalog probe. Stop its physical
+    // owner while draining admission, so cleanup can settle that dependency.
+    await Promise.all([drainingAdmissions, this.stopProviderProbes()]);
+  }
+  openRestartAdmissions(): void {
+    this.admissions.open();
+  }
+  recoveryBlockedAgents(): string[] {
+    return [
+      ...new Set([
+        ...this.failedSessionStops.keys(),
+        ...[...this.failedUnregisteredStops.values()].map((failure) => failure.agentId),
+      ]),
+    ];
+  }
+
   async pauseForRecoveryFailure(): Promise<void> {
-    this.restartPhase = "paused";
-    await this.admissions.freeze();
+    await this.quiesceRestartExecution();
+  }
+
+  /** Stop every owned provider before reporting pause; failed closes remain uncertified. */
+  async quiesceRestartExecution(): Promise<void> {
+    await this.freezeRestartAdmissions();
+    await Promise.all([
+      ...this.foregroundMutationTails.values(),
+      ...this.lifecycleMutationTails.values(),
+    ]);
+    const live = [...this.agents.values()];
+    for (const agent of live) {
+      await this.drainSessionEvents(agent.id);
+      if (
+        !agent.internal &&
+        !this.explicitStops.has(agent.id) &&
+        (this.runs.hasRun(agent.id) || agent.activeTurnId || agent.lifecycle === "running")
+      ) {
+        const inputs = this.runs.recoveryInputs(agent.id);
+        if (inputs.length || !this.suspendedForRestart.has(agent.id))
+          this.suspendedForRestart.set(agent.id, inputs);
+      }
+    }
+    // A rejection cannot short-circuit cleanup of the other providers.
+    const stopped = await Promise.allSettled([
+      ...live.map((agent) => this.stopRestartSession(agent)),
+      this.stopProviderProbes(),
+    ]);
+    const errors = stopped.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    await Promise.all(
+      [...this.failedUnregisteredStops].map(([session, failure]) =>
+        this.closeUnregisteredSession(session, failure.agentId),
+      ),
+    );
+    await this.flushForShutdown();
+    if (
+      errors.length ||
+      this.failedSessionStops.size ||
+      this.failedUnregisteredStops.size ||
+      this.eventFailures.size
+    ) {
+      throw new AggregateError(
+        [
+          ...errors,
+          ...this.failedSessionStops.values(),
+          ...[...this.failedUnregisteredStops.values()].map((failure) => failure.error),
+          ...this.eventFailures.values(),
+        ],
+        "Cannot certify provider teardown and event drain",
+      );
+    }
+  }
+
+  private async stopProviderProbes(): Promise<void> {
+    const results = await Promise.allSettled(
+      [...this.activeDraftProbes].map(async ([probe, ownerId]) => {
+        try {
+          await probe.close();
+          this.failedUnregisteredStops.delete(probe);
+        } catch (error) {
+          this.failedUnregisteredStops.set(probe, { agentId: ownerId, error });
+          throw error;
+        }
+      }),
+    );
+    const errors = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    if (errors.length) throw new AggregateError(errors, "Provider probes did not stop");
+  }
+
+  private stopRestartSession(agent: LiveManagedAgent): Promise<void> {
+    const existing = this.sessionStops.get(agent.id);
+    if (existing) return existing;
+    if (this.quiescedSessions.has(agent.id) || !agent.session) return Promise.resolve();
+    const stop = (async () => {
+      try {
+        await agent.session!.close();
+      } catch (error) {
+        this.failedSessionStops.set(agent.id, error);
+        this.publishRunOutcome({
+          type: "uncertain",
+          agentId: agent.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
+      this.failedSessionStops.delete(agent.id);
+      await this.drainOutOfBandCompletions(agent.id);
+      await this.drainSessionEvents(agent.id);
+      this.agentStreamCoalescer.flushFor(agent.id);
+      this.runs.cancelWaiters(agent, (turnId) => ({
+        type: "turn_canceled",
+        provider: agent.provider,
+        turnId,
+        reason: "restart",
+      }));
+      this.runs.clearAgentRun(agent.id);
+      agent.unsubscribeSession?.();
+      agent.unsubscribeSession = null;
+      this.quiescedSessions.add(agent.id);
+      this.uncertainStarts.delete(agent.id);
+      if (this.explicitStops.has(agent.id)) {
+        this.suspendedForRestart.delete(agent.id);
+        this.runs.forgetInputs(agent.id);
+        const outcome = this.runs.getOutcome(agent.id);
+        if (!outcome || outcome.type === "suspended" || outcome.type === "uncertain")
+          this.publishRunOutcome({ type: "user_canceled", agentId: agent.id });
+      } else if (this.suspendedForRestart.has(agent.id)) {
+        this.publishRunOutcome({ type: "suspended", agentId: agent.id });
+      }
+    })();
+    this.sessionStops.set(agent.id, stop);
+    void stop.finally(() => this.sessionStops.delete(agent.id)).catch(() => undefined);
+    return stop;
+  }
+
+  /** Called with lifecycle controls closed, after accepted cancellations drained. */
+  async finalizeRestartRestoration(): Promise<void> {
+    for (const agentId of this.quiescedSessions) {
+      const agent = this.agents.get(agentId);
+      if (!agent) continue;
+      const closed = this.prepareAgentForClosure(agent, "recovery cancellation");
+      await this.persistSnapshot(closed);
+      this.quiescedSessions.delete(agentId);
+      this.emitClosedAgent(closed, { persist: false });
+    }
   }
 
   async quiesceForRestart(): Promise<AgentCheckpoint> {
-    this.restartPhase = "preparing";
-    try {
-      await this.admissions.freeze();
-      await Promise.all([
-        ...this.foregroundMutationTails.values(),
-        ...this.lifecycleMutationTails.values(),
-      ]);
-      const live = [...this.agents.values()];
-      for (const agent of live) {
-        await this.drainSessionEvents(agent.id);
-        if (
-          !agent.internal &&
-          (this.runs.hasRun(agent.id) || agent.activeTurnId || agent.lifecycle === "running")
-        ) {
-          this.suspendedForRestart.set(agent.id, this.runs.recoveryInputs(agent.id));
-        }
+    await this.quiesceRestartExecution();
+    // Installed agents which have never launched still own their input and configuration.
+    const inventory = new Map<string, AgentCheckpoint["agents"][number]>();
+    for (const [id, entry] of this.recoveryInventory) {
+      const record = this.registry ? await this.registry.get(id) : entry.record;
+      if (!record || record.archivedAt) {
+        this.recoveryInventory.delete(id);
+        continue;
       }
-      await Promise.all(
-        live.map(async (agent) => {
-          if (this.quiescedSessions.has(agent.id) || !agent.session) return;
-          try {
-            await agent.session.close();
-          } catch (error) {
-            // A failed close can leave a provider's internal `closed` flag set
-            // without completing teardown. A later no-op close cannot certify it.
-            this.eventFailures.set(agent.id, error);
-            throw error;
-          }
-          await this.drainSessionEvents(agent.id);
-          this.agentStreamCoalescer.flushFor(agent.id);
-          // A provider is allowed to close without a terminal event. Settle only the live
-          // waiter, leaving the recovery input and displayed history owned by the manager.
-          this.runs.cancelWaiters(agent, (turnId) => ({
-            type: "turn_canceled",
-            provider: agent.provider,
-            turnId,
-            reason: "restart",
-          }));
-          this.runs.clearAgentRun(agent.id);
-          agent.unsubscribeSession?.();
-          agent.unsubscribeSession = null;
-          this.quiescedSessions.add(agent.id);
-        }),
-      );
-      await this.flushForShutdown();
-      if (this.eventFailures.size)
-        throw new AggregateError(
-          [...this.eventFailures.values()],
-          "Cannot checkpoint unprocessed provider events",
-        );
-      const agents: AgentCheckpoint["agents"] = [];
-      for (const agent of live.filter((entry) => !entry.internal)) {
-        const existing = await this.registry?.get(agent.id);
-        const record = {
-          ...existing,
-          ...toStoredAgentRecord(agent, { title: existing?.title ?? null }),
-        };
-        // Await an explicit write of the checkpoint's record; background metadata
-        // persistence logs failures and its generic shutdown flush cannot certify it.
-        await this.registry?.upsert(record);
-        const resume = this.suspendedForRestart.has(agent.id);
-        if (resume && !record.persistence?.sessionId)
-          throw new Error(`Cannot recover agent ${agent.id} without its native session handle`);
-        agents.push({
-          record,
-          continue: resume,
-          inputs: this.suspendedForRestart.get(agent.id) ?? [],
-        });
-      }
-      await this.registry?.flush();
-      const snapshot = AgentCheckpointSchema.parse({
-        timelines: this.timelineStore.exportAll(),
-        children: this.providerSubagents.exportSnapshot(),
-        agents,
-      });
-      await verifyRecoveryInputFiles(snapshot.agents.flatMap((agent) => agent.inputs));
-      return snapshot;
-    } catch (error) {
-      this.restartPhase = "paused";
-      throw error;
+      inventory.set(id, { ...entry, record });
     }
+    for (const agent of [...this.agents.values()].filter((entry) => !entry.internal)) {
+      const existing = await this.registry?.get(agent.id);
+      const record = {
+        ...existing,
+        ...toStoredAgentRecord(agent, { title: existing?.title ?? null }),
+      };
+      await this.registry?.upsert(record);
+      inventory.set(agent.id, { record, continue: false, inputs: [] });
+    }
+    const agents: AgentCheckpoint["agents"] = [];
+    for (const entry of inventory.values()) {
+      const inputs = this.suspendedForRestart.get(entry.record.id);
+      const resume = inputs !== undefined && !this.explicitStops.has(entry.record.id);
+      if (resume && !entry.record.persistence?.sessionId)
+        throw new Error(
+          `Cannot recover agent ${entry.record.id} without its native session handle`,
+        );
+      agents.push({
+        record: entry.record,
+        continue: resume,
+        inputs: resume ? inputs : [],
+        runId: this.runs.getLogicalId(entry.record.id) ?? entry.runId,
+      });
+    }
+    await this.registry?.flush();
+    const snapshot: AgentCheckpoint = {
+      timelines: this.timelineStore.exportAll(),
+      children: this.providerSubagents.exportSnapshot(),
+      agents,
+    };
+    await verifyRecoveryInputFiles(snapshot.agents.flatMap((agent) => agent.inputs));
+    return snapshot;
   }
 
   async installRestartCheckpoint(snapshot: AgentCheckpoint): Promise<void> {
-    snapshot = AgentCheckpointSchema.parse(snapshot);
-    this.restartPhase = "restoring";
     await this.admissions.freeze();
-    for (const [id, timeline] of Object.entries(snapshot.timelines))
-      this.timelineStore.restoreSnapshot(id, timeline);
-    this.providerSubagents.restoreSnapshot(snapshot.children);
+    // Register the complete inventory before fallible persistence; capture cannot drop an
+    // unstarted agent after an installation error. Existing owned histories are never replaced.
     for (const entry of snapshot.agents) {
-      await this.registry?.upsert(entry.record);
-      if (entry.continue) this.suspendedForRestart.set(entry.record.id, entry.inputs);
+      if (!this.recoveryInventory.has(entry.record.id)) {
+        this.recoveryInventory.set(entry.record.id, entry);
+        this.runs.restoreInputs(entry.record.id, entry.inputs, entry.runId);
+        if (entry.continue) this.suspendedForRestart.set(entry.record.id, entry.inputs);
+      }
     }
+    for (const [id, timeline] of Object.entries(snapshot.timelines)) {
+      if (!this.timelineStore.has(id)) this.timelineStore.restoreSnapshot(id, timeline);
+    }
+    this.providerSubagents.restoreSnapshot(snapshot.children);
+    for (const entry of this.recoveryInventory.values()) await this.registry?.upsert(entry.record);
+    await this.registry?.flush();
   }
 
   async resumeRestartCheckpoint(
@@ -845,54 +987,144 @@ export class AgentManager {
     beforeRuns?: () => void | Promise<void>,
     beforeOpen?: () => Promise<void>,
   ): Promise<void> {
+    await this.admissions.freeze();
     try {
-      await this.admissions.restore(async () => {
-        for (const entry of snapshot.agents.filter((candidate) => candidate.continue)) {
-          const { record } = entry;
-          const handle = toAgentPersistenceHandle(
-            this.getRegisteredProviderIds(),
-            record.persistence,
-          );
-          if (!handle) throw new Error(`Cannot recover native session for ${record.id}`);
-          await this.resumeAgentFromPersistence(
+      for (const entry of snapshot.agents) {
+        if (!this.recoveryInventory.has(entry.record.id))
+          this.recoveryInventory.set(entry.record.id, entry);
+      }
+      await this.retireIdleRestartSessions(snapshot);
+      for (const entry of snapshot.agents.filter((candidate) => candidate.continue)) {
+        const { record } = entry;
+        if (this.explicitStops.has(record.id)) continue;
+        const handle = toAgentPersistenceHandle(
+          this.getRegisteredProviderIds(),
+          record.persistence,
+        );
+        if (!handle) throw new Error(`Cannot recover native session for ${record.id}`);
+        const existing = this.agents.get(record.id);
+        if (existing) {
+          if (!this.quiescedSessions.has(record.id))
+            throw new Error(`Agent ${record.id} was not stopped`);
+          this.agents.delete(record.id);
+          this.quiescedSessions.delete(record.id);
+        }
+        // Private controller-to-manager work has no AsyncLocalStorage admission privilege.
+        const registration = this.trackAgentRegistrationOperation(
+          this.resumeAgentFromPersistenceInternal(
             handle,
             buildConfigOverrides(record),
             record.id,
             extractTimestamps(record),
-          );
-          this.requireAgent(record.id).lifecycle = "running";
+          ),
+        );
+        this.recoveryRegistrations.set(record.id, registration);
+        try {
+          await registration;
+        } finally {
+          this.recoveryRegistrations.delete(record.id);
         }
-        await beforeRuns?.();
-        for (const entry of snapshot.agents.filter((candidate) => candidate.continue)) {
-          const { record, inputs } = entry;
-          const iterator = this.streamAgent(
-            record.id,
-            continuationPrompt(inputs),
-            inputs[0]?.options ? { ...inputs[0].options, clientMessageId: undefined } : undefined,
-          );
-          this.runs.restoreInputs(record.id, inputs);
-          await iterator.next();
-          this.suspendedForRestart.delete(record.id);
-          // Publish the actual resumed status before reopening client queue
-          // admission; registration/start events were hidden during restoration.
-          this.emitState(this.requireAgent(record.id));
-          void (async () => {
-            for await (const _event of iterator) {
-              /* manager owns event delivery */
-            }
-          })().catch((error) => {
-            this.logger.error({ err: error, agentId: record.id }, "Recovered agent run failed");
-          });
+        // A stop accepted during provider initialization belongs to this attempt.
+        if (this.explicitStops.has(record.id)) {
+          await this.stopRestartSession(this.requireAgent(record.id));
+          continue;
         }
-      });
+        this.runs.clearOutcome(record.id);
+        this.requireAgent(record.id).lifecycle = "running";
+      }
+      await beforeRuns?.();
+      for (const entry of snapshot.agents.filter((candidate) => candidate.continue)) {
+        const { record, inputs } = entry;
+        if (this.explicitStops.has(record.id)) continue;
+        const iterator = this.streamAgentInternal(
+          record.id,
+          continuationPrompt(inputs),
+          inputs[0]?.options ? { ...inputs[0].options, clientMessageId: undefined } : undefined,
+          (operation) => Promise.resolve().then(operation),
+        );
+        this.runs.restoreInputs(record.id, inputs, entry.runId);
+        await iterator.next();
+        this.suspendedForRestart.delete(record.id);
+        this.emitState(this.requireAgent(record.id));
+        void (async () => {
+          for await (const _event of iterator) {
+            /* owned stream */
+          }
+        })().catch((error) =>
+          this.logger.error({ err: error, agentId: record.id }, "Recovered agent run failed"),
+        );
+      }
       await beforeOpen?.();
-      this.restartPhase = "running";
-      this.admissions.open();
+      // Standalone manager users have no controller; production opens only through its owner.
+      if (!this.recoveryLifecycle) {
+        await this.finalizeRestartRestoration();
+        this.admissions.open();
+      }
     } catch (error) {
-      this.restartPhase = "paused";
+      if (!this.recoveryLifecycle) await this.quiesceRestartExecution();
       throw error;
     }
   }
+
+  private async retireIdleRestartSessions(snapshot: AgentCheckpoint): Promise<void> {
+    // Same-process recovery also closes idle sessions. Retain their catalog/history,
+    // not a live handle which rejects the next ordinary command as already closed.
+    for (const entry of snapshot.agents.filter((candidate) => !candidate.continue)) {
+      const agent = this.agents.get(entry.record.id);
+      if (!agent) continue;
+      if (!this.quiescedSessions.has(agent.id))
+        throw new Error(`Agent ${agent.id} was not stopped`);
+      const closed = this.prepareAgentForClosure(agent, "restart idle session");
+      this.quiescedSessions.delete(agent.id);
+      await this.persistSnapshot(closed);
+    }
+  }
+
+  subscribeRunOutcome(agentId: string, listener: (outcome: AgentRunOutcome) => void): () => void {
+    return this.runs.subscribeOutcome(agentId, listener);
+  }
+
+  getRunOutcome(agentId: string): AgentRunOutcome | undefined {
+    return this.runs.getOutcome(agentId);
+  }
+  getRunIdentity(agentId: string): string | undefined {
+    return this.runs.getLogicalId(agentId);
+  }
+  waitForRunOutcome(agentId: string, runId: string): Promise<AgentRunOutcome> {
+    return this.runs.waitForOutcome(agentId, runId);
+  }
+  private publishRunOutcome(outcome: AgentRunOutcomeInput): void {
+    this.runs.publishOutcome(
+      outcome,
+      this.getLastAssistantMessageFromTimeline(this.timelineStore.getItems(outcome.agentId)),
+    );
+  }
+
+  /** Observe before handing off, and own subscription cleanup if admission fails. */
+  async startObservedRun(
+    agentId: string,
+    runId: string,
+    start: () => Promise<unknown>,
+  ): Promise<{ completion: Promise<AgentRunOutcome> }> {
+    let resolveOutcome!: (outcome: AgentRunOutcome) => void;
+    const completion = new Promise<AgentRunOutcome>((fulfill) => {
+      resolveOutcome = fulfill;
+    });
+    const unsubscribe = this.runs.subscribeOutcome(agentId, (outcome) => {
+      if (outcome.runId !== runId) return;
+      unsubscribe();
+      resolveOutcome(outcome);
+    });
+    try {
+      await start();
+      await Promise.race([completion, this.waitForAgentRunStart(agentId)]);
+      return { completion };
+    } catch (error) {
+      unsubscribe();
+      throw error;
+    }
+  }
+
   private readonly subscribers = new Set<SubscriptionRecord>();
   private readonly idFactory: () => string;
   private readonly registry?: AgentStorage;
@@ -945,8 +1177,7 @@ export class AgentManager {
       windowMs: options.agentStreamCoalesceWindowMs ?? AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS,
       timers: { setTimeout, clearTimeout },
       onFlush: ({ agentId, item, provider, turnId }) => {
-        const event = this.recordAndDispatchTimelineItem(agentId, item, provider, turnId);
-        this.notifyForegroundTurnWaiters(agentId, event);
+        this.commitTimeline(agentId, item, provider, turnId);
       },
     });
     this.updateProviderRegistry({
@@ -1168,15 +1399,20 @@ export class AgentManager {
     const providerResults = await Promise.all(
       providerEntries.map(async ([provider, client]) => {
         try {
-          const sessions = await withTimeout(
-            client.listImportableSessions!({
-              limit: options?.limit,
-              query: options?.query,
-              scanLimit: options?.scanLimit,
-              cwd: options?.cwd,
-            }),
-            IMPORTABLE_SESSION_LIST_TIMEOUT_MS,
-            `Timed out listing importable sessions for provider '${provider}' after ${IMPORTABLE_SESSION_LIST_TIMEOUT_MS}ms`,
+          const sessions = await this.runProviderProbe(`importable:${provider}`, (probe) =>
+            withTimeout(
+              client.listImportableSessions!(
+                {
+                  limit: options?.limit,
+                  query: options?.query,
+                  scanLimit: options?.scanLimit,
+                  cwd: options?.cwd,
+                },
+                probe,
+              ),
+              IMPORTABLE_SESSION_LIST_TIMEOUT_MS,
+              `Timed out listing importable sessions for provider '${provider}' after ${IMPORTABLE_SESSION_LIST_TIMEOUT_MS}ms`,
+            ),
           );
           return {
             sessions: sessions
@@ -1240,7 +1476,9 @@ export class AgentManager {
     }
 
     try {
-      const available = await client.isAvailable();
+      const available = await this.runProviderProbe(`availability:${provider}`, (probe) =>
+        client.isAvailable(probe.signal),
+      );
       return {
         provider,
         available,
@@ -1257,78 +1495,119 @@ export class AgentManager {
     }
   }
 
-  async listDraftCommands(config: AgentSessionConfig): Promise<AgentSlashCommand[]> {
-    const normalizedConfig = await this.normalizeConfig(config, { resolveDefaultModel: false });
-    const client = this.requireClient(normalizedConfig.provider);
-    if (!normalizedConfig.model) {
-      return [];
-    }
-    const available = await client.isAvailable();
-    if (!available) {
-      throw new Error(
-        `Provider '${normalizedConfig.provider}' is not available. Please ensure the CLI is installed.`,
-      );
-    }
-
-    if (client.listCommands) {
-      return await client.listCommands(normalizedConfig);
-    }
-
-    const session = await client.createSession(normalizedConfig);
-    try {
-      if (!session.listCommands) {
-        throw new Error(
-          `Provider '${normalizedConfig.provider}' does not support listing commands`,
-        );
-      }
-      return await session.listCommands();
-    } finally {
+  listDraftCommands(config: AgentSessionConfig): Promise<AgentSlashCommand[]> {
+    return this.runDraftProbe(config, async (client, normalizedConfig, probe) => {
+      if (!normalizedConfig.model) return [];
+      await this.assertDraftProviderAvailable(client, normalizedConfig.provider, probe.signal);
+      if (client.listCommands) return client.listCommands(normalizedConfig, probe);
+      const session = await client.createSession(normalizedConfig, undefined, { probe });
+      const release = probe.own(session);
       try {
+        if (!session.listCommands)
+          throw new Error(
+            `Provider '${normalizedConfig.provider}' does not support listing commands`,
+          );
+        return await session.listCommands();
+      } finally {
         await session.close();
-      } catch (error) {
-        this.logger.warn(
-          { err: error, provider: normalizedConfig.provider },
-          "Failed to close draft command listing session",
-        );
+        release();
       }
-    }
+    });
   }
 
-  async listDraftFeatures(config: AgentSessionConfig): Promise<AgentFeature[]> {
-    const normalizedConfig = await this.normalizeConfig(config, { resolveDefaultModel: false });
-    const client = this.requireClient(normalizedConfig.provider);
-    if (!normalizedConfig.model && !client.listFeatures) {
-      return [];
-    }
-    const available = await client.isAvailable();
-    if (!available) {
-      throw new Error(
-        `Provider '${normalizedConfig.provider}' is not available. Please ensure the CLI is installed.`,
-      );
-    }
-
-    if (client.listFeatures) {
-      return await client.listFeatures(normalizedConfig);
-    }
-
-    const session = await client.createSession(normalizedConfig);
-    try {
-      return session.features ?? [];
-    } finally {
+  listDraftFeatures(config: AgentSessionConfig): Promise<AgentFeature[]> {
+    return this.runDraftProbe(config, async (client, normalizedConfig, probe) => {
+      if (!normalizedConfig.model && !client.listFeatures) return [];
+      await this.assertDraftProviderAvailable(client, normalizedConfig.provider, probe.signal);
+      if (client.listFeatures) return client.listFeatures(normalizedConfig, probe);
+      const session = await client.createSession(normalizedConfig, undefined, { probe });
+      const release = probe.own(session);
       try {
+        return session.features ?? [];
+      } finally {
         await session.close();
-      } catch (error) {
-        this.logger.warn(
-          { err: error, provider: normalizedConfig.provider },
-          "Failed to close draft feature listing session",
-        );
+        release();
       }
-    }
+    });
+  }
+
+  private async assertDraftProviderAvailable(
+    client: AgentClient,
+    provider: AgentProvider,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (!(await client.isAvailable(signal)))
+      throw new Error(
+        `Provider '${provider}' is not available. Please ensure the CLI is installed.`,
+      );
+  }
+
+  private async runDraftProbe<T>(
+    config: AgentSessionConfig,
+    operation: (
+      client: AgentClient,
+      config: AgentSessionConfig,
+      probe: AgentProbeContext,
+    ) => Promise<T>,
+  ): Promise<T> {
+    const accepted = await this.admissions.run(async () => {
+      const ownerId = `draft:${config.provider}:${randomUUID()}`;
+      const normalizedConfig = await this.normalizeConfig(config, { resolveDefaultModel: false });
+      const client = this.requireClient(normalizedConfig.provider);
+      return this.acceptProviderProbe(ownerId, (context) =>
+        operation(client, normalizedConfig, context),
+      );
+    });
+    return accepted.completion;
+  }
+
+  /** Native catalog/diagnostic reads use the same cleanup owner as draft probes. */
+  async runProviderProbe<T>(
+    name: string,
+    operation: (context: AgentProbeContext) => Promise<T>,
+  ): Promise<T> {
+    const accepted = await this.admissions.run(async () =>
+      this.acceptProviderProbe(`${name}:${randomUUID()}`, operation),
+    );
+    return accepted.completion;
+  }
+
+  private acceptProviderProbe<T>(
+    ownerId: string,
+    operation: (context: AgentProbeContext) => Promise<T>,
+  ): { completion: Promise<T> } {
+    // A nested accepted command may finish bookkeeping after freeze, but it must
+    // not acquire a new native query owner outside the stopping inventory.
+    if (!this.admissions.isOpen) throw new RestartInProgressError();
+    const probe = new AgentProbe();
+    this.activeDraftProbes.set(probe, ownerId);
+    const completion = this.admissions.outside(() =>
+      this.ownProviderInitialization(ownerId, () => probe.run(operation)),
+    );
+    void completion
+      .finally(() => {
+        this.activeDraftProbes.delete(probe);
+      })
+      .catch(() => undefined);
+    return { completion };
   }
 
   getAgent(id: string): ManagedAgent | null {
     const agent = this.agents.get(id);
     return agent ? { ...agent } : null;
+  }
+
+  getAgentLifecycle(agentId: string): Pick<ManagedAgent, "id" | "cwd" | "lifecycle"> | null {
+    const live = this.agents.get(agentId);
+    if (live) return { id: live.id, cwd: live.cwd, lifecycle: live.lifecycle };
+    const retained = this.recoveryInventory.get(agentId)?.record;
+    return retained
+      ? {
+          id: retained.id,
+          cwd: retained.cwd,
+          lifecycle: this.suspendedForRestart.has(agentId) ? "running" : "idle",
+        }
+      : null;
   }
 
   async waitForAgentClose(agentId: string): Promise<void> {
@@ -1337,13 +1616,22 @@ export class AgentManager {
     await this.inFlightAgentCloses?.get(agentId)?.catch(() => undefined);
   }
 
+  hasInstalledHistory(id: string): boolean {
+    return this.timelineStore.has(id) && (this.agents.has(id) || this.recoveryInventory.has(id));
+  }
+
+  private requireRetainedAgent(id: string, publicOnly = false): void {
+    const record = this.agents.get(id) ?? this.recoveryInventory.get(id)?.record;
+    if (!record || (publicOnly && record.internal)) throw new AgentNotFoundError(id);
+  }
+
   getTimeline(id: string): AgentTimelineItem[] {
-    this.requireAgent(id);
+    this.requireRetainedAgent(id);
     return this.timelineStore.getItems(id);
   }
 
   async getTimelineRows(id: string): Promise<AgentTimelineRow[]> {
-    this.requireAgent(id);
+    this.requireRetainedAgent(id);
     if (this.durableTimelineStore) {
       return await this.durableTimelineStore.getCommittedRows(id);
     }
@@ -1351,12 +1639,12 @@ export class AgentManager {
   }
 
   fetchTimeline(id: string, options?: AgentTimelineFetchOptions): AgentTimelineFetchResult {
-    this.requireAgent(id);
+    this.requireRetainedAgent(id);
     return this.timelineStore.fetch(id, options);
   }
 
   listProviderSubagents(parentAgentId: string): ProviderSubagentDescriptor[] {
-    this.requirePublicAgent(parentAgentId);
+    this.requireRetainedAgent(parentAgentId, true);
     return this.providerSubagents.list(parentAgentId);
   }
 
@@ -1375,7 +1663,7 @@ export class AgentManager {
     parentAgentId: string,
     subagentId: string,
   ): ProviderSubagentDescriptor | null {
-    this.requirePublicAgent(parentAgentId);
+    this.requireRetainedAgent(parentAgentId, true);
     return this.providerSubagents.get(parentAgentId, subagentId);
   }
 
@@ -1384,7 +1672,7 @@ export class AgentManager {
     subagentId: string,
     options?: AgentTimelineFetchOptions,
   ): AgentTimelineFetchResult {
-    this.requirePublicAgent(parentAgentId);
+    this.requireRetainedAgent(parentAgentId, true);
     return this.providerSubagents.fetchTimeline(parentAgentId, subagentId, options);
   }
 
@@ -1434,8 +1722,10 @@ export class AgentManager {
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
     const createOptions = this.buildCreateSessionOptions(options);
-    const session = await client.createSession(providerLaunchConfig, launchContext, createOptions);
-    await this.requireExternalMcpSupport(session, storedConfig);
+    const session = await this.ownProviderInitialization(resolvedAgentId, () =>
+      client.createSession(providerLaunchConfig, launchContext, createOptions),
+    );
+    await this.requireExternalMcpSupport(session, storedConfig, resolvedAgentId);
     const agent = await this.registerSession(session, storedConfig, resolvedAgentId, {
       labels: options.labels,
       initialTitle: options.initialTitle,
@@ -1475,11 +1765,14 @@ export class AgentManager {
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
-    return this.admissions.run(() =>
-      this.trackAgentRegistrationOperation(
+    return this.admissions.run(() => {
+      // A user reopen starts a new owner. Recovery uses the private path and must
+      // preserve cancellations accepted while that owner is being registered.
+      if (agentId) this.explicitStops.delete(agentId);
+      return this.trackAgentRegistrationOperation(
         this.resumeAgentFromPersistenceInternal(handle, overrides, agentId, options, resumeOptions),
-      ),
-    );
+      );
+    });
   }
 
   private async resumeAgentFromPersistenceInternal(
@@ -1533,13 +1826,10 @@ export class AgentManager {
       },
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-    const session = await client.resumeSession(
-      handle,
-      providerLaunchConfig,
-      launchContext,
-      resumeOptions,
+    const session = await this.ownProviderInitialization(resolvedAgentId, () =>
+      client.resumeSession(handle, providerLaunchConfig, launchContext, resumeOptions),
     );
-    await this.requireExternalMcpSupport(session, storedConfig);
+    await this.requireExternalMcpSupport(session, storedConfig, resolvedAgentId);
     return this.registerSession(session, storedConfig, resolvedAgentId, {
       ...options,
       persistence: handle,
@@ -1591,12 +1881,14 @@ export class AgentManager {
       { reason: "import", purpose: "interactive", workspaceId: input.workspaceId },
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-    const imported = await client.importSession(
-      {
-        providerHandleId: input.providerHandleId,
-        cwd: input.cwd,
-      },
-      { config: providerLaunchConfig, storedConfig, launchContext },
+    const imported = await this.ownProviderInitialization(resolvedAgentId, () =>
+      client.importSession!(
+        {
+          providerHandleId: input.providerHandleId,
+          cwd: input.cwd,
+        },
+        { config: providerLaunchConfig, storedConfig, launchContext },
+      ),
     );
     let handedToRegistration = false;
     try {
@@ -1624,7 +1916,7 @@ export class AgentManager {
       return agent;
     } finally {
       if (!handedToRegistration) {
-        await this.closeUnregisteredSession(imported.session);
+        await this.closeUnregisteredSession(imported.session, resolvedAgentId);
       }
     }
   }
@@ -1699,6 +1991,7 @@ export class AgentManager {
     try {
       // A persisted thread can have only one writer, even when its turn is idle.
       await this.closeReloadedSession(existing.session, agentId);
+      await this.drainOutOfBandCompletions(agentId);
       await this.drainSessionEvents(agentId);
       this.cancelRunningProviderSubagents(agentId);
       closedExisting = this.prepareAgentForClosure(existing, "agent reloaded");
@@ -1706,10 +1999,13 @@ export class AgentManager {
       this.assertAcceptingAgentRegistrations();
 
       this.paseoToolPolicies.set(agentId, paseoToolPolicy);
-      session = handle
-        ? await client.resumeSession(handle, providerLaunchConfig, launchContext)
-        : await client.createSession(providerLaunchConfig, launchContext);
-      await this.requireExternalMcpSupport(session, storedConfig);
+      this.explicitStops.delete(agentId);
+      session = await this.ownProviderInitialization(agentId, () =>
+        handle
+          ? client.resumeSession(handle, providerLaunchConfig, launchContext)
+          : client.createSession(providerLaunchConfig, launchContext),
+      );
+      await this.requireExternalMcpSupport(session, storedConfig, agentId);
       this.assertAcceptingAgentRegistrations();
 
       if (rehydrateFromDisk) {
@@ -1752,7 +2048,7 @@ export class AgentManager {
           this.paseoToolPolicies.delete(agentId);
         }
         if (session) {
-          await this.closeUnregisteredSession(session);
+          await this.closeUnregisteredSession(session, agentId);
         }
       }
     }
@@ -1847,14 +2143,29 @@ export class AgentManager {
     );
     await this.drainSessionEvents(agentId);
     this.cancelRunningProviderSubagents(agentId);
-    const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
-    let closeError: unknown;
+    this.explicitStops.add(agentId);
+    // Keep subscriptions and ownership until the provider certifies cessation. A failed
+    // close must remain available to recovery stop/retry, including its late events.
     try {
       await agent.session.close();
     } catch (error) {
-      closeError = error;
+      this.failedSessionStops.set(agent.id, error);
+      throw error;
     }
-
+    this.failedSessionStops.delete(agent.id);
+    await this.drainOutOfBandCompletions(agentId);
+    await this.drainSessionEvents(agentId);
+    this.agentStreamCoalescer.flushFor(agentId);
+    const outcome = this.runs.getOutcome(agentId);
+    if (
+      this.runs.getLogicalId(agentId) &&
+      (!outcome || outcome.type === "uncertain" || outcome.type === "suspended")
+    ) {
+      this.publishRunOutcome({ type: "user_canceled", agentId });
+    }
+    this.runs.forgetInputs(agentId);
+    this.suspendedForRestart.delete(agentId);
+    const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
     let persistError: unknown;
     try {
       await this.persistSnapshot(closedAgent);
@@ -1871,9 +2182,6 @@ export class AgentManager {
       "agent.manager.close.complete",
     );
 
-    if (closeError !== undefined) {
-      throw closeError;
-    }
     if (persistError !== undefined) {
       throw persistError;
     }
@@ -2457,6 +2765,15 @@ export class AgentManager {
   /** Teardown owns closed sessions; it must not turn a checkpoint into user cancellation. */
   async closeAgentsForShutdown(): Promise<void> {
     await Promise.all(
+      [...this.activeDraftProbes].map(async ([probe, ownerId]) => {
+        try {
+          await probe.close();
+        } catch (err) {
+          this.logger.error({ err, ownerId }, "Failed to close provider probe");
+        }
+      }),
+    );
+    await Promise.all(
       [...this.agents.values()].map(async (agent) => {
         if (this.quiescedSessions.has(agent.id)) return;
         try {
@@ -2531,17 +2848,18 @@ export class AgentManager {
       // for live subscribers. Other event types are broadcast only.
       if (event.type === "timeline") {
         this.touchUpdatedAt(agent);
-        const row = this.recordTimeline(agent.id, event.item);
-        this.dispatchStream(agent.id, event, {
-          seq: row.seq,
-          epoch: this.timelineStore.getEpoch(agent.id),
-          timestamp: row.timestamp,
+        this.commitTimeline(agent.id, event.item, event.provider, event.turnId, {
+          notifyWaiters: false,
         });
         return;
       }
       this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
     };
-    void this.admissions.run(async () => {
+    // Dispatch is synchronous. Its asynchronous result belongs to the session,
+    // not the admission drain: close must be able to settle a pending /compact.
+    const completions = this.outOfBandCompletions.get(agentId) ?? new Set<Promise<void>>();
+    this.outOfBandCompletions.set(agentId, completions);
+    const completion = this.admissions.outside(async () => {
       try {
         await handler.run({ emit: dispatch });
       } catch (error) {
@@ -2553,6 +2871,14 @@ export class AgentManager {
         });
       }
     });
+    completions.add(completion);
+    void completion
+      .catch((error) => this.eventFailures.set(agentId, error))
+      .finally(() => {
+        completions.delete(completion);
+        if (completions.size === 0 && this.outOfBandCompletions.get(agentId) === completions)
+          this.outOfBandCompletions.delete(agentId);
+      });
     return true;
   }
 
@@ -2560,23 +2886,19 @@ export class AgentManager {
     agentId: string,
     item: AgentTimelineItem,
   ): Promise<{ seq: number; epoch: string }> {
+    return this.admissions.run(() => this.appendTimelineItemAccepted(agentId, item));
+  }
+
+  private async appendTimelineItemAccepted(
+    agentId: string,
+    item: AgentTimelineItem,
+  ): Promise<{ seq: number; epoch: string }> {
     const agent = this.requireAgent(agentId);
     item = limitAgentTimelineItemContent(item);
     this.touchUpdatedAt(agent);
-    const row = this.recordTimeline(agentId, item);
-    this.dispatchStream(
-      agentId,
-      {
-        type: "timeline",
-        item,
-        provider: agent.provider,
-      },
-      {
-        seq: row.seq,
-        epoch: this.timelineStore.getEpoch(agentId),
-        timestamp: row.timestamp,
-      },
-    );
+    const { row } = this.commitTimeline(agentId, item, agent.provider, undefined, {
+      notifyWaiters: false,
+    });
     await this.persistSnapshot(agent);
     return { seq: row.seq, epoch: this.timelineStore.getEpoch(agentId) };
   }
@@ -2609,7 +2931,7 @@ export class AgentManager {
       if (pendingRun.settled) {
         throw error;
       }
-      if (isStaleProviderSessionError(error)) {
+      if (isStaleProviderSessionError(error) && this.admissions.isOpen) {
         pendingRun.start = { status: "failed", error: error.message };
         agent.pendingReplacement = false;
         if (!agent.activeForegroundTurnId) agent.lifecycle = "idle";
@@ -2618,6 +2940,21 @@ export class AgentManager {
       }
       agent.pendingReplacement = false;
       const errorMsg = error instanceof Error ? error.message : "Failed to start turn";
+      if (!this.admissions.isOpen) {
+        // A rejected handoff does not prove the provider did no work. Preserve and
+        // ingest everything it already emitted, and keep the attempt owned until
+        // an actual terminal or certified close settles it. A synthetic failure
+        // here would discard staged output and hide a subsequent real completion.
+        pendingRun.start = { status: "failed", error: errorMsg };
+        this.uncertainStarts.add(agentId);
+        for (const event of pendingRun.stagedEvents.splice(0))
+          this.enqueueSessionEvent(agentId, event);
+        await this.drainSessionEvents(agentId);
+        const outcome = this.runs.getOutcome(agentId);
+        if (!outcome || outcome.type === "uncertain" || outcome.type === "suspended")
+          this.publishRunOutcome({ type: "uncertain", agentId, error: errorMsg });
+        throw error;
+      }
       pendingRun.start = { status: "failed", error: errorMsg };
       await this.handleStreamEvent(agent, {
         type: "turn_failed",
@@ -2636,6 +2973,17 @@ export class AgentManager {
     options?: AgentRunOptions,
   ): AsyncGenerator<AgentStreamEvent> {
     this.admissions.assertOpen();
+    return this.streamAgentInternal(agentId, prompt, options, (operation) =>
+      this.admissions.run(operation),
+    );
+  }
+
+  private streamAgentInternal(
+    agentId: string,
+    prompt: AgentPromptInput,
+    options: AgentRunOptions | undefined,
+    admit: <T>(operation: () => Promise<T>) => Promise<T>,
+  ): AsyncGenerator<AgentStreamEvent> {
     const existingAgent = this.requireSessionAgent(agentId);
     this.logger.trace(
       {
@@ -2670,9 +3018,11 @@ export class AgentManager {
     const isReplacement = agent.pendingReplacement;
     agent.lastError = undefined;
 
+    this.runs.clearOutcome(agentId);
+    this.explicitStops.delete(agentId);
     const pendingRun = this.runs.createPendingRun(agentId);
     this.runs.rememberInput(agentId, prompt, options, "run");
-    const admission = this.admissions.run(async () => {
+    const admission = admit(async () => {
       const turnId = await this.startPendingForegroundTurn({
         agent,
         agentId,
@@ -3194,15 +3544,43 @@ export class AgentManager {
   }
 
   async cancelAgentRun(agentId: string): Promise<AgentRunCancellationResult> {
-    return this.admissions.run(() =>
-      this.runForegroundMutation(agentId, () => this.cancelAgentRunNow(agentId)),
-    );
+    const operation = () =>
+      this.admissions.isOpen
+        ? this.admissions.run(() =>
+            this.runForegroundMutation(agentId, () => this.cancelAgentRunNow(agentId)),
+          )
+        : this.cancelRecoveryRun(agentId);
+    return this.recoveryLifecycle ? this.recoveryLifecycle.control(operation) : operation();
+  }
+
+  private async cancelRecoveryRun(agentId: string): Promise<AgentRunCancellationResult> {
+    this.requireRetainedAgent(agentId);
+    const outcome = this.runs.getOutcome(agentId);
+    if (
+      !this.suspendedForRestart.has(agentId) &&
+      !this.runs.hasRun(agentId) &&
+      (outcome?.type === "completed" || outcome?.type === "failed" || !this.agents.has(agentId))
+    )
+      return { status: "not_running" };
+    this.explicitStops.add(agentId);
+    // Registration may not have published its session yet. Its completion is an
+    // owned handoff; do not acknowledge the stop while it can still create work.
+    await this.recoveryRegistrations.get(agentId)?.catch(() => undefined);
+    const agent = this.agents.get(agentId);
+    if (agent) await this.stopRestartSession(agent);
+    this.suspendedForRestart.delete(agentId);
+    this.runs.forgetInputs(agentId);
+    const terminal = this.runs.getOutcome(agentId);
+    if (!terminal || terminal.type === "suspended" || terminal.type === "uncertain")
+      this.publishRunOutcome({ type: "user_canceled", agentId });
+    return { status: "settled" };
   }
 
   private async cancelAgentRunNow(agentId: string): Promise<AgentRunCancellationResult> {
+    this.requireRetainedAgent(agentId);
+    if (!this.agents.has(agentId)) return { status: "not_running" };
     const agent = this.requireSessionAgent(agentId);
-    this.runs.forgetInputs(agentId);
-    this.suspendedForRestart.delete(agentId);
+    this.explicitStops.add(agentId);
     const run =
       this.runs.getRun(agentId) ??
       (agent.lifecycle === "running" ? this.runs.trackAutonomousRun(agentId, null) : null);
@@ -3210,52 +3588,40 @@ export class AgentManager {
       return { status: "not_running" };
     }
 
-    const interruptAcknowledged = await this.interruptSession(agent.session, agentId);
-    const settlement = await this.waitWithTimeout({
-      operation: run.settledPromise,
-      timeoutMs: interruptAcknowledged
-        ? INTERRUPT_SESSION_TIMEOUT_MS
-        : this.rescueTimeouts.interruptSessionMs,
-    });
-
-    if (!interruptAcknowledged) {
-      return { status: settlement === "completed" ? "settled" : "refused" };
+    const cessationConfirmed = await this.interruptSession(agent.session, agentId);
+    await this.drainSessionEvents(agentId);
+    if (!cessationConfirmed) {
+      const settlement = await this.waitWithTimeout({
+        operation: run.settledPromise,
+        timeoutMs: this.rescueTimeouts.interruptSessionMs,
+      });
+      if (settlement !== "completed") return { status: "refused" };
     }
-
-    const runTurnId = this.runs.getTurnId(agentId);
-    if (settlement === "timed_out" && runTurnId) {
-      this.logger.warn(
-        { agentId, turnId: runTurnId, kind: run.kind },
-        "cancelAgentRun: acknowledged turn still active after timeout, force-canceling",
-      );
-      await this.dispatchSessionEvent(agent, {
-        type: "turn_canceled",
-        provider: agent.provider,
-        reason: "interrupted",
-        turnId: runTurnId,
-      });
-      await run.settledPromise;
-    } else if (settlement === "timed_out" && run.kind === "foreground") {
-      this.logger.warn(
-        { agentId, kind: run.kind },
-        "cancelAgentRun: acknowledged pending turn still active after timeout, clearing it",
-      );
-      this.runs.settleForegroundRun(agentId, run.token);
-      if (!agent.pendingReplacement) {
-        agent.lifecycle = "idle";
-        this.touchUpdatedAt(agent);
-        this.emitState(agent);
+    // Interrupt's contract certifies cessation, including a start which has not yet
+    // returned its native turn id. Complete logical bookkeeping after draining real
+    // events, and never let the old cancellation settle a newer autonomous run.
+    if (this.runs.getRun(agentId) && this.runs.getRun(agentId) !== run)
+      return { status: "settled" };
+    if (cessationConfirmed && !run.settled) {
+      const turnId = this.runs.getTurnId(agentId);
+      if (turnId || run.kind === "autonomous") {
+        await this.dispatchSessionEvent(agent, {
+          type: "turn_canceled",
+          provider: agent.provider,
+          reason: "interrupted",
+          ...(turnId ? { turnId } : {}),
+        });
+      } else {
+        this.runs.settleForegroundRun(agentId, run.token);
+        this.publishRunOutcome({ type: "user_canceled", agentId });
+        this.runs.forgetInputs(agentId);
+        this.suspendedForRestart.delete(agentId);
+        if (!agent.pendingReplacement) {
+          agent.lifecycle = "idle";
+          this.touchUpdatedAt(agent);
+          this.emitState(agent);
+        }
       }
-    } else if (settlement === "timed_out" && run.kind === "autonomous") {
-      this.logger.warn(
-        { agentId, kind: run.kind },
-        "cancelAgentRun: acknowledged turn still active after timeout, force-canceling",
-      );
-      await this.dispatchSessionEvent(agent, {
-        type: "turn_canceled",
-        provider: agent.provider,
-        reason: "interrupted",
-      });
     }
 
     if (agent.pendingPermissions.size > 0) {
@@ -3385,7 +3751,8 @@ export class AgentManager {
   }
 
   async deleteAgentState(agentId: string): Promise<void> {
-    return this.admissions.run(async () => {
+    return this.runLifecycleMutation(agentId, async () => {
+      if (this.agents.has(agentId)) await this.closeAgentRuntime(agentId);
       this.discardRetainedAgentState(agentId);
       await this.deleteCommittedTimeline(agentId);
     });
@@ -3396,11 +3763,7 @@ export class AgentManager {
   }
 
   async getLastAssistantMessage(agentId: string): Promise<string | null> {
-    const agent = this.agents.get(agentId);
-    if (!agent) {
-      return null;
-    }
-
+    if (!this.hasInstalledHistory(agentId)) return null;
     return await this.getLastAssistantMessageFromStores(agentId);
   }
 
@@ -3677,6 +4040,7 @@ export class AgentManager {
       });
 
       this.assertAcceptingAgentRegistrations();
+      this.quiescedSessions.delete(resolvedAgentId);
       this.agents.set(resolvedAgentId, managed);
       registered = true;
       // Initialize previousStatus to track transitions
@@ -3702,7 +4066,7 @@ export class AgentManager {
       return { ...managed };
     } catch (error) {
       if (!registered) {
-        await this.closeUnregisteredSession(session);
+        await this.closeUnregisteredSession(session, agentId);
       }
       throw error;
     }
@@ -3720,17 +4084,40 @@ export class AgentManager {
     }
   }
 
-  private async closeUnregisteredSession(session: AgentSession): Promise<void> {
+  private async ownProviderInitialization<T>(
+    agentId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      if (error instanceof ProviderInitializationCleanupError) {
+        this.failedUnregisteredStops.set(error.cleanup, { agentId, error });
+      }
+      throw error;
+    }
+  }
+
+  private async closeUnregisteredSession(
+    session: ProviderCleanupOwner,
+    agentId: string,
+  ): Promise<void> {
     try {
       await session.close();
+      this.failedUnregisteredStops.delete(session);
     } catch (error) {
-      this.logger.warn({ err: error }, "Failed to close unregistered agent session");
+      this.failedUnregisteredStops.set(session, { agentId, error });
+      this.logger.warn(
+        { err: error },
+        "Failed to close unregistered agent session; recovery blocked",
+      );
     }
   }
 
   private async requireExternalMcpSupport(
     session: AgentSession,
     storedConfig: AgentSessionConfig,
+    agentId: string,
   ): Promise<void> {
     if (
       Object.keys(storedConfig.mcpServers ?? {}).length === 0 ||
@@ -3738,7 +4125,7 @@ export class AgentManager {
     ) {
       return;
     }
-    await this.closeUnregisteredSession(session);
+    await this.closeUnregisteredSession(session, agentId);
     throw new Error(`Provider '${storedConfig.provider}' does not support MCP servers`);
   }
 
@@ -3888,6 +4275,13 @@ export class AgentManager {
   }
 
   private discardRetainedAgentState(agentId: string): void {
+    this.recoveryInventory.delete(agentId);
+    this.suspendedForRestart.delete(agentId);
+    this.explicitStops.delete(agentId);
+    this.quiescedSessions.delete(agentId);
+    this.eventFailures.delete(agentId);
+    this.failedSessionStops.delete(agentId);
+    this.runs.clearAgentState(agentId);
     this.timelineStore.delete(agentId);
     this.paseoToolPolicies.delete(agentId);
     for (const event of this.providerSubagents.deleteParent(agentId)) {
@@ -3904,7 +4298,7 @@ export class AgentManager {
     }
     const agentId = agent.id;
     const unsubscribe = agent.session.subscribe((event: AgentStreamEvent) => {
-      this.enqueueSessionEvent(agentId, event);
+      this.admissions.outside(() => this.enqueueSessionEvent(agentId, event));
     });
     agent.unsubscribeSession = unsubscribe;
   }
@@ -3976,6 +4370,11 @@ export class AgentManager {
    * asynchronous session queue. Apply those events before committing the mutation's explicit
    * manager state so call order remains authoritative.
    */
+  private async drainOutOfBandCompletions(agentId: string): Promise<void> {
+    while (this.outOfBandCompletions.get(agentId)?.size)
+      await Promise.allSettled(this.outOfBandCompletions.get(agentId)!);
+  }
+
   private async drainSessionEvents(agentId: string): Promise<void> {
     while (true) {
       const tail = this.sessionEventTails.get(agentId);
@@ -4012,14 +4411,14 @@ export class AgentManager {
       "agent.manager.dispatch_session_event",
     );
 
-    const shouldNotifyWaiters = await this.handleStreamEvent(agent, event);
+    const deliveredEvent = await this.handleStreamEvent(agent, event);
 
-    if (!shouldNotifyWaiters) {
+    if (!deliveredEvent) {
       return;
     }
 
-    this.runs.notifyWaiters(matchingWaiters, event, {
-      terminal: isTurnTerminalEvent(event),
+    this.runs.notifyWaiters(matchingWaiters, deliveredEvent, {
+      terminal: isTurnTerminalEvent(deliveredEvent),
     });
     this.logger.trace(
       {
@@ -4187,18 +4586,12 @@ export class AgentManager {
       }
     }
     for (const event of historyEvents) {
-      const row = this.recordTimeline(
-        agent.id,
-        event.item,
-        event.timestamp ? { timestamp: event.timestamp } : undefined,
-      );
-      if (broadcastTimeline) {
-        this.dispatchStream(agent.id, event, {
-          seq: row.seq,
-          epoch: this.timelineStore.getEpoch(agent.id),
-          timestamp: row.timestamp,
-        });
-      }
+      this.commitTimeline(agent.id, event.item, event.provider, event.turnId, {
+        timestamp: event.timestamp,
+        fromHistory: true,
+        notifyWaiters: false,
+        broadcast: broadcastTimeline,
+      });
     }
     this.touchUpdatedAt(agent);
     this.emitState(agent);
@@ -4234,20 +4627,13 @@ export class AgentManager {
         if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
           continue;
         }
-        const row = this.recordTimeline(
-          agent.id,
-          event.item,
-          event.timestamp ? { timestamp: event.timestamp } : undefined,
-        );
-        if (deferredBroadcast) {
-          timelineEvents.push({ event, row });
-        } else if (broadcast) {
-          this.dispatchStream(agent.id, event, {
-            seq: row.seq,
-            epoch: this.timelineStore.getEpoch(agent.id),
-            timestamp: row.timestamp,
-          });
-        }
+        const committed = this.commitTimeline(agent.id, event.item, event.provider, event.turnId, {
+          timestamp: event.timestamp,
+          fromHistory: true,
+          notifyWaiters: false,
+          broadcast: !deferredBroadcast && broadcast === true,
+        });
+        if (deferredBroadcast) timelineEvents.push(committed);
       }
     } catch (error) {
       this.logger.warn({ err: error, agentId: agent.id }, "Failed to hydrate provider history");
@@ -4298,7 +4684,7 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     event: AgentStreamEvent,
     options?: HandleStreamEventOptions,
-  ): Promise<boolean> {
+  ): Promise<AgentStreamEvent | null> {
     event = limitAgentStreamEventContent(event);
     const identified = attachManagedTurnIdentity(agent, event, options?.fromHistory === true);
     event = identified.event;
@@ -4310,7 +4696,7 @@ export class AgentManager {
       isTurnTerminalEvent(event) &&
       this.runs.hasFinalizedTurn(agent, eventTurnId)
     ) {
-      return false;
+      return null;
     }
 
     // Only update timestamp for live events, not history replay
@@ -4318,7 +4704,7 @@ export class AgentManager {
       this.touchUpdatedAt(agent);
       if (this.agentStreamCoalescer.handle(agent.id, event)) {
         this.traceCoalescerBuffered(agent, event, eventTurnId);
-        return false;
+        return null;
       }
       this.agentStreamCoalescer.flushFor(agent.id);
     }
@@ -4363,7 +4749,7 @@ export class AgentManager {
 
     this.traceHandleStreamEventEnd(agent, event, eventTurnId, flags);
 
-    return flags.shouldNotifyWaiters;
+    return flags.shouldNotifyWaiters ? event : null;
   }
 
   private settleRecoveryIntent(
@@ -4373,7 +4759,28 @@ export class AgentManager {
     fromHistory: boolean,
   ): void {
     if (fromHistory || disposition === "stale") return;
-    if (event.type !== "turn_completed" && this.isRestartSuspended(agent.id)) return;
+    if (
+      event.type === "turn_canceled" &&
+      this.isRestartSuspended(agent.id) &&
+      !this.explicitStops.has(agent.id)
+    )
+      return;
+    if (event.type === "turn_completed")
+      this.publishRunOutcome({ type: "completed", agentId: agent.id });
+    else if (event.type === "turn_failed")
+      this.publishRunOutcome({
+        type: "failed",
+        agentId: agent.id,
+        error: this.formatTurnFailedMessage(event),
+      });
+    else if (event.type === "turn_canceled")
+      this.publishRunOutcome({ type: "user_canceled", agentId: agent.id });
+    if (this.uncertainStarts.delete(agent.id)) {
+      const pending = this.runs.getPendingRun(agent.id);
+      if (pending) this.runs.settleForegroundRun(agent.id, pending.token);
+      const turnId = getAgentStreamEventTurnId(event);
+      if (turnId) this.runs.rememberFinalizedTurn(agent, turnId);
+    }
     this.runs.forgetInputs(agent.id);
     this.suspendedForRestart.delete(agent.id);
   }
@@ -4574,23 +4981,25 @@ export class AgentManager {
     }
 
     if (options?.fromHistory) {
-      this.recordTimeline(
-        agent.id,
-        event.item,
-        event.timestamp ? { timestamp: event.timestamp } : undefined,
-      );
+      this.commitTimeline(agent.id, event.item, event.provider, event.turnId, {
+        timestamp: event.timestamp,
+        fromHistory: true,
+        notifyWaiters: false,
+        broadcast: false,
+      });
       flags.shouldDispatchEvent = false;
       flags.shouldNotifyWaiters = false;
       return;
     }
 
-    this.recordAndDispatchTimelineItem(agent.id, event.item, event.provider, event.turnId);
+    this.commitTimeline(agent.id, event.item, event.provider, event.turnId);
     if (event.item.type === "user_message") {
       agent.lastUserMessageAt = new Date();
       this.emitState(agent);
     }
     flags.shouldDispatchEvent = false;
-    flags.shouldNotifyWaiters = true;
+    // commitTimeline has already delivered the canonical item to matching waiters.
+    flags.shouldNotifyWaiters = false;
   }
 
   private onStreamTurnCompleted(params: {
@@ -4794,27 +5203,37 @@ export class AgentManager {
     }
   }
 
-  private recordAndDispatchTimelineItem(
+  private commitTimeline(
     agentId: string,
     item: AgentTimelineItem,
     provider: AgentProvider,
     turnId?: string,
-    options?: { providerMessageId?: string },
-  ): AgentStreamEvent {
+    options?: {
+      providerMessageId?: string;
+      timestamp?: string;
+      notifyWaiters?: boolean;
+      broadcast?: boolean;
+      fromHistory?: boolean;
+    },
+  ): { event: Extract<AgentStreamEvent, { type: "timeline" }>; row: AgentTimelineRow } {
     const row = this.recordTimeline(agentId, item, { ...options, turnId });
-    const event: AgentStreamEvent = {
+    const event: Extract<AgentStreamEvent, { type: "timeline" }> = {
       type: "timeline",
-      item,
+      item: row.item,
       provider,
       ...(turnId !== undefined ? { turnId } : {}),
     };
-    this.dispatchStream(agentId, event, {
-      seq: row.seq,
-      epoch: this.timelineStore.getEpoch(agentId),
-      timestamp: row.timestamp,
-    });
+    if (options?.broadcast !== false) {
+      this.dispatchStream(agentId, event, {
+        seq: row.seq,
+        epoch: this.timelineStore.getEpoch(agentId),
+        timestamp: row.timestamp,
+      });
+    }
+    if (options?.notifyWaiters !== false) this.notifyForegroundTurnWaiters(agentId, event);
 
     if (
+      !options?.fromHistory &&
       item.type === "tool_call" &&
       item.status === "completed" &&
       item.detail?.type === "shell" &&
@@ -4826,7 +5245,7 @@ export class AgentManager {
       }
     }
 
-    return event;
+    return { event, row };
   }
 
   private recordSubmittedPrompt(
@@ -4849,7 +5268,7 @@ export class AgentManager {
       clientMessageId,
       ...(options?.messageId ? { messageId: options.messageId } : {}),
     };
-    this.recordAndDispatchTimelineItem(agent.id, item, agent.provider, options?.turnId, options);
+    this.commitTimeline(agent.id, item, agent.provider, options?.turnId, options);
   }
 
   private reconcileSubmittedPromptEcho(
@@ -4902,20 +5321,7 @@ export class AgentManager {
     }
 
     const item: AgentTimelineItem = { type: "assistant_message", text };
-    const row = this.recordTimeline(agent.id, item);
-    this.dispatchStream(
-      agent.id,
-      {
-        type: "timeline",
-        item,
-        provider,
-      },
-      {
-        seq: row.seq,
-        epoch: this.timelineStore.getEpoch(agent.id),
-        timestamp: row.timestamp,
-      },
-    );
+    this.commitTimeline(agent.id, item, provider, undefined, { notifyWaiters: false });
   }
 
   private formatTurnFailedMessage(
@@ -5491,14 +5897,6 @@ export class AgentManager {
     const agent = this.requireAgent(id);
     if (agent.session === null) {
       throw new Error(`Agent '${agent.id}' has no managed session`);
-    }
-    return agent;
-  }
-
-  private requirePublicAgent(id: string): LiveManagedAgent {
-    const agent = this.requireAgent(id);
-    if (agent.internal) {
-      throw new Error(`Unknown agent '${agent.id}'`);
     }
     return agent;
   }

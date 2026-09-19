@@ -1,6 +1,7 @@
 import {
   planTimelineCatchUpAfter,
   planTimelineResumeFetch,
+  planTimelineTailFetch,
   type ProjectedTimelineForwardFetchPlan,
 } from "./timeline-sync-plan";
 import type { CachedTimeline } from "@/runtime/replica-cache";
@@ -27,6 +28,10 @@ import {
 } from "./session-stream-reducers";
 import { isTimelineResumeSnapshotAuthoritative } from "./timeline-sync-plan";
 import { replaceWithCanonicalStream } from "@/types/stream";
+import {
+  TimelineRequestError,
+  type TimelineRequestErrorCode,
+} from "@getpaseo/client/internal/daemon-client";
 
 export interface TimelineReplicaStorage {
   readTimeline(serverId: string, agentId: string): Promise<CachedTimeline | undefined>;
@@ -265,6 +270,8 @@ function applyAuthoritativeTimelineResponse(input: {
   drainQueuedAgentMessage: (agentId: string) => void;
 }): boolean {
   const { serverId, payload } = input;
+  // Backpressure leaves initialization and painted history owned by the retrying fetch.
+  if (payload.errorCode === "TIMELINE_BUSY") return false;
   const agentId = payload.agentId;
   const initKey = getInitKey(serverId, agentId);
   const session = useSessionStore.getState().sessions[serverId];
@@ -338,6 +345,7 @@ export interface ViewedTimelineSync extends ViewedTimelineUiBridge {
   setConnected(connected: boolean): void;
   setDeliveryMode(mode: TimelineDeliveryMode): void;
   recoverGap(agentId: string, cursor: { epoch: string; endSeq: number }): void;
+  replaceTimelineEpoch(agentId: string, epoch: string): void;
   dispose(): void;
 }
 
@@ -403,12 +411,19 @@ const VIEWED_TIMELINE_HOT_AGENT_LIMIT = 5;
 
 type CatchUpStatus = "running" | "complete" | "error";
 
+interface CatchUpOptions {
+  request?: ProjectedTimelineForwardFetchPlan;
+  supersede?: boolean;
+  retry?: "scheduled" | "manual";
+}
+
 interface CatchUpState {
   generation: number;
   status: CatchUpStatus;
   request?: ProjectedTimelineForwardFetchPlan;
   cancelRetry?: () => void;
   retryDelayMs?: number;
+  errorCode?: TimelineRequestErrorCode;
 }
 
 const getNextRetryDelayMs = (previousDelayMs: number | undefined): number => {
@@ -469,6 +484,10 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
   const pendingCatchUps = new Map<string, ProjectedTimelineForwardFetchPlan>();
   const visibilityCatchUpPending = new Set<string>();
   const visibilityCatchUpErrors = new Map<string, string>();
+  const terminalPages = new Map<
+    string,
+    { error: TimelineRequestError; request: ProjectedTimelineForwardFetchPlan }
+  >();
   // User-initiated retries only. Background retries stay silent; a retry the user asked for
   // owes them a pending state until it settles.
   const manualRetries = new Set<string>();
@@ -557,12 +576,13 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
     fallbackToLatestTailOnOverflow: boolean,
   ): Promise<void> => {
     if (!ownsCatchUp(agentId, generation)) return;
-
+    let failedRequest = request;
     try {
       const page = await ports.fetchPage(agentId, request);
       if (!ownsCatchUp(agentId, generation)) return;
       if (page.hasNewer && page.endCursor) {
         if (fallbackToLatestTailOnOverflow) {
+          failedRequest = planTimelineTailFetch();
           await ports.fetchLatestTail(agentId);
           catchUps.set(agentId, { generation, status: "complete" });
           setVisibilityCatchUpReady(agentId);
@@ -587,22 +607,32 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
       }
       setVisibilityCatchUpReady(agentId);
     } catch (error) {
-      if (catchUps.get(agentId)?.generation === generation) {
+      if (ownsCatchUp(agentId, generation)) {
+        const errorCode = error instanceof TimelineRequestError ? error.code : undefined;
         const nextRetryDelayMs = getNextRetryDelayMs(catchUps.get(agentId)?.retryDelayMs);
-        const cancelRetry = ports.schedule(() => {
-          const current = catchUps.get(agentId);
-          if (current?.generation !== generation || current.status !== "error") return;
-          startCatchUp(agentId);
-        }, nextRetryDelayMs);
+        const cancelRetry =
+          errorCode === "TIMELINE_ITEM_TOO_LARGE"
+            ? undefined
+            : ports.schedule(() => {
+                const current = catchUps.get(agentId);
+                if (current?.generation !== generation || current.status !== "error") return;
+                startCatchUp(agentId, { request: failedRequest, retry: "scheduled" });
+              }, nextRetryDelayMs);
         catchUps.set(agentId, {
           generation,
           status: "error",
-          request,
+          request: failedRequest,
           cancelRetry,
           retryDelayMs: nextRetryDelayMs,
+          errorCode,
         });
-        setVisibilityCatchUpError([agentId], error);
-        ports.reportError(error);
+        if (error instanceof TimelineRequestError && errorCode === "TIMELINE_ITEM_TOO_LARGE") {
+          terminalPages.set(agentId, { error, request: failedRequest });
+        }
+        if (errorCode !== "TIMELINE_BUSY") {
+          setVisibilityCatchUpError([agentId], error);
+          ports.reportError(error);
+        }
       }
     }
   };
@@ -621,15 +651,43 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
     cacheLoads.set(agentId, load);
   };
 
-  const startCatchUp = (
+  const retainTerminalPage = (
     agentId: string,
-    options: {
-      request?: ProjectedTimelineForwardFetchPlan;
-      supersede?: boolean;
-    } = {},
-  ) => {
+    nextRequest: ProjectedTimelineForwardFetchPlan,
+    options: CatchUpOptions,
+  ): boolean => {
+    const terminal = terminalPages.get(agentId);
+    if (!terminal || options.retry === "manual") return false;
+    if (!options.supersede || isSameCatchUpRequest(terminal.request, nextRequest)) {
+      setVisibilityCatchUpError([agentId], terminal.error);
+      return true;
+    }
+    terminalPages.delete(agentId);
+    visibilityCatchUpErrors.delete(agentId);
+    visibilityCatchUpPending.add(agentId);
+    notifyListeners();
+    return false;
+  };
+
+  const retainBusyPage = (
+    current: CatchUpState | undefined,
+    nextRequest: ProjectedTimelineForwardFetchPlan,
+    options: CatchUpOptions,
+  ): boolean => {
+    return (
+      current?.status === "error" &&
+      current.errorCode === "TIMELINE_BUSY" &&
+      !options.retry &&
+      (!options.supersede || isSameCatchUpRequest(current.request, nextRequest))
+    );
+  };
+
+  const hasCatchUpConnection = (agentId: string) =>
+    connected && isDesired(agentId) && isAcknowledged(agentId);
+
+  const startCatchUp = (agentId: string, options: CatchUpOptions = {}) => {
     const { request, supersede = false } = options;
-    if (!connected || !isDesired(agentId) || !isAcknowledged(agentId)) {
+    if (!hasCatchUpConnection(agentId)) {
       if (request) pendingCatchUps.set(agentId, request);
       return;
     }
@@ -639,7 +697,9 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
       return;
     }
     const nextRequest = request ?? planTimelineResumeFetch(ports.readCursor(agentId));
+    if (retainTerminalPage(agentId, nextRequest, options)) return;
     const current = catchUps.get(agentId);
+    if (retainBusyPage(current, nextRequest, options)) return;
     const decision = decideCatchUp({ current, request: nextRequest, supersede });
     if (decision === "keep-and-park") {
       pendingCatchUps.set(agentId, nextRequest);
@@ -648,6 +708,7 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
     if (decision === "keep") {
       return;
     }
+    if (options.retry === "manual") terminalPages.delete(agentId);
     current?.cancelRetry?.();
     const generation = (catchUpGenerations.get(agentId) ?? 0) + 1;
     catchUpGenerations.set(agentId, generation);
@@ -676,6 +737,19 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
         supersede: Boolean(pendingCatchUp),
       });
     }
+  };
+
+  const replaceTimelineEpoch = (agentId: string, epoch: string) => {
+    const terminal = terminalPages.get(agentId);
+    if (terminal?.error.epoch === epoch) return;
+    terminalPages.delete(agentId);
+    cancelCatchUp(agentId);
+    if (!isDesired(agentId)) return;
+    visibilityCatchUpErrors.delete(agentId);
+    visibilityCatchUpPending.add(agentId);
+    manualRetries.delete(agentId);
+    notifyListeners();
+    startCatchUp(agentId, { request: planTimelineTailFetch(), supersede: true });
   };
 
   const reconcileLatestMembership = async (): Promise<void> => {
@@ -747,15 +821,20 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
   };
 
   const retryVisibleAgentTimeline = (agentId: string) => {
-    if (!isDesired(agentId) || manualRetries.has(agentId)) return;
+    if (!connected || !isDesired(agentId) || manualRetries.has(agentId)) return;
     const catchUp = catchUps.get(agentId);
+    const terminal = terminalPages.get(agentId);
     const membershipRetryable = deliveryMode === "selective" && membershipNeedsRetry && connected;
-    if (catchUp?.status !== "error" && !membershipRetryable) return;
+    if (catchUp?.status !== "error" && !terminal && !membershipRetryable) return;
     manualRetries.add(agentId);
     notifyListeners();
-    if (catchUp?.status === "error") {
-      catchUp.cancelRetry?.();
-      startCatchUp(agentId, { request: catchUp.request, supersede: true });
+    if (catchUp?.status === "error" || terminal) {
+      catchUp?.cancelRetry?.();
+      startCatchUp(agentId, {
+        request: terminal?.request ?? catchUp?.request,
+        supersede: true,
+        retry: "manual",
+      });
       return;
     }
     cancelMembershipRetry?.();
@@ -899,11 +978,17 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
     },
     recoverGap(agentId, cursor) {
       if (!isDesired(agentId)) return;
+      const failedEpoch = terminalPages.get(agentId)?.error.epoch;
+      if (failedEpoch && failedEpoch !== cursor.epoch) {
+        replaceTimelineEpoch(agentId, cursor.epoch);
+        return;
+      }
       startCatchUp(agentId, {
         request: planTimelineCatchUpAfter({ epoch: cursor.epoch, seq: cursor.endSeq }),
         supersede: true,
       });
     },
+    replaceTimelineEpoch,
     dispose() {
       disposed = true;
       cancelMembershipRetry?.();
@@ -924,6 +1009,7 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
       manualRetries.clear();
       notifyListeners();
       listeners.clear();
+      terminalPages.clear();
     },
     retryVisibleAgentTimeline,
   };

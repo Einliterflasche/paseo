@@ -1445,3 +1445,62 @@ describe("target coalesced behavior", () => {
     }
   });
 });
+
+describe("committed event ownership", () => {
+  test("run results and broadcasts retain canonical versions through immediate and coalesced delivery", async () => {
+    vi.useFakeTimers();
+    const harness = createHarness();
+    try {
+      const { agentId, session } = await createManagedSession(harness);
+      const completion = harness.manager.runAgent(agentId, "collect history");
+      await waitForSessionEventQueue();
+      const logs = ["first", "first\nsecond", "first\nsecond\nthird"];
+      for (const log of logs) {
+        session.pushEvent(
+          timelineEvent(
+            {
+              type: "tool_call",
+              callId: "child-log",
+              name: "agent",
+              status: "running",
+              error: null,
+              detail: { type: "sub_agent", log },
+            },
+            "codex",
+            "turn-1",
+          ),
+        );
+        await waitForSessionEventQueue();
+        await vi.advanceTimersByTimeAsync(COALESCE_WINDOW_MS);
+      }
+      session.pushEvent(assistant("one", "codex", "turn-1"));
+      session.pushEvent(assistant("two", "codex", "turn-1"));
+      await waitForSessionEventQueue();
+      await vi.advanceTimersByTimeAsync(COALESCE_WINDOW_MS);
+      const rows = await harness.manager.getTimelineRows(agentId);
+      const broadcasts = getTimelineStreamEvents(harness.events, agentId);
+      expect(broadcasts).toHaveLength(rows.length);
+      broadcasts.forEach((broadcast, i) => {
+        if (broadcast.type !== "agent_stream" || broadcast.event.type !== "timeline")
+          throw new Error("Expected timeline broadcast");
+        expect(broadcast.event.item).toBe(rows[i].item);
+      });
+      session.pushEvent(terminalEvent("turn_completed", "turn-1"));
+      await waitForSessionEventQueue();
+      const result = await completion;
+      expect(result.timeline).toHaveLength(rows.length);
+      result.timeline.forEach((item, i) => expect(item).toBe(rows[i].item));
+      expect(
+        result.timeline
+          .filter((item) => item.type === "tool_call")
+          .map((item) => {
+            if (item.detail.type !== "sub_agent") throw new Error("Expected subagent detail");
+            return item.detail.log;
+          }),
+      ).toEqual(logs);
+      expect(result.finalText).toBe("onetwo");
+    } finally {
+      harness.cleanup();
+    }
+  });
+});

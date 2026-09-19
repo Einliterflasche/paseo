@@ -1777,9 +1777,18 @@ export const CancelAgentRequestMessageSchema = z.object({
   requestId: z.string().optional(),
 });
 
+export const CrashRecoveryAcknowledgmentSchema = z.object({
+  generationId: z.string(),
+  orphanExecutionReconciled: z.literal(true),
+});
+export type CrashRecoveryAcknowledgment = z.infer<typeof CrashRecoveryAcknowledgmentSchema>;
+
 export const RestartServerRequestMessageSchema = z.object({
   type: z.literal("restart_server_request"),
   prepareOnly: z.boolean().optional(),
+  // COMPAT(restartRecoveryRetry): added in fork v0.8.0; remove gate after 2027-03-19.
+  retryRecovery: z.boolean().optional(),
+  acknowledgeCrash: CrashRecoveryAcknowledgmentSchema.optional(),
   reason: z.string().optional(),
   requestId: z.string(),
 });
@@ -1825,6 +1834,12 @@ export const ProviderSubagentListRequestMessageSchema = z.object({
   requestId: z.string(),
 });
 
+export const ProviderSubagentTargetSchema = z.object({
+  parentAgentId: z.string(),
+  subagentId: z.string(),
+});
+export type ProviderSubagentTarget = z.infer<typeof ProviderSubagentTargetSchema>;
+
 export const ProviderSubagentTimelineRequestMessageSchema = z.object({
   type: z.literal("agent.provider_subagents.timeline.get.request"),
   parentAgentId: z.string(),
@@ -1833,11 +1848,13 @@ export const ProviderSubagentTimelineRequestMessageSchema = z.object({
   direction: z.enum(["tail", "before", "after"]).optional(),
   cursor: AgentTimelineCursorSchema.optional(),
   limit: z.number().int().nonnegative().optional(),
+  projection: z.enum(["projected", "canonical"]).optional(),
 });
 
 export const SetAgentTimelineSubscriptionRequestMessageSchema = z.object({
   type: z.literal("agent.timeline.set_subscription.request"),
   agentIds: z.array(z.string()),
+  providerSubagents: z.array(ProviderSubagentTargetSchema).optional(),
   requestId: z.string(),
 });
 
@@ -3434,6 +3451,21 @@ export const ServerInfoStatusPayloadSchema = z
     restartRecoveryState: z.enum(["running", "preparing", "paused", "restoring"]).optional(),
     restartRecoveryGeneration: z.string().optional(),
     restartRecoveryError: z.string().optional(),
+    // COMPAT(restartRecoveryProgress): added in fork v0.8.0; remove optional parsing after 2027-03-19.
+    restartRecoveryStage: z
+      .enum([
+        "installing",
+        "starting",
+        "stopping",
+        "blocked",
+        "checkpointing",
+        "ready",
+        "replacing",
+      ])
+      .optional(),
+    restartRecoveryPreviousGeneration: z.string().optional(),
+    restartRecoveryAffectedAgents: z.array(z.string()).optional(),
+    restartCheckpointFormat: z.number().int().positive().optional(),
     serverId: z.string().trim().min(1),
     hostname: ServerInfoHostnameSchema.optional(),
     version: ServerInfoVersionSchema.optional(),
@@ -3449,6 +3481,9 @@ export const ServerInfoStatusPayloadSchema = z
         agentRequestReceipts: z.boolean().optional(),
         // COMPAT(restartRecovery): added in fork v0.8.0; remove gate after 2027-03-16.
         restartRecovery: z.boolean().optional(),
+        // COMPAT(restartRecoveryRetry): added in fork v0.8.0; remove gate after 2027-03-19.
+        restartRecoveryRetry: z.boolean().optional(),
+        restartCrashAcknowledgment: z.boolean().optional(),
         // COMPAT(hubAgentRpc): added in v0.8.0; remove gate after 2027-03-05.
         hubAgentRpc: z.boolean().optional(),
         providersSnapshot: z.boolean().optional(),
@@ -3549,6 +3584,7 @@ export const ServerInfoStatusPayloadSchema = z
         agentForkContextCursor: z.boolean().optional(),
         // COMPAT(providerSubagents): added in v0.1.107, remove gate after 2027-01-12.
         providerSubagents: z.boolean().optional(),
+        projectedProviderSubagents: z.boolean().optional(),
         // COMPAT(providerSubagentNesting): added in v0.7, remove gate after 2027-03-04.
         providerSubagentNesting: z.boolean().optional(),
         // COMPAT(workspacePinning): added in v0.1.107, remove gate after 2027-01-12.
@@ -4496,6 +4532,7 @@ export const FetchAgentTimelineResponseMessageSchema = z.object({
     mergeWindow: z.boolean().optional(),
     entries: z.array(AgentTimelineEntryPayloadSchema),
     error: z.string().nullable(),
+    errorCode: z.enum(["TIMELINE_BUSY", "TIMELINE_ITEM_TOO_LARGE"]).optional(),
   }),
 });
 
@@ -4575,6 +4612,10 @@ export const ProviderSubagentTimelineResponseMessageSchema = z.object({
     }),
     hasOlder: z.boolean(),
     hasNewer: z.boolean(),
+    projection: z.enum(["projected", "canonical"]).optional(),
+    entries: z.array(AgentTimelineEntryPayloadSchema).optional(),
+    startCursor: AgentTimelineCursorSchema.nullable().optional(),
+    endCursor: AgentTimelineCursorSchema.nullable().optional(),
     rows: z.array(
       z.object({
         item: AgentTimelineItemPayloadSchema,
@@ -4583,6 +4624,7 @@ export const ProviderSubagentTimelineResponseMessageSchema = z.object({
       }),
     ),
     error: z.string().nullable(),
+    errorCode: z.enum(["TIMELINE_BUSY", "TIMELINE_ITEM_TOO_LARGE"]).optional(),
   }),
 });
 
@@ -7189,6 +7231,7 @@ export const WSHelloMessageSchema = z.object({
       [CLIENT_CAPS.customModeIcons]: z.boolean().optional(),
       [CLIENT_CAPS.terminalReflowableSnapshot]: z.boolean().optional(),
       [CLIENT_CAPS.providerSubagents]: z.boolean().optional(),
+      [CLIENT_CAPS.projectedProviderSubagents]: z.boolean().optional(),
       [CLIENT_CAPS.projectUpdates]: z.boolean().optional(),
       [CLIENT_CAPS.compactProviderSnapshots]: z.boolean().optional(),
       [CLIENT_CAPS.providerSnapshotReferences]: z.boolean().optional(),

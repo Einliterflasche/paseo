@@ -1,3 +1,4 @@
+import { ProviderInitializationCleanupError } from "../../provider-initialization-cleanup-error.js";
 import {
   closeSync,
   existsSync,
@@ -930,36 +931,58 @@ describe("PiRpcAgentSession", () => {
     ]);
   });
 
-  test("canceling a silent Pi extension command leaves the session usable", async () => {
+  test("canceling a Pi extension preflight cannot acknowledge before the prompt handoff", async () => {
     const { pi, session, events } = await createSession();
     const fakeSession = pi.latestSession();
-
-    fakeSession.holdNextPrompt();
+    const preflight = Promise.withResolvers<{}>();
+    const originalPrompt = fakeSession.prompt.bind(fakeSession);
+    fakeSession.prompt = async (message, images) => {
+      fakeSession.prompts.push({ message, imageCount: images?.length ?? 0 });
+      return preflight.promise;
+    };
     const firstTurn = await session.startTurn("/silent-search");
-    fakeSession.emit({
-      type: "extension_ui_request",
-      id: "notify-1",
-      method: "notify",
-      message: "Search finished",
+    let stopped = false;
+    const interrupt = session.interrupt().then(() => {
+      stopped = true;
+      return undefined;
     });
-    await session.interrupt();
-    const cancellation = await events.nextTurnCancellation();
-    await session.startTurn("next request");
-    await fakeSession.failHeldPrompt(new Error("Canceled prompt timed out"));
-
-    expect(cancellation).toEqual({
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+    expect(fakeSession.abortRequested).toBe(false);
+    await expect(session.startTurn("too early")).rejects.toThrow("still stopping");
+    preflight.resolve({});
+    await interrupt;
+    expect(fakeSession.abortRequested).toBe(true);
+    expect(await events.nextTurnCancellation()).toEqual({
       type: "turn_canceled",
       provider: "pi",
       reason: "interrupted",
       turnId: firstTurn.turnId,
     });
+    fakeSession.prompt = originalPrompt;
+    await session.startTurn("next request");
     expect(fakeSession.prompts).toEqual([
       { message: "/silent-search", imageCount: 0 },
       { message: "next request", imageCount: 0 },
     ]);
-    await expect(session.startTurn("overlapping request")).rejects.toThrow(
-      "A Pi turn is already active",
+    await session.close();
+  });
+
+  test("a failed Pi handoff cannot become a successful interrupt retry", async () => {
+    const { pi, session } = await createSession();
+    const fakeSession = pi.latestSession();
+    const preflight = Promise.withResolvers<{}>();
+    fakeSession.prompt = () => preflight.promise;
+    await session.startTurn("uncertain handoff");
+    const stopping = expect(session.interrupt()).rejects.toThrow("handoff transport lost");
+    preflight.reject(new Error("handoff transport lost"));
+    await stopping;
+    await expect(session.interrupt()).rejects.toThrow("handoff transport lost");
+    expect(fakeSession.abortRequested).toBe(false);
+    await expect(session.startTurn("cannot pass failed handoff")).rejects.toThrow(
+      "handoff transport lost",
     );
+    await session.close();
   });
 
   test("treats Pi's aborted terminal response as cancellation after an interrupt", async () => {
@@ -2744,4 +2767,44 @@ describe("transformPiModels", () => {
       },
     ]);
   });
+});
+
+test("Pi retries runtime close failures and only memoizes confirmed shutdown", async () => {
+  const pi = new FakePi();
+  const session = await createClient(pi).createSession(createConfig());
+  const runtime = pi.latestSession();
+  runtime.closeError = new Error("Pi still running");
+  const close = session.close();
+  expect(session.close()).toBe(close);
+  await expect(close).rejects.toThrow("Pi still running");
+  await expect(session.startTurn("replacement")).rejects.toThrow("session is closed");
+  runtime.closeError = null;
+  await session.close();
+  await session.close();
+  expect(runtime.closeCalls).toBe(2);
+});
+
+test("Pi transfers failed initialization cleanup with its still-needed extension files", async () => {
+  const pi = new FakePi();
+  const startupError = new Error("Pi state unavailable");
+  const closeError = new Error("Pi stop unconfirmed");
+  pi.queueSessionSetup((runtime) => {
+    runtime.getStateError = startupError;
+    runtime.closeError = closeError;
+  });
+  const failure = await createClient(pi)
+    .createSession(createConfig())
+    .catch((error: unknown) => error);
+  expect(failure).toBeInstanceOf(ProviderInitializationCleanupError);
+  if (!(failure instanceof ProviderInitializationCleanupError))
+    throw new Error("Missing cleanup owner");
+  expect(failure.initializationError).toBe(startupError);
+  expect(failure.cleanupError).toBe(closeError);
+  const files = pi.recordedLaunches[0]?.extensionPaths ?? [];
+  expect(files.length).toBeGreaterThan(0);
+  expect(files.every(existsSync)).toBe(true);
+  pi.latestSession().closeError = null;
+  await failure.cleanup.close();
+  expect(files.some(existsSync)).toBe(false);
+  expect(pi.latestSession().closeCalls).toBe(2);
 });

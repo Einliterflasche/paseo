@@ -635,7 +635,16 @@ export interface AgentLaunchContext {
   paseoTools?: PaseoToolCatalog;
 }
 
+/** Temporary query runtimes are owned before any native initialization await. */
+export interface AgentProbeContext {
+  readonly signal: AbortSignal;
+  /** Retain until certified cleanup. Unregister only after close has succeeded. */
+  own(cleanup: { close(): Promise<void> }): () => void;
+}
+
 export interface AgentCreateSessionOptions {
+  /** A draft catalog probe can be stopped while native initialization is pending. */
+  probe?: AgentProbeContext;
   /**
    * Whether the provider should leave a durable native session behind.
    * Defaults to true. Providers that cannot honor false should no-op.
@@ -683,7 +692,12 @@ export interface AgentSession {
    * still uncertain.
    */
   interrupt(): Promise<void>;
-  /** Release live runtime resources without archiving or deleting the durable native session. */
+  /**
+   * Reject new execution, stop owned runtime execution and deliver accepted output before resolving.
+   * Keep native durable sessions and event ownership intact until cessation and drain are proven.
+   * Reject uncertainty. Concurrent closes share an attempt; after failure a later close must retry
+   * certification (a closed admission flag alone never proves success). Successful closes are idempotent.
+   */
   close(): Promise<void>;
   listCommands?(): Promise<AgentSlashCommand[]>;
   setModel?(modelId: string | null): Promise<void>;
@@ -699,6 +713,8 @@ export interface AgentSession {
    * manager's persistence + broadcast pipeline. The active foreground turn
    * (if any) is left untouched, so this is how mid-turn side-effect commands
    * (e.g. /goal pause) reach the provider without canceling the running turn.
+   * Session close must settle every accepted handler; the manager joins handler
+   * completion after close before publishing a checkpoint or releasing history.
    */
   tryHandleOutOfBand?(prompt: AgentPromptInput): {
     run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void>;
@@ -718,6 +734,8 @@ export type FetchCatalogOptions =
 
 export interface ProviderRefreshContext {
   readonly signal: AbortSignal;
+  /** Lifecycle-owned physical cleanup, shared with the refresh deadline signal. */
+  readonly probe?: AgentProbeContext;
   /** Track an upstream operation so timeout errors identify the work still pending. */
   runActivity<T>(name: string, operation: () => Promise<T>): Promise<T>;
 }
@@ -769,10 +787,14 @@ export interface AgentClient {
   resolveDefaultModeId?(input: ResolveAgentDefaultModeInput): Promise<string | undefined>;
   resolveCreateConfig?(input: ResolveAgentCreateConfigInput): ResolveAgentCreateConfigResult;
   isCreateConfigUnattended?(input: AgentCreateConfigUnattendedInput): boolean;
-  listCommands?(config: AgentSessionConfig): Promise<AgentSlashCommand[]>;
-  listFeatures?(config: AgentSessionConfig): Promise<AgentFeature[]>;
+  listCommands?(
+    config: AgentSessionConfig,
+    probe?: AgentProbeContext,
+  ): Promise<AgentSlashCommand[]>;
+  listFeatures?(config: AgentSessionConfig, probe?: AgentProbeContext): Promise<AgentFeature[]>;
   listImportableSessions?(
     options?: ListImportableSessionsOptions,
+    probe?: AgentProbeContext,
   ): Promise<ImportableProviderSession[]>;
   importSession?(
     input: ImportProviderSessionInput,
@@ -783,7 +805,7 @@ export interface AgentClient {
    * Returns true if available, false otherwise.
    */
   isAvailable(signal?: AbortSignal, options?: FetchCatalogOptions): Promise<boolean>;
-  getDiagnostic?(): Promise<{ diagnostic: string }>;
+  getDiagnostic?(probe?: AgentProbeContext): Promise<{ diagnostic: string }>;
   /**
    * Archive a durable native session (best-effort). Runtime release belongs to AgentSession.close().
    * Called when Paseo archives an agent so the provider's own UI reflects the same state.

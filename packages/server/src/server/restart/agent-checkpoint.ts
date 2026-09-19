@@ -11,6 +11,8 @@ export const AgentCheckpointSchema = z.object({
     z.object({
       record: z.unknown().transform(parseStoredAgentRecord),
       continue: z.boolean(),
+      // Logical identity survives replacement of the native execution attempt.
+      runId: z.string().optional(),
       inputs: z.array(RecoveryInputSchema),
     }),
   ),

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 
 import type { TerminalManager } from "../../../terminal/terminal-manager.js";
@@ -16,7 +17,11 @@ import type { AgentPromptInput, AgentRunOptions, AgentSessionConfig } from "../a
 import type { AgentStorage } from "../agent-storage.js";
 import type { AgentOwner } from "../agent-owner.js";
 import type { ProviderSnapshotManager } from "../provider-snapshot-manager.js";
-import { setupFinishNotification, startCreatedAgentInitialPrompt } from "../agent-prompt.js";
+import {
+  startWithFinishNotification,
+  type SetupFinishNotificationParams,
+  startCreatedAgentInitialPrompt,
+} from "../agent-prompt.js";
 import { resolveCreateAgentTitles } from "../create-agent-title.js";
 import { buildAgentPrompt } from "../prompt-attachments.js";
 import { normalizeClientMessageId, resolveClientMessageId } from "../../client-message-id.js";
@@ -175,6 +180,15 @@ export async function createAgentCommand(
   dependencies: CreateAgentCommandDependencies,
   input: CreateAgentCommandInput,
 ): Promise<CreateAgentCommandResult> {
+  return dependencies.agentManager.runRequestAdmission(() =>
+    createAgentAccepted(dependencies, input),
+  );
+}
+
+async function createAgentAccepted(
+  dependencies: CreateAgentCommandDependencies,
+  input: CreateAgentCommandInput,
+): Promise<CreateAgentCommandResult> {
   const resolved =
     input.kind === "session"
       ? await resolveSessionCreateAgent(dependencies, input)
@@ -197,21 +211,21 @@ export async function createAgentCommand(
     input.onCreated?.({ agentId: snapshot.id, createdWorktree: resolved.createdWorktree ?? null });
   }
   if (resolved.prompt !== undefined) {
-    const sendResult = await sendInitialPrompt(dependencies, resolved, snapshot);
+    const notification =
+      input.kind === "mcp" && input.notifyOnFinish && input.callerAgentId
+        ? {
+            agentManager: dependencies.agentManager,
+            agentStorage: dependencies.agentStorage,
+            childAgentId: snapshot.id,
+            callerAgentId: input.callerAgentId,
+            requireParentOwnership: true,
+            logger: dependencies.logger,
+          }
+        : undefined;
+    const sendResult = await sendInitialPrompt(dependencies, resolved, snapshot, notification);
     initialPromptStarted = sendResult.started;
     liveSnapshot = sendResult.liveSnapshot;
     initialPromptError = sendResult.error ?? null;
-  }
-
-  if (input.kind === "mcp" && input.notifyOnFinish && input.callerAgentId && initialPromptStarted) {
-    setupFinishNotification({
-      agentManager: dependencies.agentManager,
-      agentStorage: dependencies.agentStorage,
-      childAgentId: snapshot.id,
-      callerAgentId: input.callerAgentId,
-      requireParentOwnership: true,
-      logger: dependencies.logger,
-    });
   }
 
   return {
@@ -449,20 +463,26 @@ async function sendInitialPrompt(
   dependencies: CreateAgentCommandDependencies,
   resolved: ResolvedCreateAgent,
   snapshot: ManagedAgent,
+  notification?: SetupFinishNotificationParams,
 ): Promise<{ started: boolean; liveSnapshot: ManagedAgent; error?: unknown }> {
   try {
     const prompt = resolved.prompt;
     if (prompt === undefined) {
       return { started: false, liveSnapshot: snapshot };
     }
-    const liveSnapshot = await startCreatedAgentInitialPrompt({
-      agentManager: dependencies.agentManager,
-      agentId: snapshot.id,
-      snapshot,
-      prompt,
-      runOptions: resolved.runOptions,
-      logger: resolved.promptLogger ?? dependencies.logger,
-    });
+    const runId = resolved.runOptions?.clientMessageId ?? randomUUID();
+    const start = () =>
+      startCreatedAgentInitialPrompt({
+        agentManager: dependencies.agentManager,
+        agentId: snapshot.id,
+        snapshot,
+        prompt,
+        runOptions: { ...resolved.runOptions, clientMessageId: runId },
+        logger: resolved.promptLogger ?? dependencies.logger,
+      });
+    const liveSnapshot = notification
+      ? await startWithFinishNotification({ ...notification, runId }, start)
+      : await start();
     return { started: true, liveSnapshot };
   } catch (error) {
     if (resolved.promptFailure === "throw") {

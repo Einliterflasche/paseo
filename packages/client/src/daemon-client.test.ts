@@ -2,6 +2,7 @@ import { afterEach, expect, expectTypeOf, test, vi } from "vitest";
 import { z } from "zod";
 import {
   DaemonClient,
+  TimelineRequestError,
   type DaemonClientTrace,
   type DaemonTransport,
   type Logger,
@@ -770,6 +771,7 @@ test("advertises client capabilities in hello", async () => {
       custom_mode_icons: true,
       project_updates: true,
       provider_subagents: true,
+      projected_provider_subagents: true,
       reasoning_merge_enum: true,
       terminal_reflowable_snapshot: true,
       timeline_notifications: true,
@@ -1267,6 +1269,75 @@ test("preserves legacy fetchAgent id overload", async () => {
 
   await expect(responsePromise).rejects.toThrow("legacy fetch sentinel");
 });
+
+test.each(["TIMELINE_BUSY", "TIMELINE_ITEM_TOO_LARGE"] as const)(
+  "preserves typed %s errors for managed and provider-child pages",
+  async (errorCode) => {
+    const mock = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "timeline-errors",
+      reconnect: { enabled: false },
+      transportFactory: () => mock.transport,
+    });
+    clients.push(client);
+    const connected = client.connect();
+    mock.triggerOpen();
+    await connected;
+    for (const child of [false, true]) {
+      const requestId = child ? "child-error" : "managed-error";
+      const response = child
+        ? client.fetchProviderSubagentTimeline("parent", "child", {
+            requestId,
+            projection: "projected",
+          })
+        : client.fetchAgentTimeline("parent", { requestId, projection: "projected" });
+      const error = response.catch((failure: unknown) => failure);
+      const common = {
+        requestId,
+        direction: "tail",
+        projection: "projected",
+        epoch: "epoch",
+        reset: false,
+        staleCursor: false,
+        gap: false,
+        window: { minSeq: 0, maxSeq: 0, nextSeq: 1 },
+        startCursor: null,
+        endCursor: null,
+        hasOlder: false,
+        hasNewer: false,
+        entries: [],
+        error: "timeline request refused",
+        errorCode,
+      };
+      mock.triggerMessage(
+        wrapSessionMessage(
+          child
+            ? {
+                type: "agent.provider_subagents.timeline.get.response",
+                payload: {
+                  ...common,
+                  parentAgentId: "parent",
+                  subagentId: "child",
+                  provider: "codex",
+                  rows: [],
+                },
+              }
+            : {
+                type: "fetch_agent_timeline_response",
+                payload: { ...common, agentId: "parent", agent: null },
+              },
+        ),
+      );
+      expect(await error).toBeInstanceOf(TimelineRequestError);
+      expect(await error).toMatchObject({
+        code: errorCode,
+        epoch: "epoch",
+        message: "timeline request refused",
+      });
+    }
+  },
+);
 
 test("honors explicit fetchAgentTimeline timeout below the session RPC default", async () => {
   useHeartbeatClock();

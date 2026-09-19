@@ -1,3 +1,4 @@
+import { ProviderInitializationCleanupError } from "../../provider-initialization-cleanup-error.js";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { Logger } from "pino";
 
@@ -51,6 +52,8 @@ export class PiCliRuntime implements PiRuntime {
   }
 
   async startSession(input: PiStartSessionInput): Promise<PiRuntimeSession> {
+    input.signal?.throwIfAborted();
+    input.probe?.signal.throwIfAborted();
     const launch = buildPiLaunch({
       command: this.command,
       runtimeSettings: this.options.runtimeSettings,
@@ -72,8 +75,13 @@ export class PiCliRuntime implements PiRuntime {
       ...(spawn ? { spawn: () => spawn(launch) } : {}),
     };
     const process = new JsonlRpcProcess(processOptions);
+    input.probe?.own(process);
     if (input.signal?.aborted) {
-      await process.close(input.signal.reason);
+      try {
+        await process.close(input.signal.reason);
+      } catch (cleanupError) {
+        throw new ProviderInitializationCleanupError(process, input.signal.reason, cleanupError);
+      }
       input.signal.throwIfAborted();
     }
     return new PiCliRuntimeSession(process, this.commandsRpcName);

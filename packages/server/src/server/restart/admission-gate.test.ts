@@ -39,18 +39,20 @@ it("does not leak admission authority into detached work after its owner finishe
   await assertion;
 });
 
-it("permits owner recovery without opening admissions to unrelated callers", async () => {
+it("provider callbacks cannot inherit an in-flight command's authority", async () => {
   const gate = new AdmissionGate();
-  await gate.freeze();
   const release = Promise.withResolvers<void>();
-  const recovery = gate.restore(async () => {
+  let providerCallback!: () => Promise<string>;
+  const newWork = async () => "new work";
+  const admitNewWork = () => gate.run(newWork);
+  const accepted = gate.run(async () => {
+    providerCallback = () => gate.outside(admitNewWork);
     await release.promise;
-    return "restored";
   });
-  await expect(gate.run(async () => "new work")).rejects.toBeInstanceOf(RestartInProgressError);
+  const frozen = gate.freeze();
+  await expect(providerCallback()).rejects.toBeInstanceOf(RestartInProgressError);
   release.resolve();
-  expect(await recovery).toBe("restored");
-  await expect(gate.run(async () => "still frozen")).rejects.toBeInstanceOf(RestartInProgressError);
+  await Promise.all([accepted, frozen]);
   gate.open();
-  expect(await gate.run(async () => "new work")).toBe("new work");
+  expect(await providerCallback()).toBe("new work");
 });

@@ -3,6 +3,7 @@ import readline from "node:readline";
 import type { Logger } from "pino";
 import { z } from "zod";
 
+import { withTimeout } from "../../../../utils/promise-timeout.js";
 import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
 
 const DEFAULT_TIMEOUT_MS = 14 * 24 * 60 * 60 * 1000;
@@ -175,6 +176,8 @@ export class CodexAppServerClient {
   private unexpectedTerminationHandler: UnexpectedTerminationHandler | null = null;
   private nextId = 1;
   private disposed = false;
+  private disposePromise: Promise<void> | null = null;
+  private readonly outputClosed: Promise<void>;
   private stderrBuffer = "";
 
   constructor(
@@ -183,6 +186,7 @@ export class CodexAppServerClient {
     private readonly getTraceContext: () => CodexAppServerTraceContext = () => ({}),
   ) {
     this.rl = readline.createInterface({ input: child.stdout });
+    this.outputClosed = new Promise((resolve) => this.rl.once("close", () => resolve()));
     this.rl.on("line", (line) => {
       void this.handleLine(line).catch((error) => {
         this.logger.warn({ error, line }, "Failed to handle Codex app-server stdout line");
@@ -256,10 +260,20 @@ export class CodexAppServerClient {
     this.child.stdin.write(`${JSON.stringify(payload)}\n`);
   }
 
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
+    if (!this.disposePromise) {
+      const attempt = this.disposeProcess();
+      this.disposePromise = attempt;
+      void attempt.catch(() => {
+        if (this.disposePromise === attempt) this.disposePromise = null;
+      });
+    }
+    return this.disposePromise;
+  }
+
+  private async disposeProcess(): Promise<void> {
     this.disposed = true;
     this.unexpectedTerminationHandler = null;
-    this.rl.close();
     this.rejectPending(new Error("Codex app-server client is closed"));
     try {
       this.child.stdin.end();
@@ -279,6 +293,11 @@ export class CodexAppServerClient {
     if (result === "kill-timeout") {
       throw new Error("Codex app-server did not report exit after SIGKILL");
     }
+    await withTimeout(
+      this.outputClosed,
+      APP_SERVER_FORCE_SHUTDOWN_TIMEOUT_MS,
+      "Codex app-server output drain",
+    );
   }
 
   private handleUnexpectedTermination(error: Error): void {
@@ -286,7 +305,6 @@ export class CodexAppServerClient {
       return;
     }
     this.disposed = true;
-    this.rl.close();
     this.rejectPending(error);
     const handler = this.unexpectedTerminationHandler;
     this.unexpectedTerminationHandler = null;
@@ -356,6 +374,7 @@ export class CodexAppServerClient {
       }
 
       if (isJsonRpcRequest(raw)) {
+        if (this.disposed) return;
         const request = raw;
         this.traceRawEvent(request);
         const handler = this.requestHandlers.get(request.method);

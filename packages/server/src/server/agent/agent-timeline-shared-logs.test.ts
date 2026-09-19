@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import { AgentTimelineSnapshotSchema, InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
+import { SharedLogStore, timelineItemJsonBytes } from "./shared-log.js";
+import { decodeTextNodes } from "./shared-text.js";
 import { projectTimelineRows } from "./timeline-projection.js";
 
 function call(callId: string, log: string): AgentTimelineItem {
@@ -70,7 +72,13 @@ describe("canonical shared subagent logs", () => {
       nextSeq: 9,
       rows: expected,
     });
-    for (const snapshot of [compact, legacy]) {
+    const version2 = AgentTimelineSnapshotSchema.parse({
+      epoch: "epoch",
+      nextSeq: 9,
+      rows: compact.rows.map((row, index) => ({ ...row, logRef: index === 0 ? 0 : 2 })),
+      textNodes: ["before", " + after", [0, 1]],
+    });
+    for (const snapshot of [compact, legacy, version2]) {
       const restored = new InMemoryAgentTimelineStore();
       restored.restoreSnapshot("parent", snapshot);
       expect(plain(restored.getRows("parent"))).toEqual(expected);
@@ -111,6 +119,33 @@ describe("canonical shared subagent logs", () => {
     const snapshot = imported.exportSnapshot("copy");
     expect(snapshot.rows.every((row) => row.logRef !== undefined)).toBe(true);
     expect(AgentTimelineSnapshotSchema.safeParse(snapshot).success).toBe(true);
+  });
+
+  it("sizes shared and projected items exactly without flattening retained history", () => {
+    const store = new InMemoryAgentTimelineStore();
+    store.initialize("parent");
+    const values = ["", "\ud800", "\ud800\udfff", 'quote"\\\n\u0001', "new🙂 text"];
+    for (const value of values) store.append("parent", call("one", value));
+    const rows = store.getRows("parent");
+    const projected = projectTimelineRows({ rows, mode: "projected" });
+    for (const { item } of [...rows, ...projected]) {
+      const expected = Buffer.byteLength(JSON.stringify(item));
+      expect(timelineItemJsonBytes(item)).toBe(expected);
+      expect(timelineItemJsonBytes(item, expected)).toBe(expected);
+      expect(timelineItemJsonBytes(item, expected - 1)).toBe(null);
+    }
+    const ordinary: AgentTimelineItem = { type: "assistant_message", text: "hello🙂" };
+    expect(timelineItemJsonBytes(ordinary)).toBe(Buffer.byteLength(JSON.stringify(ordinary)));
+    expect(timelineItemJsonBytes(ordinary, 0)).toBe(null);
+  });
+
+  it("rejects an unrepresentable response before expanding a shared log", () => {
+    const nodes: Array<string | [number, number]> = ["a"];
+    for (let index = 0; index < 27; index++) nodes.push([index, index]);
+    const logs = new SharedLogStore();
+    const item = logs.attach(call("one", ""), decodeTextNodes(nodes)[27]);
+    // Existing physical socket capacity; no 128 MiB expanded log is needed to refuse it.
+    expect(timelineItemJsonBytes(item, 64 * 1024 * 1024)).toBe(null);
   });
 
   it("rejects malformed compact references and conflicting inline log text", () => {

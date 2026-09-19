@@ -1,3 +1,7 @@
+import { ProviderInitializationCleanupError } from "../../provider-initialization-cleanup-error.js";
+import { createTestLogger } from "../../../../test-utils/test-logger.js";
+import { FakeOmp } from "./test-utils/fake-omp.js";
+import { OmpAgentClient } from "./agent.js";
 import { describe, expect, test } from "vitest";
 import { setImmediate as waitForImmediate } from "node:timers/promises";
 
@@ -245,6 +249,26 @@ describe("OMP agent client and session", () => {
     expect(omp.completedTurnCount()).toBe(1);
   });
 
+  test("OMP keeps successors blocked after terminal output until abort acknowledgement", async () => {
+    const omp = new OmpHarness();
+    await omp.start();
+    await omp.requireStartTurn("old turn");
+    const acknowledged = Promise.withResolvers<void>();
+    const terminal = Promise.withResolvers<void>();
+    omp.runtime().abort = async () => {
+      omp.runtime().finishTurn({ role: "assistant", stopReason: "stop", content: [] });
+      terminal.resolve();
+      await acknowledged.promise;
+    };
+    const interrupt = omp.interrupt();
+    await terminal.promise;
+    await expect(omp.startTurn("too early")).rejects.toThrow("still stopping");
+    acknowledged.resolve();
+    await interrupt;
+    await omp.requireStartTurn("replacement");
+    await omp.close();
+  });
+
   test("starts and stops context usage polling with the active turn", async () => {
     const scheduler = new ManualUsagePollScheduler();
     const omp = new OmpHarness({ usagePollScheduler: scheduler });
@@ -454,8 +478,10 @@ describe("OMP agent client and session", () => {
     await omp.close();
 
     expect(scheduler.wasAborted()).toBe(true);
-    expect(prompt.completed()).toBe(false);
+    await expect(prompt.completion).resolves.toMatchObject({ finalText: "" });
+    expect(prompt.completed()).toBe(true);
     expect(omp.completedTurnCount()).toBe(0);
+    expect(omp.canceledTurnCount()).toBe(1);
   });
 
   test("preserves a correlated invoked result over a local-only prompt ack", async () => {
@@ -660,4 +686,43 @@ describe("OMP agent client and session", () => {
       { type: "user_message", text: "hello OMP", messageId: "user-1" },
     ]);
   });
+});
+
+test("OMP retries runtime close failures before clearing owned session state", async () => {
+  const harness = new OmpHarness();
+  await harness.start();
+  const runtime = harness.runtime();
+  runtime.closeError = new Error("OMP still running");
+  await expect(harness.close()).rejects.toThrow("OMP still running");
+  expect(harness.isClosed()).toBe(false);
+  runtime.closeError = null;
+  await harness.close();
+  await harness.close();
+  expect(runtime.closeCalls).toBe(2);
+  expect(harness.isClosed()).toBe(true);
+});
+
+test("OMP transfers failed initialization cleanup to its caller", async () => {
+  const startupError = new Error("OMP state unavailable");
+  const closeError = new Error("OMP stop unconfirmed");
+  class FailingRuntime extends FakeOmp {
+    override async startSession(input: Parameters<FakeOmp["startSession"]>[0]) {
+      const runtime = await super.startSession(input);
+      runtime.getStateError = startupError;
+      runtime.closeError = closeError;
+      return runtime;
+    }
+  }
+  const runtime = new FailingRuntime();
+  const client = new OmpAgentClient({ logger: createTestLogger(), runtime });
+  const failure = await client
+    .createSession({ provider: "omp", cwd: process.cwd() })
+    .catch((error: unknown) => error);
+  expect(failure).toBeInstanceOf(ProviderInitializationCleanupError);
+  if (!(failure instanceof ProviderInitializationCleanupError))
+    throw new Error("Missing cleanup owner");
+  expect(failure.initializationError).toBe(startupError);
+  runtime.latestSession().closeError = null;
+  await failure.cleanup.close();
+  expect(runtime.latestSession().closeCalls).toBe(2);
 });

@@ -13,7 +13,6 @@ import {
 import type { StreamItem } from "@/types/stream";
 import { deriveAgentStreamTurnLiveness } from "@/timeline/session-stream-reducers";
 import { planTimelineTailFetch } from "@/timeline/timeline-sync-plan";
-import { requestTimelineReplacement } from "@/timeline/timeline-replacement";
 import {
   consumeForcedTimelineTailReplacement,
   type TimelineDeliveryMode,
@@ -30,6 +29,7 @@ import {
 } from "@getpaseo/protocol/agent-attention-notification";
 
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { TimelineRequestError } from "@getpaseo/client/internal/daemon-client";
 import type { AgentSessionConfig } from "@getpaseo/protocol/agent-types";
 import type { GitSetupOptions } from "@getpaseo/protocol/messages";
 import type { AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
@@ -57,7 +57,7 @@ import { useToast } from "@/contexts/toast-context";
 import { toErrorMessage } from "@/utils/error-messages";
 import { showProviderNoticeToast } from "@/utils/provider-notice-toast";
 import { applyCheckoutStatusUpdateFromEvent } from "@/git/checkout-status-cache";
-import { useProviderSubagentStore } from "@/subagents/provider-store";
+import { applyProviderSubagentDescriptorUpdate } from "@/subagents/provider-transcripts";
 import { revalidateSessionAfterResume } from "@/contexts/session-resume-revalidation";
 
 // Re-export types from session-store and draft-store for backward compatibility
@@ -462,7 +462,10 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
           }
           return page;
         } catch (error) {
-          if (shouldInitialize) {
+          if (
+            shouldInitialize &&
+            !(error instanceof TimelineRequestError && error.code === "TIMELINE_BUSY")
+          ) {
             setAgentInitializing(agentId, false);
             rejectInitDeferred(initKey, error instanceof Error ? error : new Error(String(error)));
           }
@@ -556,20 +559,12 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
 
     const unsubTimelineReplacement = client.on("agent.timeline.replacement", (message) => {
       if (message.type !== "agent.timeline.replacement") return;
-      void requestTimelineReplacement(
-        {
-          fetchAgentTimeline: (agentId, request) =>
-            getHostRuntimeStore().fetchAgentTimeline(serverId, agentId, request),
-        },
-        message.payload.agentId,
-      ).catch((error: unknown) => {
-        console.warn("[Session] timeline replacement refresh failed", { serverId, error });
-      });
+      owner.replaceTimelineEpoch(message.payload.agentId, message.payload.epoch);
     });
 
     const unsubProviderSubagentUpdate = client.on("agent.provider_subagents.update", (message) => {
       if (message.type !== "agent.provider_subagents.update") return;
-      useProviderSubagentStore.getState().applyUpdate(serverId, message.payload);
+      applyProviderSubagentDescriptorUpdate(serverId, client, message.payload);
     });
 
     const unsubCheckoutStatusUpdate = client.on("checkout_status_update", (message) => {

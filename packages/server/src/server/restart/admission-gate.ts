@@ -38,10 +38,13 @@ export class AdmissionGate {
     while (this.admitted.size) await Promise.allSettled(this.admitted);
   }
 
-  /** Only the lifecycle owner restores work through a frozen gate. */
-  restore<T>(operation: () => Promise<T>): Promise<T> {
-    if (!this.frozen) throw new Error("Recovery requires a frozen admission gate");
-    return this.own(operation);
+  get isOpen(): boolean {
+    return !this.frozen;
+  }
+
+  /** Provider events own settlement, never authority to admit a new command. */
+  outside<T>(operation: () => T): T {
+    return this.scope.exit(operation);
   }
 
   open(): void {

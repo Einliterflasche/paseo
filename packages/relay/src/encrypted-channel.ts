@@ -119,6 +119,8 @@ const HANDSHAKE_RETRY_MS = 1000;
 const MAX_PENDING_SENDS = 200;
 const REHANDSHAKE_REJECTION_CODE = 1008;
 const ENCRYPTED_PAYLOAD_OVERHEAD_BYTES = 40;
+// The hosted relay's frame limit also constrains JSON encrypted as base64 text.
+export const RELAY_MAX_FRAME_BYTES = 32 * 1024 * 1024;
 
 export function base64EncryptedWireByteLength(plaintextBytes: number): number {
   return 4 * Math.ceil((plaintextBytes + ENCRYPTED_PAYLOAD_OVERHEAD_BYTES) / 3);

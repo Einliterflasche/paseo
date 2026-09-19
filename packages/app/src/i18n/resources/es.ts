@@ -8,6 +8,13 @@ export const es: TranslationResources = {
       description:
         "Paseo ha pausado el trabajo de los agentes para proteger el historial guardado. El operador del host debe resolver el error de recuperación antes de continuar.",
       generation: "Punto de control: {{generation}}",
+      stoppingTitle: "La recuperación está deteniendo el trabajo en {{hostName}}",
+      stoppingDescription:
+        "La recuperación falló. Paseo está deteniendo los agentes afectados y conservando sus resultados. Todavía no se ha confirmado que el trabajo esté en pausa.",
+      blockedTitle: "La recuperación requiere atención en {{hostName}}",
+      blockedDescription:
+        "Paseo no pudo confirmar que todos los agentes afectados se hayan detenido. El trabajo nuevo y el reinicio están bloqueados. El operador del host debe resolver el error antes de reintentar la recuperación.",
+      affectedAgents: "Agentes afectados: {{agents}}",
     },
     back: "Atrás",
     loading: "Cargando...",

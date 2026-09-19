@@ -230,6 +230,7 @@ export interface SendPromptToAgentParams {
   /** Prompt to dispatch to the provider (may include image blocks or wrapped text). */
   prompt: AgentPromptInput;
   messageId?: string;
+  finishNotification?: { callerAgentId: string; requireParentOwnership?: boolean };
   activeTurnBehavior?: ActiveTurnBehavior;
   runOptions?: AgentRunOptions;
   /** Optional mode to set on the agent before the run starts. */
@@ -305,6 +306,12 @@ export async function waitForAgentRunStartWithTimeout(
 export async function sendPromptToAgent(
   params: SendPromptToAgentParams,
 ): Promise<{ disposition: PromptDispatchDisposition }> {
+  return params.agentManager.runRequestAdmission(() => sendAcceptedPrompt(params));
+}
+
+async function sendAcceptedPrompt(
+  params: SendPromptToAgentParams,
+): Promise<{ disposition: PromptDispatchDisposition }> {
   const unarchive = params.unarchive ?? true;
 
   const record = await params.agentStorage.get(params.agentId);
@@ -325,16 +332,31 @@ export async function sendPromptToAgent(
     await params.agentManager.setAgentMode(params.agentId, params.sessionMode);
   }
 
-  const runOptions = params.messageId
-    ? { ...params.runOptions, clientMessageId: params.messageId }
-    : params.runOptions;
-
-  return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
-    replaceRunning: true,
-    activeTurnBehavior: params.activeTurnBehavior,
-    clearPendingPermissions: params.clearPendingPermissions,
-    runOptions,
-  });
+  const messageId = params.messageId ?? params.runOptions?.clientMessageId ?? randomUUID();
+  const runOptions = { ...params.runOptions, clientMessageId: messageId };
+  const start = () =>
+    startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
+      replaceRunning: true,
+      activeTurnBehavior: params.activeTurnBehavior,
+      clearPendingPermissions: params.clearPendingPermissions,
+      runOptions,
+    });
+  if (!params.finishNotification) return await start();
+  if (params.activeTurnBehavior === "steer") {
+    throw new Error("Finish-notification ownership requires a new run, not a steering message");
+  }
+  return await startWithFinishNotification(
+    {
+      agentManager: params.agentManager,
+      agentStorage: params.agentStorage,
+      childAgentId: params.agentId,
+      ...params.finishNotification,
+      runId: messageId,
+      logger: params.logger,
+    },
+    start,
+    (result) => result.disposition !== "out_of_band",
+  );
 }
 
 export async function startCreatedAgentInitialPrompt(
@@ -376,6 +398,8 @@ export interface SetupFinishNotificationParams {
   childAgentId: string;
   callerAgentId: string;
   requireParentOwnership?: boolean;
+  /** Stable accepted input/run identity; recovery attempts preserve it. */
+  runId?: string;
   logger: Logger;
 }
 
@@ -420,6 +444,7 @@ function formatFinishNotificationBody(params: FinishNotificationBodyInput): stri
 }
 
 interface NotifySafelyOptions {
+  lastAssistantMessage?: string | null;
   terminal?: boolean;
   permissionRequest?: AgentPermissionRequest;
 }
@@ -448,7 +473,10 @@ export interface FinishNotificationWatchRecord {
   childAgentId: string;
   callerAgentId: string;
   requireParentOwnership: boolean;
+  runId?: string;
   hasSeenRunning: boolean;
+  /** A terminal outcome is already owned; restore only its pending deliveries. */
+  stopped?: boolean;
   notifiedPermissionRequestIds: string[];
   /** Delivery-ordered; oldest entry is the one currently being attempted. */
   pending: FinishNotificationPendingRecord[];
@@ -458,22 +486,23 @@ export const FinishNotificationPendingRecordSchema = z.object({
   id: z.string(),
   reason: z.enum(["finished", "errored", "needs permission", "was closed"]),
   lastAssistantMessage: z.string().nullable(),
-  permissionRequest: z
-    .object({
-      id: z.string(),
-      provider: z.string(),
-      name: z.string(),
-      kind: z.enum(["tool", "plan", "question", "mode", "other"]),
-      title: z.string().optional(),
-      description: z.string().optional(),
-      input: z.record(z.string(), z.unknown()).optional(),
-      detail: z.unknown().optional(),
-      suggestions: z.array(z.unknown()).optional(),
-      actions: z.array(z.unknown()).optional(),
-      metadata: z.record(z.string(), z.unknown()).optional(),
-    })
-    .passthrough()
-    .optional() as z.ZodType<AgentPermissionRequest | undefined>,
+  permissionRequest: (
+    z
+      .object({
+        id: z.string(),
+        provider: z.string(),
+        name: z.string(),
+        kind: z.enum(["tool", "plan", "question", "mode", "other"]),
+        title: z.string().optional(),
+        description: z.string().optional(),
+        input: z.record(z.string(), z.unknown()).optional(),
+        detail: z.unknown().optional(),
+        suggestions: z.array(z.unknown()).optional(),
+        actions: z.array(z.unknown()).optional(),
+        metadata: z.record(z.string(), z.unknown()).optional(),
+      })
+      .passthrough() as z.ZodType<AgentPermissionRequest>
+  ).optional(),
 });
 
 export const FinishNotificationWatchRecordSchema = z.object({
@@ -481,7 +510,9 @@ export const FinishNotificationWatchRecordSchema = z.object({
   childAgentId: z.string(),
   callerAgentId: z.string(),
   requireParentOwnership: z.boolean(),
+  runId: z.string().optional(),
   hasSeenRunning: z.boolean(),
+  stopped: z.boolean().optional(),
   notifiedPermissionRequestIds: z.array(z.string()),
   pending: z.array(FinishNotificationPendingRecordSchema),
 });
@@ -566,6 +597,7 @@ export function restoreFinishNotificationWatch(
   params: RestoreFinishNotificationWatchParams,
   record: FinishNotificationWatchRecord,
 ): void {
+  if (getWatchRegistry(params.agentManager).has(record.watchId)) return;
   setupFinishNotificationWatch(
     {
       agentManager: params.agentManager,
@@ -573,6 +605,7 @@ export function restoreFinishNotificationWatch(
       childAgentId: record.childAgentId,
       callerAgentId: record.callerAgentId,
       requireParentOwnership: record.requireParentOwnership,
+      runId: record.runId,
       logger: params.logger,
     },
     record,
@@ -583,10 +616,47 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
   setupFinishNotificationWatch(params, null);
 }
 
+/** Own the notification before provider handoff, including immediate completion. */
+export async function startWithFinishNotification<T>(
+  params: SetupFinishNotificationParams & { runId: string },
+  start: () => Promise<T>,
+  ownsRun: (result: T) => boolean = () => true,
+): Promise<T> {
+  const stop = setupFinishNotificationWatch(params, null);
+  try {
+    const result = await start();
+    if (!ownsRun(result)) stop();
+    return result;
+  } catch (error) {
+    stop();
+    throw error;
+  }
+}
+
+function restoreFinishWatchState(
+  params: SetupFinishNotificationParams,
+  initialState: FinishNotificationWatchRecord | null,
+) {
+  const pending = initialState?.pending.map((entry) => Object.assign({}, entry)) ?? [];
+  return {
+    watchId: initialState?.watchId ?? randomUUID(),
+    runId:
+      initialState?.runId ??
+      params.runId ??
+      params.agentManager.getRunIdentity(params.childAgentId),
+    hasSeenRunning: initialState?.hasSeenRunning ?? false,
+    // COMPAT(restart-watch-stopped): format 1/2 omitted terminal observation.
+    // Keep pending-terminal inference until those checkpoint readers retire.
+    stopped: initialState?.stopped ?? pending.some((entry) => entry.reason !== "needs permission"),
+    notifiedPermissionRequestIds: new Set<string>(initialState?.notifiedPermissionRequestIds),
+    pending,
+  };
+}
+
 function setupFinishNotificationWatch(
   params: SetupFinishNotificationParams,
   initialState: FinishNotificationWatchRecord | null,
-): void {
+): () => void {
   const {
     agentManager,
     agentStorage,
@@ -595,13 +665,11 @@ function setupFinishNotificationWatch(
     requireParentOwnership = false,
     logger,
   } = params;
-  const watchId = initialState?.watchId ?? randomUUID();
-  let hasSeenRunning = initialState?.hasSeenRunning ?? false;
-  let stopped = false;
-  const notifiedPermissionRequestIds = new Set<string>(initialState?.notifiedPermissionRequestIds);
+  const state = restoreFinishWatchState(params, initialState);
+  const { watchId, notifiedPermissionRequestIds, pending } = state;
+  let { runId, hasSeenRunning, stopped } = state;
   let unsubscribe: (() => void) | null = null;
-  const pending: FinishNotificationPendingRecord[] =
-    initialState?.pending.map((entry) => Object.assign({}, entry)) ?? [];
+  let unsubscribeOutcome: (() => void) | null = null;
   // In-flight lastAssistantMessage captures, keyed by pending entry id. Only
   // populated for entries created in this process; a restored entry already
   // carries its captured value and has nothing to await here.
@@ -619,6 +687,7 @@ function setupFinishNotificationWatch(
     if (stopped) return;
     stopped = true;
     unsubscribe?.();
+    unsubscribeOutcome?.();
     maybeRetire();
   }
 
@@ -673,14 +742,7 @@ function setupFinishNotificationWatch(
   // it under its original stable id rather than firing a fresh notification.
   function flushPending(): void {
     flushChain = flushChain.then(async () => {
-      // Explicit gate, independent of AdmissionGate: a callback invoked from
-      // inside manager.resumeRestartCheckpoint (e.g. a live event on an
-      // agent that already finished restoring) inherits restore authority
-      // via AsyncLocalStorage, so an admission call it makes would be
-      // accepted even while OTHER agents are still restoring. Hold every
-      // entry — do not consume or partially attempt them — until the phase
-      // is fully "running" again; retryPendingFinishNotifications() is what
-      // flushes after that.
+      // Pending obligations survive recovery; delivery starts only after admission reopens.
       if (agentManager.isRestartSuspended()) {
         // Delivery is held, but the lastAssistantMessage capture for every
         // currently-pending entry still must settle before this resolves —
@@ -716,25 +778,28 @@ function setupFinishNotificationWatch(
       // Captured once, now, from the live child — not inside deliver(),
       // which can run again on retry/restore after the child has unloaded
       // or moved on.
-      lastAssistantMessage: null,
+      lastAssistantMessage: options.lastAssistantMessage ?? null,
     };
     // Push before stop(): stop() can retire the watch from the registry when
     // nothing is pending, and this entry must count as pending before that
     // check runs, or a terminal notification (the common case) would retire
     // itself out of the checkpoint before it was ever queued.
     pending.push(entry);
-    const capture = agentManager
-      .getLastAssistantMessage(childAgentId)
-      .then((message) => {
-        entry.lastAssistantMessage = message;
-        return;
-      })
-      .catch((error) => {
-        logger.warn(
-          { err: error, childAgentId, callerAgentId, reason },
-          "Failed to capture last assistant message for finish notification",
-        );
-      });
+    const capture =
+      options.lastAssistantMessage !== undefined
+        ? Promise.resolve()
+        : agentManager
+            .getLastAssistantMessage(childAgentId)
+            .then((message) => {
+              entry.lastAssistantMessage = message;
+              return;
+            })
+            .catch((error) => {
+              logger.warn(
+                { err: error, childAgentId, callerAgentId, reason },
+                "Failed to capture last assistant message for finish notification",
+              );
+            });
     pendingCaptures.set(entry.id, capture);
     if (options.terminal ?? true) stop();
     flushPending();
@@ -746,7 +811,9 @@ function setupFinishNotificationWatch(
       childAgentId,
       callerAgentId,
       requireParentOwnership,
+      runId,
       hasSeenRunning,
+      stopped,
       notifiedPermissionRequestIds: [...notifiedPermissionRequestIds],
       pending: pending.map((entry) => Object.assign({}, entry)),
     }),
@@ -759,11 +826,25 @@ function setupFinishNotificationWatch(
   // restart driver calls retryPendingFinishNotifications() once admission
   // reopens, via this same registered `flush`.
 
+  if (stopped) {
+    maybeRetire();
+    return stop;
+  }
+
+  const observeOutcome = (outcome: NonNullable<ReturnType<AgentManager["getRunOutcome"]>>) => {
+    runId ??= outcome.runId;
+    if (outcome.runId !== runId) return;
+    const options = { lastAssistantMessage: outcome.lastMessage };
+    if (outcome.type === "completed") notifySafely("finished", options);
+    else if (outcome.type === "failed") notifySafely("errored", options);
+    else if (outcome.type === "user_canceled") notifySafely("was closed", options);
+  };
+  unsubscribeOutcome = agentManager.subscribeRunOutcome(childAgentId, observeOutcome);
   unsubscribe = agentManager.subscribe(
     (event) => {
-      if (stopped) {
-        return;
-      }
+      if (stopped) return;
+      runId ??= agentManager.getRunIdentity(childAgentId);
+      if (runId && agentManager.getRunIdentity(childAgentId) !== runId) return;
 
       if (event.type === "agent_state") {
         for (const requestId of notifiedPermissionRequestIds) {
@@ -775,14 +856,6 @@ function setupFinishNotificationWatch(
           if (event.agent.pendingPermissions.size === 0) {
             hasSeenRunning = true;
           }
-          return;
-        }
-        if (event.agent.lifecycle === "error") {
-          notifySafely("errored");
-          return;
-        }
-        if (event.agent.lifecycle === "idle" && hasSeenRunning) {
-          notifySafely("finished");
           return;
         }
         if (event.agent.lifecycle === "closed") {
@@ -827,14 +900,19 @@ function setupFinishNotificationWatch(
   // Do NOT treat an immediate "idle" as "finished" — the agent may
   // not have started yet (streamAgent sets a pending run before
   // transitioning to "running").
+  const completed = agentManager.getRunOutcome(childAgentId);
+  if (completed && (!runId || completed.runId === runId)) observeOutcome(completed);
   const childSnapshot = agentManager.getAgent(childAgentId);
-  if (!childSnapshot || childSnapshot.lifecycle === "closed") {
+  if (!childSnapshot) {
+    if (!agentManager.hasInstalledHistory(childAgentId)) stop();
+    return stop;
+  }
+  if (childSnapshot.lifecycle === "closed") {
     stop();
-    return;
+    return stop;
   }
   if (childSnapshot.lifecycle === "running") {
     hasSeenRunning = true;
-  } else if (childSnapshot.lifecycle === "error") {
-    notifySafely("errored");
   }
+  return stop;
 }

@@ -25,6 +25,7 @@ import { DownloadTokenStore } from "../../file-download/token-store.js";
 import { PreviewGrantStore } from "../../file-preview/grant-store.js";
 import { getFileAccessInfo } from "../../file-explorer/service.js";
 import type { SessionOutboundMessage } from "../../messages.js";
+import { AdmissionGate } from "../../restart/admission-gate.js";
 
 const tempDirs: string[] = [];
 
@@ -94,6 +95,80 @@ function uploadFrame(args: Parameters<typeof encodeFileTransferFrame>[0]): FileT
 }
 
 describe("WorkspaceFilesSession", () => {
+  test("accepted upload completion drains queued disk writes before restart admission freezes", async () => {
+    const { subsystem, emitted, paseoHome } = makeSubsystem();
+    const admission = new AdmissionGate();
+    const requestId = "upload-before-freeze";
+    subsystem.handleFileUploadRequest({
+      type: "file.upload.request",
+      requestId,
+      fileName: "accepted.txt",
+      mimeType: "text/plain",
+      size: 11,
+      modifiedAt: "2026-09-19T00:00:00.000Z",
+    });
+    // All frames are accepted in this synchronous turn, while the store's
+    // asynchronous filesystem queue has not completed even its initial mkdir.
+    const accepted = [
+      admission.run(() =>
+        subsystem.handleFileTransferFrame(
+          uploadFrame({
+            opcode: FileTransferOpcode.FileBegin,
+            requestId,
+            metadata: {
+              mime: "text/plain",
+              size: 11,
+              encoding: "utf-8",
+              modifiedAt: "2026-09-19T00:00:00.000Z",
+            },
+          }),
+        ),
+      ),
+      admission.run(() =>
+        subsystem.handleFileTransferFrame(
+          uploadFrame({ opcode: FileTransferOpcode.FileChunk, requestId, payload: "hello" }),
+        ),
+      ),
+      admission.run(() =>
+        subsystem.handleFileTransferFrame(
+          uploadFrame({ opcode: FileTransferOpcode.FileChunk, requestId, payload: " world" }),
+        ),
+      ),
+      admission.run(() =>
+        subsystem.handleFileTransferFrame(
+          uploadFrame({ opcode: FileTransferOpcode.FileEnd, requestId }),
+        ),
+      ),
+    ];
+    expect(emitted).toEqual([]);
+    await admission.freeze();
+    expect(emitted).toEqual([
+      {
+        type: "file.upload.response",
+        payload: {
+          requestId,
+          error: null,
+          file: {
+            type: "uploaded_file",
+            id: "upload_upload-before-freeze",
+            fileName: "accepted.txt",
+            mimeType: "text/plain",
+            size: 11,
+            path: join(paseoHome, "uploads", "upload_upload-before-freeze", "accepted.txt"),
+          },
+        },
+      },
+    ]);
+    expect(
+      readFileSync(
+        join(paseoHome, "uploads", "upload_upload-before-freeze", "accepted.txt"),
+        "utf8",
+      ),
+    ).toBe("hello world");
+    await Promise.all(accepted);
+    subsystem.dispose();
+  });
+
   test("creates an entry and emits the complete success response", async () => {
     const cwd = makeDir("workspace-files-create-");
     const { subsystem, emitted } = makeSubsystem();

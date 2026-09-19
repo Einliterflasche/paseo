@@ -1016,7 +1016,7 @@ describe("ProviderSnapshotManager public surface", () => {
 
   test("getProviderDiagnostic starts provider diagnostics before waiting for snapshot refresh", async () => {
     vi.useFakeTimers();
-    let diagnosticStarted = false;
+    const diagnosticStarted = Promise.withResolvers<void>();
     const manager = new ProviderSnapshotManager({
       logger: createTestLogger(),
       refreshTimeoutMs: TEST_REFRESH_TIMEOUT_MS,
@@ -1028,7 +1028,7 @@ describe("ProviderSnapshotManager public surface", () => {
             return { models: [], modes: [] };
           },
           getDiagnostic: async () => {
-            diagnosticStarted = true;
+            diagnosticStarted.resolve();
             return { diagnostic: "codex diagnostics available" };
           },
         }),
@@ -1036,7 +1036,7 @@ describe("ProviderSnapshotManager public surface", () => {
     });
     try {
       const diagnosticRequest = manager.getProviderDiagnostic("codex");
-      expect(diagnosticStarted).toBe(true);
+      await diagnosticStarted.promise;
 
       const diagnosticOrBlocked = Promise.race([
         diagnosticRequest.then(() => ({ type: "diagnostic" as const })),
@@ -3374,4 +3374,114 @@ test("binding a settled catalogue publishes once and rebinding an equal settled 
   } finally {
     manager.destroy();
   }
+});
+
+test("recovery preserves cached provider reads while refusing native catalog and diagnostic acquisition", async () => {
+  const { AgentManager } = await import("./agent-manager.js");
+  const logger = createTestLogger();
+  let catalogs = 0;
+  let diagnostics = 0;
+  let listings = 0;
+  const client = createExtraClient("codex", {
+    capabilities: { ...TEST_CAPABILITIES, supportsSessionListing: true },
+    isAvailable: async () => true,
+    fetchCatalog: async () => {
+      catalogs++;
+      return { models: [{ provider: "codex", id: "cached", label: "Cached model" }], modes: [] };
+    },
+    getDiagnostic: async () => {
+      diagnostics++;
+      return { diagnostic: "native process" };
+    },
+    listImportableSessions: async () => {
+      listings++;
+      return [];
+    },
+  });
+  const owner = new AgentManager({ clients: { codex: client }, logger });
+  const snapshots = new ProviderSnapshotManager({
+    logger,
+    extraClients: { codex: client },
+    providerOverrides: {
+      claude: { enabled: false },
+      copilot: { enabled: false },
+      opencode: { enabled: false },
+      pi: { enabled: false },
+    },
+  });
+  snapshots.bindNativeWork({
+    isOpen: () => owner.recoveryPhase === "running",
+    run: (name, operation) => owner.runProviderProbe(name, operation),
+  });
+  const before = await snapshots.getProvider({ provider: "codex", cwd: "/tmp", wait: true });
+  expect(before.status).toBe("ready");
+  expect(catalogs).toBe(1);
+  await owner.freezeRestartAdmissions();
+  expect(await snapshots.getProvider({ provider: "codex", cwd: "/tmp", wait: true })).toEqual(
+    before,
+  );
+  expect(await snapshots.listModels({ provider: "codex", cwd: "/tmp", wait: true })).toEqual(
+    before.models,
+  );
+  expect(await snapshots.listModes({ provider: "codex", cwd: "/tmp", wait: true })).toEqual([]);
+  snapshots.getSnapshot("/tmp");
+  await snapshots.refreshSnapshotForCwd({ cwd: "/tmp", providers: ["codex"] });
+  await expect(snapshots.getProviderDiagnostic("codex")).rejects.toMatchObject({
+    code: "restart_in_progress",
+  });
+  expect((await owner.listImportableSessions()).providerErrors).toHaveLength(1);
+  expect(catalogs).toBe(1);
+  expect(diagnostics).toBe(0);
+  expect(listings).toBe(0);
+  snapshots.destroy();
+});
+
+test("catalog resources remain owned through freeze and a failed cleanup can be retried", async () => {
+  const { AgentManager } = await import("./agent-manager.js");
+  const entered = Promise.withResolvers<void>();
+  const released = Promise.withResolvers<void>();
+  let canStop = false;
+  let stops = 0;
+  const client = createExtraClient("codex", {
+    isAvailable: async () => true,
+    fetchCatalog: async (_options, context) => {
+      context!.probe!.own({
+        close: async () => {
+          stops++;
+          if (!canStop) throw new Error("catalog process still active");
+          released.resolve();
+        },
+      });
+      entered.resolve();
+      await released.promise;
+      context!.signal.throwIfAborted();
+      return { models: [], modes: [] };
+    },
+  });
+  const logger = createTestLogger();
+  const owner = new AgentManager({ clients: { codex: client }, logger });
+  const snapshots = new ProviderSnapshotManager({
+    logger,
+    extraClients: { codex: client },
+    providerOverrides: {
+      claude: { enabled: false },
+      copilot: { enabled: false },
+      opencode: { enabled: false },
+      pi: { enabled: false },
+    },
+  });
+  snapshots.bindNativeWork({
+    isOpen: () => owner.recoveryPhase === "running",
+    run: (name, operation) => owner.runProviderProbe(name, operation),
+  });
+  const refreshing = snapshots.refreshSnapshotForCwd({ cwd: "/tmp", providers: ["codex"] });
+  await entered.promise;
+  await expect(owner.freezeRestartAdmissions()).rejects.toThrow("Provider probes did not stop");
+  expect(owner.recoveryBlockedAgents()).toEqual([expect.stringMatching(/^catalog:codex:/)]);
+  canStop = true;
+  await owner.quiesceRestartExecution();
+  await refreshing;
+  expect(stops).toBe(2);
+  expect(owner.recoveryBlockedAgents()).toEqual([]);
+  snapshots.destroy();
 });

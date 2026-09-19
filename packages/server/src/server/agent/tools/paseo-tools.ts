@@ -60,7 +60,7 @@ import {
   toScheduleSummary,
   waitForAgentWithTimeout,
 } from "../mcp-shared.js";
-import { sendPromptToAgent, setupFinishNotification } from "../agent-prompt.js";
+import { sendPromptToAgent } from "../agent-prompt.js";
 import { respondToAgentPermission } from "../permission-response.js";
 import {
   archiveAgentCommand,
@@ -575,7 +575,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   const tools = new Map<string, PaseoToolDefinition>();
   const registerTool = (
     name: string,
-    config: PaseoToolConfig,
+    config: PaseoToolConfig & { admission: "query" | "mutation" | "owned" | "control" },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Tool handlers are schema-validated at registration boundaries.
     handler: (input: any, context: PaseoToolExecutionContext) => Promise<PaseoToolResult>,
   ) => {
@@ -588,7 +588,10 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       description: config.description ?? name,
       inputSchema: config.inputSchema,
       outputSchema: config.outputSchema,
-      handler: handler as PaseoToolDefinition["handler"],
+      handler: ((input, context) =>
+        config.admission === "mutation"
+          ? agentManager.runRequestAdmission(() => handler(input, context))
+          : handler(input, context)) as PaseoToolDefinition["handler"],
     });
   };
   const toCatalog = (): PaseoToolCatalog => ({
@@ -1166,6 +1169,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
     registerTool(
       "speak",
       {
+        admission: "owned",
         title: "Speak",
         description:
           "Speak text to the user via daemon-managed voice output. Blocks until playback completes.",
@@ -1206,8 +1210,20 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   }
 
   if (options.browserToolsEnabled && options.browserToolsBroker) {
+    const browserQueries = new Set([
+      "browser_list_tabs",
+      "browser_snapshot",
+      "browser_wait",
+      "browser_screenshot",
+      "browser_logs",
+    ]);
     registerBrowserTools({
-      registerTool,
+      registerTool: (name, config, handler) =>
+        registerTool(
+          name,
+          { ...config, admission: browserQueries.has(name) ? "query" : "mutation" },
+          handler,
+        ),
       broker: options.browserToolsBroker,
       callerAgentId,
       resolveCallerAgent,
@@ -1217,6 +1233,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "create_workspace",
     {
+      admission: "mutation",
       title: "Create workspace",
       description:
         "Create a workspace using an existing local checkout or a new Paseo-managed worktree.",
@@ -1341,6 +1358,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "list_workspaces",
     {
+      admission: "query",
       title: "List workspaces",
       description: "List active workspaces.",
       inputSchema: {},
@@ -1363,6 +1381,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "archive_workspace",
     {
+      admission: "mutation",
       title: "Archive workspace",
       description: "Archive a workspace and everything it owns.",
       inputSchema: { workspaceId: z.string().min(1) },
@@ -1406,6 +1425,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "create_agent",
     {
+      admission: "owned",
       title: "Create agent",
       description:
         "Create an agent. Agent-scoped creation defaults to your workspace and creates your subagent. Top-level creation without workspaceId creates a new local workspace. Requires provider/model (for example codex/gpt-5.4) and an initial prompt. Do not guess; call list_providers and list_models first if uncertain.",
@@ -1424,57 +1444,62 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       },
     },
     async (args: unknown) => {
-      const resolvedArgs = await resolveCreateAgentToolArgs(args);
-      const { parsedArgs, worktree } = resolvedArgs;
-      let requestedBackground: boolean;
-      let notifyOnFinish: boolean;
-      if (resolvedArgs.kind === "agent-scoped") {
-        requestedBackground = true;
-        notifyOnFinish = parsedArgs.notifyOnFinish;
-      } else {
-        requestedBackground = resolvedArgs.parsedArgs.background;
-        notifyOnFinish = resolvedArgs.parsedArgs.notifyOnFinish ?? false;
-      }
-      const selectedProvider = resolveRequiredProviderModel(parsedArgs.provider).provider;
-      const inheritedConfig = resolveInheritedProviderConfig(selectedProvider);
       const {
         snapshot,
         background: createdInBackground,
         initialPromptStarted,
-      } = await createAgentCommand(
-        {
-          agentManager,
-          agentStorage,
-          logger: childLogger,
-          paseoHome: options.paseoHome,
-          worktreesRoot: options.worktreesRoot,
-          terminalManager,
-          providerSnapshotManager,
-          createPaseoWorktree: options.createPaseoWorktree,
-          ...(options.ensureWorkspaceForCreate
-            ? { ensureWorkspaceForCreate: options.ensureWorkspaceForCreate }
-            : {}),
-        },
-        {
-          kind: "mcp",
-          provider: parsedArgs.provider,
-          title: parsedArgs.title,
-          initialPrompt: parsedArgs.initialPrompt,
-          config: inheritedConfig,
-          cwd: resolvedArgs.cwd,
-          workspaceId: resolvedArgs.workspaceId,
-          thinking: parsedArgs.settings?.thinkingOptionId,
-          features: parsedArgs.settings?.features,
-          labels: parsedArgs.labels,
-          mode: parsedArgs.settings?.modeId,
-          background: requestedBackground,
-          notifyOnFinish,
-          detached: resolvedArgs.detached,
-          callerAgentId,
-          callerContext,
-          worktree,
-        },
-      );
+        notifyOnFinish: shouldNotifyOnFinish,
+      } = await agentManager.runRequestAdmission(async () => {
+        const resolvedArgs = await resolveCreateAgentToolArgs(args);
+        const { parsedArgs, worktree } = resolvedArgs;
+        let requestedBackground: boolean;
+        let notifyOnFinish: boolean;
+        if (resolvedArgs.kind === "agent-scoped") {
+          requestedBackground = true;
+          notifyOnFinish = parsedArgs.notifyOnFinish;
+        } else {
+          requestedBackground = resolvedArgs.parsedArgs.background;
+          notifyOnFinish = resolvedArgs.parsedArgs.notifyOnFinish ?? false;
+        }
+        const selectedProvider = resolveRequiredProviderModel(parsedArgs.provider).provider;
+        const inheritedConfig = resolveInheritedProviderConfig(selectedProvider);
+        const created = await createAgentCommand(
+          {
+            agentManager,
+            agentStorage,
+            logger: childLogger,
+            paseoHome: options.paseoHome,
+            worktreesRoot: options.worktreesRoot,
+            terminalManager,
+            providerSnapshotManager,
+            createPaseoWorktree: options.createPaseoWorktree,
+            ...(options.ensureWorkspaceForCreate
+              ? { ensureWorkspaceForCreate: options.ensureWorkspaceForCreate }
+              : {}),
+          },
+          {
+            kind: "mcp",
+            provider: parsedArgs.provider,
+            title: parsedArgs.title,
+            initialPrompt: parsedArgs.initialPrompt,
+            config: inheritedConfig,
+            cwd: resolvedArgs.cwd,
+            workspaceId: resolvedArgs.workspaceId,
+            thinking: parsedArgs.settings?.thinkingOptionId,
+            features: parsedArgs.settings?.features,
+            labels: parsedArgs.labels,
+            mode: parsedArgs.settings?.modeId,
+            background: requestedBackground,
+            notifyOnFinish,
+            detached: resolvedArgs.detached,
+            callerAgentId,
+            callerContext,
+            worktree,
+          },
+        );
+
+        return { ...created, notifyOnFinish };
+      });
 
       try {
         if (!createdInBackground && initialPromptStarted) {
@@ -1510,7 +1535,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       // Return immediately for async creation.
       const currentSnapshot = agentManager.getAgent(snapshot.id) ?? snapshot;
       const guidance =
-        callerAgentId && notifyOnFinish && initialPromptStarted
+        callerAgentId && shouldNotifyOnFinish && initialPromptStarted
           ? "You will get notified when the created agent finishes, errors, or needs permission. Do not poll for status; continue with other work until the notification arrives."
           : undefined;
       const response = {
@@ -1868,6 +1893,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "send_agent_prompt",
     {
+      admission: "owned",
       title: "Send agent prompt",
       description:
         "Send a task to a running agent. Agent-scoped callers run in background by default; top-level callers wait by default.",
@@ -1896,17 +1922,8 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         prompt,
         sessionMode,
         logger: childLogger,
+        ...(shouldNotifyOnFinish && callerAgentId ? { finishNotification: { callerAgentId } } : {}),
       });
-
-      if (shouldNotifyOnFinish && callerAgentId) {
-        setupFinishNotification({
-          agentManager,
-          agentStorage,
-          childAgentId: agentId,
-          callerAgentId,
-          logger: childLogger,
-        });
-      }
 
       // If not running in background, wait for completion
       if (!background) {
@@ -1958,6 +1975,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "get_agent_status",
     {
+      admission: "query",
       title: "Get agent status",
       description:
         "Return the latest snapshot for an agent, including lifecycle state, capabilities, and pending permissions.",
@@ -2008,6 +2026,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "list_agents",
     {
+      admission: "query",
       title: "List agents",
       description: "List recent agents as compact metadata.",
       inputSchema: {
@@ -2067,6 +2086,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "cancel_agent",
     {
+      admission: "control",
       title: "Cancel agent run",
       description: "Abort the agent's current run but keep the agent alive for future tasks.",
       inputSchema: {
@@ -2091,6 +2111,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "archive_agent",
     {
+      admission: "mutation",
       title: "Archive agent",
       description:
         "Archive an agent (soft-delete). The agent is interrupted if running and removed from the active list.",
@@ -2120,6 +2141,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "kill_agent",
     {
+      admission: "mutation",
       title: "Kill agent",
       description: "Terminate an agent session permanently.",
       inputSchema: {
@@ -2141,6 +2163,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "update_agent",
     {
+      admission: "mutation",
       title: "Update agent",
       description: "Update an agent name, labels, and/or runtime settings.",
       inputSchema: {
@@ -2183,6 +2206,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "rename_workspace",
     {
+      admission: "mutation",
       title: "Rename workspace",
       description:
         "Rename a workspace by setting its user-visible title. Omit workspaceId to rename your current workspace.",
@@ -2243,6 +2267,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "list_workspace_scripts",
     {
+      admission: "query",
       title: "List workspace scripts",
       description:
         "List configured workspace scripts and their lifecycle, service port, proxy URL, health, and terminal ID.",
@@ -2267,6 +2292,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "start_workspace_script",
     {
+      admission: "mutation",
       title: "Start workspace script",
       description:
         "Start one configured workspace script through Paseo's managed workspace-script launcher.",
@@ -2294,6 +2320,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "stop_workspace_script",
     {
+      admission: "mutation",
       title: "Stop workspace script",
       description: "Stop a running workspace script through its supervised terminal lifecycle.",
       inputSchema: {
@@ -2320,6 +2347,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "list_terminals",
     {
+      admission: "query",
       title: "List terminals",
       description: "List terminals for a working directory or across all working directories.",
       inputSchema: {
@@ -2368,6 +2396,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "create_terminal",
     {
+      admission: "mutation",
       title: "Create terminal",
       description: "Create a terminal session for a working directory.",
       inputSchema: {
@@ -2407,6 +2436,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "kill_terminal",
     {
+      admission: "mutation",
       title: "Kill terminal",
       description: "Kill an existing terminal session.",
       inputSchema: {
@@ -2438,6 +2468,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "capture_terminal",
     {
+      admission: "query",
       title: "Capture terminal",
       description: "Capture plain-text terminal output lines from a terminal session.",
       inputSchema: {
@@ -2482,6 +2513,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "send_terminal_keys",
     {
+      admission: "mutation",
       title: "Send terminal keys",
       description: "Send literal text or special key tokens to a terminal session.",
       inputSchema: {
@@ -2518,6 +2550,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "create_schedule",
     {
+      admission: "mutation",
       title: "Create schedule",
       description: "Create a recurring schedule that starts a new agent on a cron cadence.",
       inputSchema: {
@@ -2568,6 +2601,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "create_heartbeat",
     {
+      admission: "mutation",
       title: "Create heartbeat",
       description: "Create a recurring heartbeat that sends you a prompt on a cron cadence.",
       inputSchema: {
@@ -2617,6 +2651,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "delete_heartbeat",
     {
+      admission: "mutation",
       title: "Delete heartbeat",
       description: "Delete one of your heartbeats.",
       inputSchema: { id: z.string().min(1) },
@@ -2638,6 +2673,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "list_schedules",
     {
+      admission: "query",
       title: "List schedules",
       description: "List all schedules managed by the daemon.",
       inputSchema: {},
@@ -2663,6 +2699,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "inspect_schedule",
     {
+      admission: "query",
       title: "Inspect schedule",
       description: "Inspect a schedule and its run history.",
       inputSchema: {
@@ -2686,6 +2723,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "pause_schedule",
     {
+      admission: "mutation",
       title: "Pause schedule",
       description: "Pause an active schedule.",
       inputSchema: {
@@ -2712,6 +2750,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "resume_schedule",
     {
+      admission: "mutation",
       title: "Resume schedule",
       description: "Resume a paused schedule.",
       inputSchema: {
@@ -2738,6 +2777,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "delete_schedule",
     {
+      admission: "mutation",
       title: "Delete schedule",
       description: "Delete a schedule permanently.",
       inputSchema: {
@@ -2764,6 +2804,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "update_schedule",
     {
+      admission: "mutation",
       title: "Update schedule",
       description:
         "Update an existing schedule. Only provided fields are changed; omitted fields remain unchanged.",
@@ -2836,6 +2877,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "schedule_logs",
     {
+      admission: "query",
       title: "Schedule logs",
       description: "Get the run history (logs) for a schedule.",
       inputSchema: {
@@ -2862,6 +2904,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "run_schedule_once",
     {
+      admission: "owned",
       title: "Run schedule once",
       description: "Run a schedule immediately without changing its cron cadence.",
       inputSchema: { id: z.string().min(1) },
@@ -2883,6 +2926,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "list_providers",
     {
+      admission: "query",
       title: "List providers",
       description: "List configured agent providers, availability, and their modes.",
       inputSchema: {},
@@ -2904,6 +2948,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "list_models",
     {
+      admission: "query",
       title: "List models",
       description: "List models for an agent provider.",
       inputSchema: {
@@ -2932,6 +2977,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "list_profiles",
     {
+      admission: "query",
       title: "List agent profiles",
       description:
         "List agent profiles: named provider/model/mode bundles a human configured for specific " +
@@ -2956,6 +3002,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "inspect_provider",
     {
+      admission: "query",
       title: "Inspect provider",
       description:
         "Inspect compact provider capabilities for orchestration, including modes and draft feature settings. Use list_models for the full model list.",
@@ -3018,6 +3065,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "get_agent_activity",
     {
+      admission: "query",
       title: "Get agent activity",
       description: "Return recent agent timeline entries as a curated summary.",
       inputSchema: {
@@ -3074,6 +3122,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "set_agent_mode",
     {
+      admission: "mutation",
       title: "Set agent session mode",
       description:
         "Switch the agent's session mode (plan, bypassPermissions, read-only, auto, etc.).",
@@ -3098,6 +3147,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "list_pending_permissions",
     {
+      admission: "query",
       title: "List pending permissions",
       description:
         "Return all pending permission requests across all agents with the normalized payloads.",
@@ -3132,6 +3182,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   registerTool(
     "respond_to_permission",
     {
+      admission: "mutation",
       title: "Respond to permission",
       description:
         "Approve or deny a pending permission request with an AgentManager-compatible response payload.",

@@ -79,6 +79,8 @@ function makeDeps(overrides: Partial<DeployCommandDependencies> = {}): {
       calls.connectReadiness += 1;
       return readinessClient();
     },
+    targetFormats: async () => [1, 2, 3],
+    validateTarget: async () => {},
     spawnActivation: async (argv) => {
       calls.spawnActivation = [...calls.spawnActivation, [...argv]];
       return { code: 0, signal: null };
@@ -91,10 +93,93 @@ function makeDeps(overrides: Partial<DeployCommandDependencies> = {}): {
 }
 
 describe("runDeployCommand", () => {
+  it("refuses a target without offline validation before pausing", async () => {
+    const { deps, calls } = makeDeps({
+      targetFormats: async () => {
+        throw new Error("unsupported command");
+      },
+    });
+    await expect(
+      runDeployCommand(["activate"], { targetCli: "/old/bin/paseo" }, {} as never, deps),
+    ).rejects.toMatchObject({ code: "DEPLOY_FAILED" });
+    expect(calls.connectPrepare).toBe(0);
+    expect(calls.spawnActivation).toEqual([]);
+  });
+  it("rejects an advertised incompatible format without preparing", async () => {
+    const prepareRestart = vi.fn();
+    const { deps, calls } = makeDeps({
+      targetFormats: async () => [1],
+      connectPrepare: async () =>
+        prepareClient({
+          getLastServerInfoMessage: () => ({
+            features: { restartRecovery: true },
+            restartCheckpointFormat: 3,
+          }),
+          prepareRestart,
+        }),
+    });
+    await expect(
+      runDeployCommand(["activate"], { targetCli: "/old/bin/paseo" }, {} as never, deps),
+    ).rejects.toMatchObject({ code: "DEPLOY_CHECKPOINT_INCOMPATIBLE" });
+    expect(prepareRestart).not.toHaveBeenCalled();
+    expect(calls.spawnActivation).toEqual([]);
+  });
+  it("requires validation of the exact ready generation before activation", async () => {
+    const validateTarget = vi.fn(async () => {
+      throw new Error("incompatible checkpoint");
+    });
+    const { deps, calls } = makeDeps({ validateTarget });
+    await expect(
+      runDeployCommand(["activate"], { targetCli: "/target/bin/paseo" }, {} as never, deps),
+    ).rejects.toMatchObject({ code: "DEPLOY_FAILED" });
+    expect(validateTarget).toHaveBeenCalledExactlyOnceWith(
+      "/target/bin/paseo",
+      "/home/test/.paseo",
+      "gen-1",
+    );
+    expect(calls.spawnActivation).toEqual([]);
+    expect(calls.lockReleased).toBe(1);
+  });
+  it.each(["stopping", "blocked"])(
+    "reports failed recovery while %s without waiting forever",
+    async (stage) => {
+      const { deps } = makeDeps({
+        connectReadiness: async () =>
+          readinessClient({
+            getLastServerInfoMessage: () => ({
+              restartRecoveryState: "restoring",
+              restartRecoveryStage: stage,
+              restartRecoveryGeneration: "gen-1",
+              restartRecoveryError: "stop not confirmed",
+            }),
+          }),
+      });
+      await expect(
+        runDeployCommand(["activate"], { targetCli: "/target/bin/paseo" }, {} as never, deps),
+      ).rejects.toMatchObject({ code: "DEPLOY_RECOVERY_FAILED" });
+    },
+  );
+  it("reports a successor recovery instead of accepting the wrong generation", async () => {
+    const { deps } = makeDeps({
+      connectReadiness: async () =>
+        readinessClient({
+          getLastServerInfoMessage: () => ({
+            restartRecoveryState: "running",
+            restartRecoveryGeneration: "gen-2",
+            restartRecoveryPreviousGeneration: "gen-1",
+          }),
+        }),
+    });
+    await expect(
+      runDeployCommand(["activate"], { targetCli: "/target/bin/paseo" }, {} as never, deps),
+    ).rejects.toMatchObject({ code: "DEPLOY_GENERATION_SUPERSEDED" });
+  });
   it("refuses an empty activation command before touching anything", async () => {
     const { deps, calls } = makeDeps();
 
-    await expect(runDeployCommand([], {}, {} as never, deps)).rejects.toMatchObject({
+    await expect(
+      runDeployCommand([], { targetCli: "/nix/store/target/bin/paseo" }, {} as never, deps),
+    ).rejects.toMatchObject({
       code: "DEPLOY_ARGV_REQUIRED",
     });
     expect(calls.lockAcquired).toBe(0);
@@ -107,7 +192,14 @@ describe("runDeployCommand", () => {
       },
     });
 
-    await expect(runDeployCommand(["echo", "ok"], {}, {} as never, deps)).rejects.toMatchObject({
+    await expect(
+      runDeployCommand(
+        ["echo", "ok"],
+        { targetCli: "/nix/store/target/bin/paseo" },
+        {} as never,
+        deps,
+      ),
+    ).rejects.toMatchObject({
       code: "DEPLOY_LOCKED",
     });
     expect(calls.connectPrepare).toBe(0);
@@ -117,7 +209,14 @@ describe("runDeployCommand", () => {
   it("never activates when the daemon is unreachable for preparation", async () => {
     const { deps, calls } = makeDeps({ connectPrepare: async () => null });
 
-    await expect(runDeployCommand(["echo", "ok"], {}, {} as never, deps)).rejects.toMatchObject({
+    await expect(
+      runDeployCommand(
+        ["echo", "ok"],
+        { targetCli: "/nix/store/target/bin/paseo" },
+        {} as never,
+        deps,
+      ),
+    ).rejects.toMatchObject({
       code: "DAEMON_UNREACHABLE",
     });
     expect(calls.spawnActivation).toHaveLength(0);
@@ -132,7 +231,14 @@ describe("runDeployCommand", () => {
         }),
     });
 
-    await expect(runDeployCommand(["echo", "ok"], {}, {} as never, deps)).rejects.toMatchObject({
+    await expect(
+      runDeployCommand(
+        ["echo", "ok"],
+        { targetCli: "/nix/store/target/bin/paseo" },
+        {} as never,
+        deps,
+      ),
+    ).rejects.toMatchObject({
       code: "DEPLOY_UNSUPPORTED",
     });
     expect(calls.spawnActivation).toHaveLength(0);
@@ -143,7 +249,14 @@ describe("runDeployCommand", () => {
       connectPrepare: async () => prepareClient({ prepareRestart: async () => ({}) }),
     });
 
-    await expect(runDeployCommand(["echo", "ok"], {}, {} as never, deps)).rejects.toMatchObject({
+    await expect(
+      runDeployCommand(
+        ["echo", "ok"],
+        { targetCli: "/nix/store/target/bin/paseo" },
+        {} as never,
+        deps,
+      ),
+    ).rejects.toMatchObject({
       code: "DEPLOY_PREPARE_FAILED",
     });
     expect(calls.spawnActivation).toHaveLength(0);
@@ -159,7 +272,14 @@ describe("runDeployCommand", () => {
         }),
     });
 
-    await expect(runDeployCommand(["echo", "ok"], {}, {} as never, deps)).rejects.toMatchObject({
+    await expect(
+      runDeployCommand(
+        ["echo", "ok"],
+        { targetCli: "/nix/store/target/bin/paseo" },
+        {} as never,
+        deps,
+      ),
+    ).rejects.toMatchObject({
       code: "DEPLOY_FAILED",
     });
     expect(calls.spawnActivation).toHaveLength(0);
@@ -170,7 +290,7 @@ describe("runDeployCommand", () => {
 
     const result = await runDeployCommand(
       ["sudo", "/nix/store/xyz/bin/switch-to-configuration", "switch"],
-      {},
+      { targetCli: "/nix/store/target/bin/paseo" },
       {} as never,
       deps,
     );
@@ -186,9 +306,14 @@ describe("runDeployCommand", () => {
       spawnActivation: async () => ({ code: 1, signal: null }),
     });
 
-    await expect(runDeployCommand(["sudo", "switch"], {}, {} as never, deps)).rejects.toMatchObject(
-      { code: "DEPLOY_ACTIVATION_FAILED" },
-    );
+    await expect(
+      runDeployCommand(
+        ["sudo", "switch"],
+        { targetCli: "/nix/store/target/bin/paseo" },
+        {} as never,
+        deps,
+      ),
+    ).rejects.toMatchObject({ code: "DEPLOY_ACTIVATION_FAILED" });
     expect(calls.connectReadiness).toBe(0);
   });
 
@@ -197,9 +322,14 @@ describe("runDeployCommand", () => {
       spawnActivation: async () => ({ code: null, signal: "SIGTERM" }),
     });
 
-    await expect(runDeployCommand(["sudo", "switch"], {}, {} as never, deps)).rejects.toMatchObject(
-      { code: "DEPLOY_ACTIVATION_FAILED" },
-    );
+    await expect(
+      runDeployCommand(
+        ["sudo", "switch"],
+        { targetCli: "/nix/store/target/bin/paseo" },
+        {} as never,
+        deps,
+      ),
+    ).rejects.toMatchObject({ code: "DEPLOY_ACTIVATION_FAILED" });
   });
 
   it("confirms the replacement daemon is running the exact prepared generation", async () => {
@@ -215,7 +345,12 @@ describe("runDeployCommand", () => {
         }),
     });
 
-    const result = await runDeployCommand(["sudo", "switch"], {}, {} as never, deps);
+    const result = await runDeployCommand(
+      ["sudo", "switch"],
+      { targetCli: "/nix/store/target/bin/paseo" },
+      {} as never,
+      deps,
+    );
     expect(result.data.generationId).toBe("gen-7");
   });
 
@@ -235,7 +370,12 @@ describe("runDeployCommand", () => {
     });
 
     await expect(
-      runDeployCommand(["sudo", "switch"], { waitTimeout: "1" }, {} as never, deps),
+      runDeployCommand(
+        ["sudo", "switch"],
+        { targetCli: "/nix/store/target/bin/paseo", waitTimeout: "1" },
+        {} as never,
+        deps,
+      ),
     ).rejects.toMatchObject({ code: "DEPLOY_READINESS_TIMEOUT" });
     expect(readinessAttempts).toBeGreaterThan(0);
   });
@@ -243,7 +383,12 @@ describe("runDeployCommand", () => {
   it("releases the lock on success so a subsequent deploy can proceed", async () => {
     const { deps, calls } = makeDeps();
 
-    await runDeployCommand(["sudo", "switch"], {}, {} as never, deps);
+    await runDeployCommand(
+      ["sudo", "switch"],
+      { targetCli: "/nix/store/target/bin/paseo" },
+      {} as never,
+      deps,
+    );
     expect(calls.lockAcquired).toBe(1);
     expect(calls.lockReleased).toBe(1);
   });
@@ -258,7 +403,12 @@ describe("runDeployCommand", () => {
       },
       connectReadiness: async () => (++attempts === 3 ? readinessClient() : null),
     });
-    const result = await runDeployCommand(["activate"], {}, {} as never, deps);
+    const result = await runDeployCommand(
+      ["activate"],
+      { targetCli: "/nix/store/target/bin/paseo" },
+      {} as never,
+      deps,
+    );
     expect(result.data.generationId).toBe("gen-1");
     expect(attempts).toBe(3);
   });
@@ -273,7 +423,14 @@ describe("runDeployCommand", () => {
           }),
         }),
     });
-    await expect(runDeployCommand(["activate"], {}, {} as never, deps)).rejects.toMatchObject({
+    await expect(
+      runDeployCommand(
+        ["activate"],
+        { targetCli: "/nix/store/target/bin/paseo" },
+        {} as never,
+        deps,
+      ),
+    ).rejects.toMatchObject({
       code: "DEPLOY_RECOVERY_FAILED",
       message: "native session unavailable",
     });
@@ -284,11 +441,23 @@ describe("runDeployCommand", () => {
   it("releases the lock after a failed attempt, allowing a retry", async () => {
     const { deps, calls } = makeDeps({ connectPrepare: async () => null });
 
-    await expect(runDeployCommand(["sudo", "switch"], {}, {} as never, deps)).rejects.toBeTruthy();
+    await expect(
+      runDeployCommand(
+        ["sudo", "switch"],
+        { targetCli: "/nix/store/target/bin/paseo" },
+        {} as never,
+        deps,
+      ),
+    ).rejects.toBeTruthy();
     expect(calls.lockReleased).toBe(1);
 
     // Retry after the lock was released succeeds.
-    const second = await runDeployCommand(["sudo", "switch"], {}, {} as never, makeDeps().deps);
+    const second = await runDeployCommand(
+      ["sudo", "switch"],
+      { targetCli: "/nix/store/target/bin/paseo" },
+      {} as never,
+      makeDeps().deps,
+    );
     expect(second.data.action).toBe("deployed");
   });
 
@@ -301,7 +470,14 @@ describe("runDeployCommand", () => {
     const close = vi.spyOn(client, "close");
     const { deps } = makeDeps({ connectPrepare: async () => client });
 
-    await expect(runDeployCommand(["sudo", "switch"], {}, {} as never, deps)).rejects.toBeTruthy();
+    await expect(
+      runDeployCommand(
+        ["sudo", "switch"],
+        { targetCli: "/nix/store/target/bin/paseo" },
+        {} as never,
+        deps,
+      ),
+    ).rejects.toBeTruthy();
     expect(close).toHaveBeenCalledOnce();
   });
 });

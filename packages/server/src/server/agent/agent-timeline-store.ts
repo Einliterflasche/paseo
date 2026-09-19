@@ -2,7 +2,12 @@ import { randomUUID } from "node:crypto";
 import { AgentTimelineItemPayloadSchema } from "@getpaseo/protocol/messages";
 import { z } from "zod";
 import { SharedLogStore } from "./shared-log.js";
-import { decodeTextNodes, TextNodeSnapshotSchema, TextSnapshotWriter } from "./shared-text.js";
+import {
+  decodeTextNodes,
+  validateTextNodes,
+  TextNodeSnapshotSchema,
+  TextSnapshotWriter,
+} from "./shared-text.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type {
   AgentTimelineFetchOptions,
@@ -36,6 +41,7 @@ export const AgentTimelineSnapshotSchema = z
       }),
     ),
     textNodes: z.array(TextNodeSnapshotSchema).optional(),
+    textBackings: z.array(z.string().min(1)).optional(),
   })
   .refine(({ rows, nextSeq }) => {
     let previous = -1;
@@ -47,7 +53,10 @@ export const AgentTimelineSnapshotSchema = z
   }, "Timeline sequences must increase and precede nextSeq")
   .superRefine((snapshot, ctx) => {
     try {
-      decodeTextNodes(snapshot.textNodes ?? []);
+      if (snapshot.textBackings !== undefined && snapshot.textNodes === undefined) {
+        throw new Error("Shared text backings require a node table");
+      }
+      validateTextNodes(snapshot.textNodes ?? [], snapshot.textBackings);
       for (const row of snapshot.rows) {
         if (row.logRef === undefined) continue;
         if (
@@ -239,7 +248,7 @@ export class InMemoryAgentTimelineStore {
       nextSeq: state.nextSeq,
       rows,
       ...(text.nodes.length || rows.some((row) => row.logRef !== undefined)
-        ? { textNodes: text.nodes }
+        ? { textNodes: text.nodes, textBackings: text.backings }
         : {}),
     };
   }
@@ -255,7 +264,7 @@ export class InMemoryAgentTimelineStore {
   /** Replaces this agent's state exactly with the snapshot, no derivation. */
   restoreSnapshot(agentId: string, snapshot: AgentTimelineSnapshot): void {
     const logs = new SharedLogStore();
-    const nodes = decodeTextNodes(snapshot.textNodes ?? []);
+    const nodes = decodeTextNodes(snapshot.textNodes ?? [], snapshot.textBackings);
     const rows = snapshot.rows.map(({ logRef, ...row }) => ({
       ...row,
       item:

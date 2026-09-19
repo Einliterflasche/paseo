@@ -13,3 +13,13 @@ export class AgentRestartSuspendedError extends Error {
     this.name = "AgentRestartSuspendedError";
   }
 }
+
+/** An immutable prepared generation already owns the handoff; changing it would lose intent. */
+export class RestartHandoffInProgressError extends RestartInProgressError {
+  constructor() {
+    super();
+    this.name = "RestartHandoffInProgressError";
+    this.message =
+      "The restart checkpoint is being committed or handed off; cancel after recovery completes.";
+  }
+}

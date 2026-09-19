@@ -11,6 +11,12 @@ import type { CachedTimeline } from "@/runtime/replica-cache";
 import { selectAgentTimelineState, useSessionStore } from "@/stores/session-store";
 import type { StreamItem } from "@/types/stream";
 import {
+  createInitDeferred,
+  getInitDeferred,
+  getInitKey,
+  resolveInitDeferred,
+} from "@/utils/agent-initialization";
+import {
   createTimelineReplica,
   createViewedTimelineOwner,
   type TimelineReplicaStorage,
@@ -77,6 +83,50 @@ function applySynced(agentId: string, seq: number): void {
 afterEach(() => useSessionStore.getState().clearSession(SERVER_ID));
 
 describe("viewed timeline persistence", () => {
+  it("leaves initialization and painted history intact on a busy page response", () => {
+    useSessionStore.getState().initializeSession(SERVER_ID, null);
+    applySynced(AGENT_ID, 4);
+    useSessionStore.getState().setInitializingAgents(SERVER_ID, new Map([[AGENT_ID, true]]));
+    const key = getInitKey(SERVER_ID, AGENT_ID);
+    const deferred = createInitDeferred(key, "tail");
+    const before = selectAgentTimelineState(
+      useSessionStore.getState().sessions[SERVER_ID],
+      AGENT_ID,
+    );
+    const owner = createOwner({
+      readTimeline: async () => undefined,
+      commitTimeline: () => undefined,
+    });
+    owner.applyTimelineResponse({
+      requestId: "busy",
+      agentId: AGENT_ID,
+      agent: null,
+      direction: "tail",
+      projection: "projected",
+      epoch: "epoch-1",
+      reset: false,
+      staleCursor: false,
+      gap: false,
+      window: { minSeq: 1, maxSeq: 4, nextSeq: 5 },
+      startCursor: null,
+      endCursor: null,
+      hasOlder: false,
+      hasNewer: false,
+      entries: [],
+      error: "socket busy",
+      errorCode: "TIMELINE_BUSY",
+    });
+    expect(getInitDeferred(key)).toBe(deferred);
+    expect(useSessionStore.getState().sessions[SERVER_ID]?.initializingAgents.get(AGENT_ID)).toBe(
+      true,
+    );
+    expect(
+      selectAgentTimelineState(useSessionStore.getState().sessions[SERVER_ID], AGENT_ID),
+    ).toEqual(before);
+    resolveInitDeferred(key);
+    owner.dispose();
+  });
+
   it("shares an in-flight cache preparation with the viewed owner", async () => {
     useSessionStore.getState().initializeSession(SERVER_ID, null);
     let release!: (value: CachedTimeline) => void;

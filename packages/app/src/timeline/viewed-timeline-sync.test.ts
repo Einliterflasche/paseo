@@ -1,4 +1,5 @@
 import { expect, test, vi } from "vitest";
+import { TimelineRequestError } from "@getpaseo/client/internal/daemon-client";
 import type { ProjectedTimelineForwardFetchPlan } from "./timeline-sync-plan";
 import {
   consumeForcedTimelineTailReplacement,
@@ -32,7 +33,7 @@ interface TimelineFetch {
   agentId: string;
   request: ProjectedTimelineForwardFetchPlan;
   respond(input: { hasNewer: boolean; seq?: number }): void;
-  fail(message: string): void;
+  fail(error: string | Error): void;
 }
 
 class TimelineWorld {
@@ -54,7 +55,8 @@ class TimelineWorld {
       this.memberships.push({
         agentIds,
         succeed: () => result.resolve(),
-        fail: (message) => result.reject(new Error(message)),
+        fail: (message) =>
+          result.reject(typeof message === "string" ? new Error(message) : message),
       });
       this.releaseMembershipWaiter();
       return result.promise;
@@ -73,7 +75,8 @@ class TimelineWorld {
             hasNewer,
             endCursor: { epoch: `epoch-${agentId}`, seq },
           }),
-        fail: (message) => result.reject(new Error(message)),
+        fail: (message) =>
+          result.reject(typeof message === "string" ? new Error(message) : message),
       });
       this.releaseFetchWaiters();
       return result.promise;
@@ -130,6 +133,10 @@ class TimelineWorld {
     return this.fetches.length;
   }
 
+  get pendingRetryDelays(): number[] {
+    return this.scheduled.map(({ delayMs }) => delayMs);
+  }
+
   applyTimelineResponse(payload: TimelineResponsePayload): TimelineResponsePayload {
     return consumeForcedTimelineTailReplacement(payload, this.forcedTimelineTailReplacements);
   }
@@ -153,7 +160,7 @@ class TimelineWorld {
       request,
       respond: ({ hasNewer, seq = 1 }) =>
         result.resolve({ hasNewer, endCursor: { epoch: `epoch-${agentId}`, seq } }),
-      fail: (message) => result.reject(new Error(message)),
+      fail: (message) => result.reject(typeof message === "string" ? new Error(message) : message),
     });
     this.releaseFetchWaiters();
     return result.promise;
@@ -469,6 +476,132 @@ test("overlapping sources deduplicate membership and retain hidden hot agents", 
   world.expectNoPendingMembership();
   world.expectNoPendingFetch();
 });
+
+test("transport backpressure silently retries the same cursor after backoff", async () => {
+  const world = new TimelineWorld();
+  world.cursors.set("agent-a", { epoch: "epoch-agent-a", endSeq: 10 });
+  world.sync.setConnected(true);
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
+  (await world.nextMembership()).succeed();
+  const failed = await world.nextFetch("agent-a");
+  failed.fail(new TimelineRequestError("socket busy", "TIMELINE_BUSY"));
+  const retry = await world.nextRetry();
+  expect(world.errors).toEqual([]);
+  expect(world.sync.getAgentTimelineError("agent-a")).toBeNull();
+  world.sync.recoverGap("agent-a", { epoch: "epoch-agent-a", endSeq: 10 });
+  world.expectNoPendingFetch();
+  retry();
+  const retried = await world.nextFetch("agent-a");
+  expect(retried.request).toEqual(failed.request);
+  retried.respond({ hasNewer: false, seq: 11 });
+  await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("ready"));
+});
+
+test("an oversized timeline page remains visible and requires an explicit retry across reconnect", async () => {
+  const world = new TimelineWorld();
+  world.cursors.set("agent-a", { epoch: "epoch-agent-a", endSeq: 10 });
+  world.sync.setConnected(true);
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
+  (await world.nextMembership()).succeed();
+  const failed = await world.nextFetch("agent-a");
+  failed.fail(
+    new TimelineRequestError(
+      "Timeline row 12 exceeds this connection's capacity",
+      "TIMELINE_ITEM_TOO_LARGE",
+      "epoch-agent-a",
+    ),
+  );
+  await world.nextError();
+  world.elapse(60_000);
+  world.sync.recoverGap("agent-a", { epoch: "epoch-agent-a", endSeq: 10 });
+  world.expectNoPendingFetch();
+  world.sync.setConnected(false);
+  world.sync.setConnected(true);
+  (await world.nextMembership()).succeed();
+  await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("error"));
+  world.expectNoPendingFetch();
+  expect(world.sync.getAgentTimelineError("agent-a")).toContain("row 12");
+  world.sync.retryVisibleAgentTimeline("agent-a");
+  const retried = await world.nextFetch("agent-a");
+  expect(retried.request).toEqual(failed.request);
+  retried.respond({ hasNewer: false });
+  await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("ready"));
+});
+
+test("a daemon epoch replacement clears an obsolete oversized-page failure through the same owner", async () => {
+  const world = new TimelineWorld();
+  world.sync.setConnected(true);
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
+  (await world.nextMembership()).succeed();
+  const failed = await world.nextFetch("agent-a");
+  failed.fail(
+    new TimelineRequestError("old row too large", "TIMELINE_ITEM_TOO_LARGE", "old-epoch"),
+  );
+  await world.nextError();
+  world.sync.replaceTimelineEpoch("agent-a", "old-epoch");
+  world.expectNoPendingFetch();
+  world.sync.replaceTimelineEpoch("agent-a", "replacement-epoch");
+  const replacement = await world.nextFetch("agent-a");
+  expect(replacement.request.direction).toBe("tail");
+  replacement.respond({ hasNewer: false });
+  await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("ready"));
+  expect(world.sync.getAgentTimelineError("agent-a")).toBeNull();
+});
+
+test("reconnect cancels busy backoff and resumes from the current cursor with bounded tail fallback", async () => {
+  const world = new TimelineWorld();
+  world.cursors.set("agent-a", { epoch: "epoch-agent-a", endSeq: 10 });
+  world.sync.setConnected(true);
+  world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
+  (await world.nextMembership()).succeed();
+  (await world.nextFetch("agent-a")).fail(new TimelineRequestError("busy", "TIMELINE_BUSY"));
+  await vi.waitFor(() => expect(world.pendingRetryDelays).toEqual([1000]));
+  world.sync.setConnected(false);
+  expect(world.pendingRetryDelays).toEqual([]);
+  world.cursors.set("agent-a", { epoch: "epoch-agent-a", endSeq: 20 });
+  world.sync.setConnected(true);
+  (await world.nextMembership()).succeed();
+  const resumed = await world.nextFetch("agent-a");
+  expect(resumed.request).toMatchObject({
+    direction: "after",
+    cursor: { epoch: "epoch-agent-a", seq: 20 },
+  });
+  resumed.respond({ hasNewer: true, seq: 21 });
+  const tail = await world.nextFetch("agent-a");
+  expect(tail.request.direction).toBe("tail");
+  tail.respond({ hasNewer: false, seq: 100 });
+  await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("ready"));
+  world.elapse(60_000);
+  world.expectNoPendingFetch();
+});
+
+test.each(["TIMELINE_BUSY", "TIMELINE_ITEM_TOO_LARGE"] as const)(
+  "a distinct superseding page advances past %s without retrying the failed plan",
+  async (code) => {
+    const world = new TimelineWorld();
+    world.cursors.set("agent-a", { epoch: "epoch-agent-a", endSeq: 10 });
+    world.sync.setConnected(true);
+    world.sync.replaceVisibleAgentIds("workspace", ["agent-a"]);
+    (await world.nextMembership()).succeed();
+    (await world.nextFetch("agent-a")).fail(
+      new TimelineRequestError("old request failed", code, "epoch-agent-a"),
+    );
+    if (code === "TIMELINE_BUSY")
+      await vi.waitFor(() => expect(world.pendingRetryDelays).toEqual([1000]));
+    else await world.nextError();
+    world.sync.recoverGap("agent-a", { epoch: "epoch-agent-a", endSeq: 20 });
+    const advanced = await world.nextFetch("agent-a");
+    expect(advanced.request).toMatchObject({
+      direction: "after",
+      cursor: { epoch: "epoch-agent-a", seq: 20 },
+    });
+    expect(world.pendingRetryDelays).toEqual([]);
+    advanced.respond({ hasNewer: false, seq: 21 });
+    await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("ready"));
+    world.elapse(60_000);
+    world.expectNoPendingFetch();
+  },
+);
 
 test("a failed catch-up reports once and retries through the explicit retry policy", async () => {
   const world = new TimelineWorld();

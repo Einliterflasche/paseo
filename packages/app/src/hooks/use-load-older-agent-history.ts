@@ -9,6 +9,7 @@ import {
 } from "@/stores/session-store";
 import { planTimelineOlderFetch } from "@/timeline/timeline-sync-plan";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
+import { TimelineRequestError } from "@getpaseo/client/internal/daemon-client";
 
 export interface LoadOlderAgentHistoryClient {
   fetchAgentTimeline: (
@@ -57,11 +58,17 @@ export async function loadOlderAgentHistory(
       planTimelineOlderFetch({ epoch: cursor.epoch, seq: cursor.startSeq }),
     );
   } catch (error) {
+    if (error instanceof TimelineRequestError && error.code === "TIMELINE_BUSY") return true;
     (logger ?? console).warn("[Timeline] failed to load older agent history", agentId, error);
-    toast?.show(failedMessage ?? i18n.t("loadOlderHistory.failed"), {
-      durationMs: 2200,
-      testID: "agent-load-older-history-toast",
-    });
+    toast?.show(
+      error instanceof TimelineRequestError && error.code === "TIMELINE_ITEM_TOO_LARGE"
+        ? error.message
+        : (failedMessage ?? i18n.t("loadOlderHistory.failed")),
+      {
+        durationMs: 2200,
+        testID: "agent-load-older-history-toast",
+      },
+    );
   } finally {
     setInFlight(false);
   }

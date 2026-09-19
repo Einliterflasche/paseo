@@ -8,6 +8,13 @@ export const fr: TranslationResources = {
       description:
         "Paseo a suspendu le travail des agents pour protéger l’historique enregistré. L’opérateur de l’hôte doit résoudre l’erreur de récupération avant de poursuivre.",
       generation: "Point de contrôle : {{generation}}",
+      stoppingTitle: "La récupération arrête le travail sur {{hostName}}",
+      stoppingDescription:
+        "La récupération a échoué. Paseo arrête les agents concernés et préserve leurs résultats. La mise en pause du travail n’est pas encore confirmée.",
+      blockedTitle: "La récupération nécessite une intervention sur {{hostName}}",
+      blockedDescription:
+        "Paseo n’a pas pu confirmer l’arrêt de tous les agents concernés. Les nouvelles tâches et le redémarrage sont bloqués. L’opérateur de l’hôte doit résoudre l’erreur avant de relancer la récupération.",
+      affectedAgents: "Agents concernés : {{agents}}",
     },
     back: "Dos",
     loading: "Chargement...",

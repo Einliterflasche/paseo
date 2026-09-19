@@ -1,4 +1,5 @@
-import { CheckpointStore } from "./restart/checkpoint-store.js";
+import { CheckpointStore, type CrashAcknowledgmentRequester } from "./restart/checkpoint-store.js";
+import type { CrashRecoveryAcknowledgment } from "@getpaseo/protocol/messages";
 import { RestartController } from "./restart/restart-controller.js";
 import { DaemonCheckpointSchema } from "./restart/daemon-checkpoint.js";
 import {
@@ -391,6 +392,9 @@ export type DaemonLifecycleIntent =
   | {
       type: "restart";
       prepareOnly?: boolean;
+      retryRecovery?: boolean;
+      acknowledgeCrash?: CrashRecoveryAcknowledgment;
+      acknowledgmentRequester?: CrashAcknowledgmentRequester;
       clientId: string;
       requestId: string;
       reason: string;
@@ -949,6 +953,10 @@ export async function createPaseoDaemon(
       resolvePaseoToolPolicy(provider, daemonConfigStore.get().providers),
     logger,
   });
+  providerSnapshotManager.bindNativeWork({
+    isOpen: () => agentManager.recoveryPhase === "running",
+    run: (name, operation) => agentManager.runProviderProbe(name, operation),
+  });
   const syncPluginProviders = () => {
     agentManager.updateProviderRegistry(
       providerSnapshotManager.replacePluginProviders(pluginRuntime.getProviderRegistrations()),
@@ -1358,40 +1366,54 @@ export async function createPaseoDaemon(
   const restartController = new RestartController({
     store: new CheckpointStore(config.paseoHome, DaemonCheckpointSchema.parse),
     changed: () => wsServer?.broadcastRestartStatus(),
-    capture: async () => {
-      await scheduleService.pauseForRestart();
-      await agentManager.quiesceForRestart();
+    observerFailed: (error) => logger.error({ err: error }, "Failed to broadcast recovery status"),
+    freeze: () => {
+      const admissions = agentManager.freezeRestartAdmissions();
+      const schedules = scheduleService.pauseForRestart();
+      return Promise.all([admissions, schedules]).then(() => undefined);
+    },
+    stop: async () => {
+      await agentManager.quiesceRestartExecution();
       await workspaceSetupRuntime.drain();
       await wsServer?.drainAgentRequests();
-      // Setup completion may append after provider quiescence. Export again once
-      // all external writers have settled; already closed sessions are not closed twice.
-      const stableAgents = await agentManager.quiesceForRestart();
       await drainFinishNotificationWatches(agentManager);
-      return DaemonCheckpointSchema.parse({
-        version: 2,
-        agents: stableAgents,
-        notifications: snapshotFinishNotificationWatches(agentManager),
-        schedules: await scheduleService.snapshotForRestart(),
-      });
+      await scheduleService.snapshotForRestart();
+    },
+    affectedAgentIds: () => agentManager.recoveryBlockedAgents(),
+    initialize: () => scheduleService.initializeRecoveryState(),
+    capture: async () => ({
+      version: 3 as const,
+      agents: await agentManager.quiesceForRestart(),
+      notifications: snapshotFinishNotificationWatches(agentManager),
+      schedules: await scheduleService.snapshotForRestart(),
+    }),
+    install: async (snapshot) => {
+      await agentManager.installRestartCheckpoint(snapshot.agents);
+      scheduleService.restoreAfterRestart(snapshot.schedules);
+      await scheduleService.initializeRecoveryState();
+      for (const watch of snapshot.notifications)
+        restoreFinishNotificationWatch({ agentManager, agentStorage, logger }, watch);
+    },
+    resume: async (snapshot) => {
+      scheduleService.restoreAfterRestart(snapshot.schedules);
+      await agentManager.resumeRestartCheckpoint(snapshot.agents, () =>
+        scheduleService.resumeRestoredRuns(),
+      );
+    },
+    finalize: () => agentManager.finalizeRestartRestoration(),
+    open: () => {
+      agentManager.openRestartAdmissions();
+      retryPendingFinishNotifications(agentManager);
+      scheduleService.resumeAfterRestartFailure();
     },
   });
+  agentManager.bindRecoveryLifecycle(restartController);
   const initializeScheduleRecovery = async () => {
     try {
       const checkpoint = await restartController.claim();
-      if (checkpoint) {
-        await agentManager.installRestartCheckpoint(checkpoint.snapshot.agents);
-        scheduleService.restoreAfterRestart(checkpoint.snapshot.schedules);
-      }
-      await scheduleService.start();
-      if (checkpoint) await scheduleService.pauseForRestart();
+      if (checkpoint) await restartController.install(checkpoint);
       return checkpoint;
     } catch (error) {
-      // Keep recovery failures reachable through server_info and the normal UI.
-      // In particular, do not start ordinary schedule recovery or hydrate native
-      // agent history after refusing an already consumed/corrupt checkpoint.
-      await scheduleService.pauseForRestart();
-      await agentManager.pauseForRecoveryFailure();
-      restartController.failRestoration(error);
       logger.error({ err: error }, "Restart recovery blocked; saved state retained");
       return null;
     }
@@ -1736,6 +1758,29 @@ export async function createPaseoDaemon(
               daemonVersion,
               async (intent) => {
                 if (intent.type === "restart") {
+                  if (intent.acknowledgeCrash) {
+                    if (!intent.acknowledgmentRequester)
+                      throw new Error(
+                        "Crash acknowledgment requires an attributed authenticated session",
+                      );
+                    await restartController.acknowledgeCrash(
+                      intent.acknowledgeCrash.generationId,
+                      intent.acknowledgeCrash.orphanExecutionReconciled,
+                      intent.acknowledgmentRequester,
+                    );
+                    const generationId = restartController.status.generationId;
+                    if (!generationId)
+                      throw new Error(
+                        "Crash acknowledgment completed without a successor generation",
+                      );
+                    return { generationId };
+                  }
+                  if (intent.retryRecovery) {
+                    await restartController.retryRecovery();
+                    const generationId = restartController.status.generationId;
+                    if (!generationId) throw new Error("Recovery completed without a generation");
+                    return { generationId };
+                  }
                   if (!intent.prepareOnly && !config.onLifecycleIntent) {
                     throw new Error("No daemon replacement handler is configured");
                   }
@@ -1840,27 +1885,15 @@ export async function createPaseoDaemon(
       if (restartCheckpoint && restartController.status.state === "restoring") {
         try {
           const checkpoint = restartCheckpoint;
-          await agentManager.resumeRestartCheckpoint(
-            checkpoint.snapshot.agents,
-            () => {
-              for (const watch of checkpoint.snapshot.notifications) {
-                restoreFinishNotificationWatch({ agentManager, agentStorage, logger }, watch);
-              }
-              scheduleService.resumeRestoredRuns();
-            },
-            () => restartController.completeRestoration(),
-          );
-          await retryPendingFinishNotifications(agentManager);
-          scheduleService.resumeAfterRestartFailure();
-          // The stores now own immutable shared history. In particular, do not
-          // keep a legacy checkpoint's expanded log copies alive in start's
-          // closure for the entire lifetime of the daemon.
+          await restartController.restore(checkpoint);
+          // Installed owners retain histories and obligations; release legacy inline source copies.
           restartCheckpoint = null;
         } catch (error) {
-          await scheduleService.pauseForRestart();
-          await agentManager.pauseForRecoveryFailure();
-          restartController.failRestoration(error);
-          logger.error({ err: error }, "Restart restoration paused; saved state retained");
+          restartCheckpoint = null;
+          logger.error(
+            { err: error },
+            "Restart restoration stopped or blocked; saved state retained",
+          );
         }
       }
     } catch (error) {

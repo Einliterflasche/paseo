@@ -1,3 +1,4 @@
+import { ProviderInitializationCleanupError } from "../provider-initialization-cleanup-error.js";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -30,6 +31,81 @@ afterEach(() => {
 });
 
 describe("OpenCodeServerManager generations", () => {
+  test("a failed final release retains the generation for a fresh termination attempt", async () => {
+    let confirmed = false;
+    let attempts = 0;
+    const { manager, runtime } = createTestManager([4099], {
+      terminateProcess: async (child, options) => {
+        attempts += 1;
+        return confirmed ? runtime.terminateProcess(child, options) : "kill-timeout";
+      },
+    });
+    const acquisition = await manager.acquireCurrent();
+    await expect(acquisition.release()).rejects.toThrow("did not report exit");
+    confirmed = true;
+    await acquisition.release();
+    await acquisition.release();
+    expect(attempts).toBe(2);
+    await manager.shutdown();
+    expect(attempts).toBe(2);
+  });
+
+  test("startup failure transfers its still-running process cleanup", async () => {
+    let confirmed = false;
+    const { manager, runtime } = createTestManager([4098], {
+      autoAnnounce: false,
+      terminateProcess: (child, options) =>
+        confirmed ? runtime.terminateProcess(child, options) : Promise.resolve("kill-timeout"),
+    });
+    const started = manager.acquireCurrent().catch((error: unknown) => error);
+    await vi.waitFor(() => expect(runtime.launchedPorts).toContain(4098));
+    runtime.processForPort(4098).emit("error", new Error("startup handshake failed"));
+    const failure = await started;
+    expect(failure).toBeInstanceOf(ProviderInitializationCleanupError);
+    if (!(failure instanceof ProviderInitializationCleanupError))
+      throw new Error("Missing cleanup owner");
+    confirmed = true;
+    await failure.cleanup.close();
+    await manager.shutdown();
+    expect(runtime.terminatedPorts).toEqual([4098]);
+  });
+
+  test("dedicated startup keeps a retryable owner when startup cleanup and release both fail", async () => {
+    let confirmed = false;
+    let attempts = 0;
+    const { manager, runtime } = createTestManager([4097], {
+      autoAnnounce: false,
+      terminateProcess: (child, options) => {
+        attempts += 1;
+        return confirmed
+          ? runtime.terminateProcess(child, options)
+          : Promise.resolve("kill-timeout");
+      },
+    });
+    const started = manager
+      .acquireDedicated({ PASEO_AGENT_ID: "failed-start" })
+      .catch((error: unknown) => error);
+    await vi.waitFor(() => expect(runtime.launchedPorts).toContain(4097));
+    runtime.processForPort(4097).emit("error", new Error("dedicated startup handshake failed"));
+
+    const failure = await started;
+    expect(attempts).toBe(2);
+    expect(failure).toBeInstanceOf(ProviderInitializationCleanupError);
+    if (!(failure instanceof ProviderInitializationCleanupError))
+      throw new Error("Missing cleanup owner");
+    expect(failure.initializationError).toBeInstanceOf(ProviderInitializationCleanupError);
+    expect(failure.message).toContain("dedicated startup handshake failed");
+    expect(await runtime.managedProcesses.list()).toHaveLength(1);
+
+    confirmed = true;
+    await failure.cleanup.close();
+    await failure.cleanup.close();
+    await manager.shutdown();
+    expect(attempts).toBe(3);
+    expect(runtime.terminatedPorts).toEqual([4097]);
+    expect(await runtime.managedProcesses.list()).toEqual([]);
+  });
+
   test("logs generation lifecycle transitions", async () => {
     const { logger, records } = createCapturingLogger();
     const { manager } = createTestManager([4081, 4082], { logger });
@@ -423,6 +499,7 @@ function createTestManager(
     baseEnv?: Record<string, string>;
     opencodeHomeDir?: string;
     logger?: Logger;
+    terminateProcess?: ProcessTerminator;
   } = {},
 ): {
   manager: OpenCodeServerManager;
@@ -441,7 +518,7 @@ function createTestManager(
       resolveCommandPrefix: runtime.resolveCommandPrefix,
       ...(opencodeHomeDir ? { resolveHomeDir: () => opencodeHomeDir } : {}),
       spawnServerProcess: runtime.spawnServerProcess,
-      terminateProcess: runtime.terminateProcess,
+      terminateProcess: options.terminateProcess ?? runtime.terminateProcess,
     }),
     runtime,
   };

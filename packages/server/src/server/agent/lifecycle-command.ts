@@ -12,7 +12,7 @@ export type LifecycleAgentSnapshot = Pick<ManagedAgent, "id" | "cwd" | "lifecycl
 
 export interface LifecycleAgentManager {
   getAgent(agentId: string): LifecycleAgentSnapshot | null;
-  hasInFlightRun(agentId: string): boolean;
+  getAgentLifecycle(agentId: string): LifecycleAgentSnapshot | null;
   cancelAgentRun(agentId: string): Promise<AgentRunCancellationResult>;
   clearAgentAttention(agentId: string): Promise<void>;
   archiveAgent(agentId: string): Promise<{ archivedAt: string }>;
@@ -60,25 +60,15 @@ async function requestAgentRunCancellation(
   agentId: string,
 ): Promise<RequestedAgentRunCancellation> {
   const { agentManager, logger } = dependencies;
-  const agent = agentManager.getAgent(agentId);
+  const agent = agentManager.getAgentLifecycle(agentId);
   if (!agent) {
     logger.trace({ agentId }, "cancelAgentRunCommand: agent not found");
     throw new Error(`Agent ${agentId} not found`);
   }
 
-  const hasInFlightRun = agentManager.hasInFlightRun(agentId);
-  if (!hasInFlightRun) {
-    logger.trace(
-      { agentId, lifecycle: agent.lifecycle, hasInFlightRun },
-      "cancelAgentRunCommand: skipping because agent is not running",
-    );
-    return { agent, cancelled: false, cancellation: { status: "not_running" } };
-  }
-
-  logger.debug(
-    { agentId, lifecycle: agent.lifecycle, hasInFlightRun },
-    "cancelAgentRunCommand: interrupting",
-  );
+  // The lifecycle owner also knows installed, suspended, and registering work.
+  // A live-session snapshot cannot decide whether a recovery stop is needed.
+  logger.debug({ agentId, lifecycle: agent.lifecycle }, "cancelAgentRunCommand: requesting stop");
   const startedAt = Date.now();
   const cancellation = await agentManager.cancelAgentRun(agentId);
   logger.debug(

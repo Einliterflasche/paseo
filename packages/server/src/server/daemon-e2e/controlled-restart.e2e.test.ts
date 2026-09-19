@@ -1,5 +1,5 @@
 import { fork, type ChildProcess } from "node:child_process";
-import { mkdtemp, readFile, mkdir } from "node:fs/promises";
+import { mkdtemp, readFile, mkdir, rmdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,10 +10,11 @@ import { DaemonClient } from "../test-utils/daemon-client.js";
 async function launch(
   home: string,
   port?: number,
+  behavior?: string,
 ): Promise<{ child: ChildProcess; client: DaemonClient; port: number }> {
   const child = fork(
     fileURLToPath(new URL("../test-utils/checkpoint-daemon-process.ts", import.meta.url)),
-    [home, String(port ?? 0)],
+    [home, String(port ?? 0), ...(behavior ? [behavior] : [])],
     {
       execArgv: ["--import", "tsx"],
       stdio: ["ignore", "pipe", "pipe", "ipc"],
@@ -160,3 +161,57 @@ test("failed checkpoint keeps the real daemon alive and never produces a ready g
   ).toContain("late-close-output");
   expect(await dispatches(home)).toHaveLength(1);
 }, 30_000);
+
+test("an active restoration stops before reporting a marker failure and retries current history", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-marker-failure-"));
+  const old = await launch(home);
+  const agent = await old.client.createAgent({
+    provider: "codex",
+    cwd: home,
+    modeId: "full-access",
+  });
+  await old.client.sendAgentMessage(agent.id, "keep this input", { messageId: "marker-input" });
+  const checkpoint = await old.client.prepareRestart();
+  const generationId = checkpoint.generationId!;
+  const marker = join(home, "restart-checkpoints", generationId, "restored.json");
+  // Actual filesystem failure after resume, without replacing a persistence function.
+  await mkdir(marker);
+  const exited = once(old.child, "exit");
+  await old.client.restartServer();
+  await exited;
+  await old.client.close();
+  const next = await launch(home, old.port, "keep-resumed-active");
+  await expect
+    .poll(() => next.client.getLastServerInfoMessage()?.restartRecoveryState)
+    .toBe("paused");
+  expect(next.client.getLastServerInfoMessage()?.restartRecoveryGeneration).toBe(generationId);
+  expect(next.client.getLastServerInfoMessage()?.restartRecoveryError).toContain("restored.json");
+  const stoppedHistory = await next.client.fetchAgentTimeline(agent.id, {
+    projection: "canonical",
+    limit: 0,
+  });
+  expect(stoppedHistory.error).toBe(null);
+  const stoppedText = stoppedHistory.entries.map((entry) =>
+    entry.item.type === "assistant_message" ? entry.item.text : "",
+  );
+  expect(stoppedText.filter((text) => text === "late-close-output")).toHaveLength(2);
+  expect((await dispatches(home)).filter((call) => call.resumed)).toHaveLength(1);
+  // Remove only the deliberately created empty directory blocking this isolated fixture.
+  await rmdir(marker);
+  const retried = await next.client.retryRecovery();
+  expect(retried.generationId).not.toBe(generationId);
+  expect(next.client.getLastServerInfoMessage()?.restartRecoveryState).toBe("running");
+  const after = await next.client.fetchAgentTimeline(agent.id, {
+    projection: "canonical",
+    limit: 0,
+  });
+  expect(after.entries.slice(0, stoppedHistory.entries.length)).toEqual(stoppedHistory.entries);
+  expect(
+    after.entries.filter(
+      (entry) =>
+        entry.item.type === "user_message" && entry.item.clientMessageId === "marker-input",
+    ),
+  ).toHaveLength(1);
+  expect((await dispatches(home)).filter((call) => call.resumed)).toHaveLength(2);
+  await next.client.cancelAgent(agent.id);
+});

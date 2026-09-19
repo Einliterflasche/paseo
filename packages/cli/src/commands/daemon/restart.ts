@@ -19,7 +19,7 @@ import type {
 } from "../../output/index.js";
 
 interface RestartResult {
-  action: "started" | "restart_requested" | "restarted";
+  action: "started" | "restart_requested" | "restarted" | "recovery_retried" | "crash_acknowledged";
   home: string;
   pid: string;
   message: string;
@@ -49,6 +49,11 @@ export type RestartCommandResult = SingleResult<RestartResult>;
 export interface RestartDaemonClient {
   getLastServerInfoMessage(): { features?: { restartRecovery?: boolean } } | null;
   restartServer(reason?: string): Promise<{ generationId?: string }>;
+  retryRecovery(reason?: string): Promise<{ generationId?: string }>;
+  acknowledgeCrash(
+    generationId: string,
+    orphanExecutionReconciled: true,
+  ): Promise<{ generationId?: string }>;
   close(): Promise<void>;
 }
 
@@ -185,6 +190,34 @@ async function runSafeRestart(
       throw error;
     }
 
+    if (typeof options.acknowledgeCrash === "string") {
+      const result = await client.acknowledgeCrash(options.acknowledgeCrash, true);
+      return {
+        type: "single",
+        schema: restartResultSchema,
+        data: {
+          action: "crash_acknowledged",
+          home: state.home,
+          pid: state.pidInfo ? String(state.pidInfo.pid) : "-",
+          generationId: result.generationId,
+          message: `Unexpected crash acknowledged; successor '${result.generationId}' is active in the same daemon. Old checkpoint work was not replayed.`,
+        },
+      };
+    }
+    if (options.retryRecovery === true) {
+      const result = await client.retryRecovery(reason);
+      return {
+        type: "single",
+        schema: restartResultSchema,
+        data: {
+          action: "recovery_retried",
+          home: state.home,
+          pid: state.pidInfo ? String(state.pidInfo.pid) : "-",
+          generationId: result.generationId,
+          message: `Recovery completed using successor generation '${result.generationId}'. The daemon process was preserved.`,
+        },
+      };
+    }
     const result = await client.restartServer(reason);
     return {
       type: "single",
@@ -214,6 +247,28 @@ export async function runRestartCommand(
   const timeoutMs = parseTimeoutMs(options.timeout);
   const force = options.force === true;
   const startOptions = toStartOptions(options);
+  const acknowledgeCrash =
+    typeof options.acknowledgeCrash === "string" && options.acknowledgeCrash.trim().length > 0;
+
+  if (
+    (options.acknowledgeCrash !== undefined && !acknowledgeCrash) ||
+    (acknowledgeCrash &&
+      (force || options.retryRecovery === true || options.orphanExecutionReconciled !== true)) ||
+    (!acknowledgeCrash && options.orphanExecutionReconciled === true)
+  ) {
+    throw {
+      code: "INVALID_OPTIONS",
+      message:
+        "--acknowledge-crash <generation> requires --orphan-execution-reconciled and cannot be combined with --force or --retry-recovery.",
+    } satisfies CommandError;
+  }
+
+  if (force && options.retryRecovery === true) {
+    throw {
+      code: "INVALID_OPTIONS",
+      message: "--retry-recovery cannot be combined with --force.",
+    } satisfies CommandError;
+  }
 
   if (force) {
     return runForcedRestart(startOptions, timeoutMs, deps);
@@ -222,6 +277,13 @@ export async function runRestartCommand(
   const state = deps.resolveState(startOptions.home);
 
   if (!state.pidInfo || !state.running) {
+    if (options.retryRecovery === true || acknowledgeCrash) {
+      throw {
+        code: "DAEMON_NOT_RUNNING",
+        message:
+          "Recovery controls require the existing paused daemon process; they will not start or replay an older checkpoint.",
+      } satisfies CommandError;
+    }
     try {
       const startup = await deps.start(startOptions);
       return {

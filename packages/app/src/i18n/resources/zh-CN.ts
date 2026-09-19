@@ -8,6 +8,13 @@ export const zhCN: TranslationResources = {
       description:
         "Paseo 已暂停代理工作，以保护已保存的历史记录。主机管理员必须解决恢复错误后才能继续工作。",
       generation: "检查点：{{generation}}",
+      stoppingTitle: "恢复正在停止 {{hostName}} 上的工作",
+      stoppingDescription:
+        "恢复失败。Paseo 正在停止受影响的代理并保留其输出。目前尚未确认工作已暂停。",
+      blockedTitle: "{{hostName}} 上的恢复需要处理",
+      blockedDescription:
+        "Paseo 无法确认所有受影响的代理都已停止。新工作和重启已被阻止。主机操作员必须解决错误后才能重试恢复。",
+      affectedAgents: "受影响的代理：{{agents}}",
     },
     back: "返回",
     loading: "加载中...",

@@ -42,9 +42,68 @@ export interface ForegroundRunAgentState {
   finalizedForegroundTurnIds: Set<string>;
 }
 
+export type AgentRunOutcomeInput =
+  | { type: "completed" | "user_canceled" | "suspended"; agentId: string }
+  | { type: "failed" | "uncertain"; agentId: string; error: string };
+
+export type AgentRunOutcome = AgentRunOutcomeInput & { runId: string; lastMessage: string | null };
+
 export class AgentRunState {
   private readonly runs = new Map<string, TrackedAgentRun>();
   private readonly recovery = new Map<string, RecoveryInput[]>();
+  private readonly logicalIds = new Map<string, string>();
+  private readonly outcomes = new Map<string, AgentRunOutcome>();
+  private readonly outcomeListeners = new Map<string, Set<(outcome: AgentRunOutcome) => void>>();
+
+  /** Permanent discard happens only after execution and its terminal observers settle. */
+  clearAgentState(agentId: string): void {
+    if (this.runs.has(agentId)) throw new Error(`Cannot discard active run ${agentId}`);
+    this.recovery.delete(agentId);
+    this.logicalIds.delete(agentId);
+    this.outcomes.delete(agentId);
+    this.outcomeListeners.delete(agentId);
+  }
+
+  getOutcome(agentId: string): AgentRunOutcome | undefined {
+    return this.outcomes.get(agentId);
+  }
+  clearOutcome(agentId: string): void {
+    this.outcomes.delete(agentId);
+  }
+
+  getLogicalId(agentId: string): string | undefined {
+    return this.logicalIds.get(agentId);
+  }
+
+  publishOutcome(input: AgentRunOutcomeInput, lastMessage: string | null): void {
+    const runId = this.logicalIds.get(input.agentId);
+    if (!runId) return;
+    const outcome: AgentRunOutcome = { ...input, runId, lastMessage };
+    this.outcomes.set(input.agentId, outcome);
+    for (const listener of this.outcomeListeners.get(input.agentId) ?? []) listener(outcome);
+  }
+
+  subscribeOutcome(agentId: string, listener: (outcome: AgentRunOutcome) => void): () => void {
+    let listeners = this.outcomeListeners.get(agentId);
+    if (!listeners) this.outcomeListeners.set(agentId, (listeners = new Set()));
+    listeners.add(listener);
+    return () => {
+      listeners!.delete(listener);
+      if (!listeners!.size) this.outcomeListeners.delete(agentId);
+    };
+  }
+
+  waitForOutcome(agentId: string, runId: string): Promise<AgentRunOutcome> {
+    const previous = this.outcomes.get(agentId);
+    if (previous?.runId === runId) return Promise.resolve(previous);
+    return new Promise((resolve) => {
+      const unsubscribe = this.subscribeOutcome(agentId, (outcome) => {
+        if (outcome.runId !== runId) return;
+        unsubscribe();
+        resolve(outcome);
+      });
+    });
+  }
 
   rememberInput(
     agentId: string,
@@ -56,14 +115,16 @@ export class AgentRunState {
     const current = intent === "run" ? [] : (this.recovery.get(agentId) ?? []);
     if (!current.some((entry) => entry.id === input.id)) current.push(input);
     this.recovery.set(agentId, current);
+    if (intent === "run") this.logicalIds.set(agentId, input.id);
   }
 
   recoveryInputs(agentId: string): RecoveryInput[] {
     return structuredClone(this.recovery.get(agentId) ?? []);
   }
 
-  restoreInputs(agentId: string, inputs: RecoveryInput[]): void {
+  restoreInputs(agentId: string, inputs: RecoveryInput[], runId?: string): void {
     this.recovery.set(agentId, structuredClone(inputs));
+    this.logicalIds.set(agentId, runId ?? inputs[0]?.id ?? randomUUID());
   }
 
   forgetInputs(agentId: string): void {
@@ -71,8 +132,10 @@ export class AgentRunState {
   }
 
   createPendingRun(agentId: string): PendingForegroundRun {
+    this.outcomes.delete(agentId);
     const pendingRun = createPendingForegroundRun();
     this.runs.set(agentId, pendingRun);
+    this.logicalIds.set(agentId, pendingRun.token);
     return pendingRun;
   }
 
@@ -106,6 +169,7 @@ export class AgentRunState {
       return current;
     }
 
+    this.outcomes.delete(agentId);
     const run: AutonomousAgentRun = {
       ...createTrackedRunState(),
       kind: "autonomous",
@@ -113,6 +177,7 @@ export class AgentRunState {
       started: true,
     };
     this.runs.set(agentId, run);
+    this.logicalIds.set(agentId, run.token);
     return run;
   }
 

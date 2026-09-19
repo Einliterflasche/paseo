@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Text, View } from "react-native";
+import { Button } from "@/components/ui/button";
 import { StyleSheet } from "react-native-unistyles";
 import invariant from "tiny-invariant";
 import { useShallow } from "zustand/react/shallow";
@@ -20,14 +21,17 @@ import { SubagentsTrack } from "@/subagents/track";
 import {
   providerSubagentKey,
   providerSubagentLifecycleStatus,
-  refreshProviderSubagents,
   useProviderSubagentStore,
 } from "@/subagents/provider-store";
 import { useTranslation } from "react-i18next";
 import type { PendingPermission } from "@/types/shared";
 import type { StreamItem } from "@/types/stream";
 import { deriveSidebarStateBucket } from "@/utils/sidebar-agent-state";
-import { TIMELINE_FETCH_PAGE_SIZE } from "@/timeline/timeline-fetch-policy";
+import {
+  observeProviderSubagent,
+  refreshProviderSubagents,
+} from "@/subagents/provider-transcripts";
+import { useRetainedPanelActive } from "@/components/retained-panel";
 import type { TurnPresentation } from "@/timeline/turn-liveness";
 
 const EMPTY_PERMISSIONS = new Map<string, PendingPermission>();
@@ -125,9 +129,12 @@ function ProviderSubagentPanel() {
       null,
   );
   const client = useSessionStore((state) => state.sessions[serverId]?.client ?? null);
+  const clientGeneration = useSessionStore((state) => state.sessions[serverId]?.clientGeneration);
   const serverInfo = useSessionStore((state) => state.sessions[serverId]?.serverInfo ?? null);
-  // COMPAT(providerSubagents): added in v0.2.11, remove after 2027-01-12.
-  const supported = serverInfo?.features?.providerSubagents === true;
+  // COMPAT(projectedProviderSubagents): added in v0.8.0, remove gate after 2027-03-19.
+  const supported = serverInfo?.features?.projectedProviderSubagents === true;
+  const active = useRetainedPanelActive();
+  const transcript = useRef<ReturnType<typeof observeProviderSubagent>>(null);
   const [isLoadingOlder, setIsLoadingOlder] = useState(false);
   const isCompact = useIsCompactFormFactor();
   const childRows = useSubagentsForParent({
@@ -146,54 +153,41 @@ function ProviderSubagentPanel() {
   useEffect(() => {
     if (!client || !supported) return;
     void refreshProviderSubagents(client, serverId, target.parentAgentId).catch(() => undefined);
-  }, [client, serverId, supported, target.parentAgentId]);
+  }, [client, clientGeneration, serverId, supported, target.parentAgentId]);
 
   useEffect(() => {
-    if (!client || !supported) return;
-    void client
-      .fetchProviderSubagentTimeline(target.parentAgentId, target.subagentId, {
-        direction: "tail",
-        limit: TIMELINE_FETCH_PAGE_SIZE,
-      })
-      .then((payload) => {
-        useProviderSubagentStore.getState().replaceTimeline(serverId, payload);
-        return undefined;
-      })
-      .catch(() => undefined);
-  }, [client, serverId, supported, target.parentAgentId, target.subagentId]);
-
-  const loadOlder = useCallback((): boolean => {
-    if (!client || !supported || isLoadingOlder || !timeline?.hasOlder || !timeline.epoch) {
-      return false;
-    }
-    const firstSeq = timeline.rows.size ? Math.min(...timeline.rows.keys()) : null;
-    if (firstSeq === null) return false;
-    setIsLoadingOlder(true);
-    void client
-      .fetchProviderSubagentTimeline(target.parentAgentId, target.subagentId, {
-        direction: "before",
-        cursor: { epoch: timeline.epoch, seq: firstSeq },
-        limit: TIMELINE_FETCH_PAGE_SIZE,
-      })
-      .then((payload) => {
-        useProviderSubagentStore.getState().replaceTimeline(serverId, payload);
-        return undefined;
-      })
-      .catch(() => undefined)
-      .finally(() => setIsLoadingOlder(false));
-    return true;
+    if (!client || !supported || !active) return;
+    const owner = observeProviderSubagent(serverId, client, {
+      parentAgentId: target.parentAgentId,
+      subagentId: target.subagentId,
+    });
+    transcript.current = owner;
+    return () => {
+      owner?.release();
+      if (transcript.current === owner) transcript.current = null;
+    };
   }, [
     client,
-    isLoadingOlder,
+    clientGeneration,
     serverId,
     supported,
+    active,
     target.parentAgentId,
     target.subagentId,
-    timeline,
   ]);
-  const firstTimelineSeq = timeline?.rows.size ? Math.min(...timeline.rows.keys()) : null;
-  const progressKey =
-    timeline?.epoch && firstTimelineSeq !== null ? `${timeline.epoch}:${firstTimelineSeq}` : null;
+
+  const retry = useCallback(() => transcript.current?.retry(), []);
+
+  const loadOlder = useCallback((): boolean => {
+    const owner = transcript.current;
+    if (!owner || isLoadingOlder || !timeline?.hasOlder || !timeline.cursor) return false;
+    setIsLoadingOlder(true);
+    void owner.loadOlder().finally(() => setIsLoadingOlder(false));
+    return true;
+  }, [isLoadingOlder, timeline]);
+  const progressKey = timeline?.cursor
+    ? `${timeline.cursor.epoch}:${timeline.cursor.startSeq}`
+    : null;
   const subtitle = descriptor?.subtitle?.trim();
 
   const streamContext = useMemo<AgentScreenAgent>(
@@ -248,6 +242,16 @@ function ProviderSubagentPanel() {
           </Text>
         </View>
       ) : null}
+      {timeline?.error ? (
+        <View style={styles.error}>
+          <Text accessibilityRole="alert" style={styles.unsupportedText}>
+            {timeline.error}
+          </Text>
+          <Button variant="outline" size="sm" onPress={retry} testID="provider-subagent-retry">
+            {t("common.actions.retry")}
+          </Button>
+        </View>
+      ) : null}
       <AgentStreamView
         agentId={streamId}
         serverId={serverId}
@@ -256,7 +260,7 @@ function ProviderSubagentPanel() {
         streamHead={timeline?.head ?? EMPTY_STREAM_ITEMS}
         turnPresentation={turnPresentation}
         pendingPermissions={EMPTY_PERMISSIONS}
-        isAuthoritativeHistoryReady
+        isAuthoritativeHistoryReady={timeline?.hasAuthoritativeBaseline === true}
         onOpenWorkspaceFile={openFileInWorkspace}
         readOnly
         historyPagination={historyPagination}
@@ -274,6 +278,7 @@ function ProviderSubagentPanel() {
 
 const styles = StyleSheet.create((theme) => ({
   container: { flex: 1, minHeight: 0 },
+  error: { alignItems: "center", gap: theme.spacing[2], padding: theme.spacing[3] },
   subtitleHeader: {
     paddingHorizontal: theme.spacing[3],
     paddingVertical: theme.spacing[1],

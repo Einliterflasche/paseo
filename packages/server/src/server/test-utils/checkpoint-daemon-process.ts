@@ -4,7 +4,7 @@ import pino from "pino";
 import { createPaseoDaemon } from "../bootstrap.js";
 import { createCheckpointAgentClient } from "./checkpoint-agent-client.js";
 
-const [home, port = "0"] = process.argv.slice(2);
+const [home, port = "0", behavior] = process.argv.slice(2);
 if (!home) throw new Error("An isolated test home is required");
 await mkdir(join(home, "static"), { recursive: true });
 const daemon = await createPaseoDaemon(
@@ -19,7 +19,11 @@ const daemon = await createPaseoDaemon(
     pluginsEnabled: false,
     relayEnabled: false,
     agentStoragePath: join(home, "agents"),
-    agentClients: { codex: createCheckpointAgentClient(join(home, "provider-dispatches.jsonl")) },
+    agentClients: {
+      codex: createCheckpointAgentClient(join(home, "provider-dispatches.jsonl"), {
+        keepResumedActive: behavior === "keep-resumed-active",
+      }),
+    },
     onLifecycleIntent: () => {
       void daemon.stop().then(
         () => process.exit(0),

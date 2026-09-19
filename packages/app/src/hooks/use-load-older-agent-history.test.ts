@@ -6,6 +6,7 @@ import {
   loadOlderAgentHistory,
   type LoadOlderAgentHistoryClient,
 } from "./use-load-older-agent-history";
+import { TimelineRequestError } from "@getpaseo/client/internal/daemon-client";
 
 const agentId = "agent-1";
 
@@ -156,6 +157,52 @@ describe("loadOlderAgentHistory", () => {
     ]);
     expect(inFlight.values).toEqual([false, true, false]);
     expect(started).toBe(true);
+  });
+
+  it("keeps viewport-driven busy retries silent and preserves the older cursor", async () => {
+    const client = createClient(async () => {
+      throw new TimelineRequestError("busy", "TIMELINE_BUSY");
+    });
+    const inFlight = createInFlight();
+    const toast = createToast();
+    const logger = createLogger();
+    await loadOlderAgentHistory(agentId, {
+      client,
+      cursor: someCursor,
+      hasOlder: true,
+      isLoadingOlder: false,
+      setInFlight: inFlight.setInFlight,
+      toast,
+      logger,
+    });
+    expect(client.calls).toHaveLength(1);
+    expect(client.calls[0]!.request.cursor).toEqual({ epoch: "epoch-1", seq: 10 });
+    expect(toast.shown).toEqual([]);
+    expect(logger.warnings).toEqual([]);
+    expect(inFlight.values).toEqual([false, true, false]);
+  });
+
+  it("explains an oversized older row and leaves another attempt to user intent", async () => {
+    const client = createClient(async () => {
+      throw new TimelineRequestError(
+        "Timeline row 9 exceeds this connection capacity",
+        "TIMELINE_ITEM_TOO_LARGE",
+      );
+    });
+    const inFlight = createInFlight();
+    const toast = createToast();
+    await loadOlderAgentHistory(agentId, {
+      client,
+      cursor: someCursor,
+      hasOlder: true,
+      isLoadingOlder: false,
+      setInFlight: inFlight.setInFlight,
+      toast,
+      logger: createLogger(),
+    });
+    expect(client.calls).toHaveLength(1);
+    expect(toast.shown[0]!.message).toContain("row 9");
+    expect(inFlight.values).toEqual([false, true, false]);
   });
 
   it("shows a panel toast, warns, and clears in-flight on failure", async () => {

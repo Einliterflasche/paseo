@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { Command } from "commander";
@@ -36,7 +37,10 @@ export type DeployCommandResult = SingleResult<DeployResult>;
 
 /** Narrow client seam for requesting checkpoint preparation, not process replacement. */
 export interface DeployPrepareClient {
-  getLastServerInfoMessage(): { features?: { restartRecovery?: boolean } } | null;
+  getLastServerInfoMessage(): {
+    features?: { restartRecovery?: boolean };
+    restartCheckpointFormat?: number;
+  } | null;
   prepareRestart(reason?: string): Promise<{ generationId?: string }>;
   close(): Promise<void>;
 }
@@ -47,6 +51,8 @@ export interface DeployReadinessClient {
     restartRecoveryState?: string;
     restartRecoveryGeneration?: string;
     restartRecoveryError?: string;
+    restartRecoveryStage?: string;
+    restartRecoveryPreviousGeneration?: string;
   } | null;
   close(): Promise<void>;
 }
@@ -66,6 +72,8 @@ export interface DeployCommandDependencies {
   acquireLock(home: string): Promise<DeployLock>;
   connectPrepare(target: string, timeoutMs: number): Promise<DeployPrepareClient | null>;
   connectReadiness(target: string, timeoutMs: number): Promise<DeployReadinessClient | null>;
+  targetFormats(executable: string): Promise<readonly number[]>;
+  validateTarget(executable: string, home: string, generationId: string): Promise<void>;
   /** Runs the caller-supplied activation argv directly, no shell. */
   spawnActivation(argv: readonly string[]): Promise<DeployActivationResult>;
   sleep(ms: number): Promise<void>;
@@ -74,6 +82,48 @@ export interface DeployCommandDependencies {
 
 const LOCK_FILENAME = "deploy.lock";
 const READINESS_POLL_INTERVAL_MS = 2000;
+
+const execFileAsync = promisify(execFile);
+async function checkTarget(executable: string, args: string[]): Promise<unknown> {
+  const { stdout } = await execFileAsync(executable, [
+    "daemon",
+    "checkpoint-check",
+    ...args,
+    "--json",
+  ]);
+  return JSON.parse(stdout);
+}
+
+export async function readTargetCheckpointFormats(executable: string): Promise<readonly number[]> {
+  const result = await checkTarget(executable, ["--formats"]);
+  if (
+    !result ||
+    typeof result !== "object" ||
+    !("readableFormats" in result) ||
+    !Array.isArray(result.readableFormats) ||
+    !result.readableFormats.length ||
+    !result.readableFormats.every((format: unknown) => Number.isSafeInteger(format))
+  ) {
+    throw new Error("Replacement package returned invalid checkpoint format information");
+  }
+  return result.readableFormats;
+}
+
+export async function validateTargetCheckpoint(
+  executable: string,
+  home: string,
+  generationId: string,
+): Promise<void> {
+  const result = await checkTarget(executable, ["--home", home, "--generation", generationId]);
+  if (
+    !result ||
+    typeof result !== "object" ||
+    !("generationId" in result) ||
+    result.generationId !== generationId
+  ) {
+    throw new Error("Replacement package did not validate the prepared checkpoint generation");
+  }
+}
 
 async function defaultAcquireLock(home: string): Promise<DeployLock> {
   await fs.mkdir(home, { recursive: true });
@@ -121,6 +171,8 @@ const defaultDeployCommandDependencies: DeployCommandDependencies = {
   acquireLock: defaultAcquireLock,
   connectPrepare: (target, timeoutMs) => tryConnectToDaemon({ host: target, timeout: timeoutMs }),
   connectReadiness: (target, timeoutMs) => tryConnectToDaemon({ host: target, timeout: timeoutMs }),
+  targetFormats: readTargetCheckpointFormats,
+  validateTarget: validateTargetCheckpoint,
   spawnActivation: defaultSpawnActivation,
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   now: () => Date.now(),
@@ -161,6 +213,7 @@ async function prepareGeneration(
   reason: string | undefined,
   timeoutMs: number,
   deps: DeployCommandDependencies,
+  targetFormats: readonly number[],
 ): Promise<string> {
   const client = await deps.connectPrepare(state.listen, timeoutMs);
   if (!client) {
@@ -185,6 +238,13 @@ async function prepareGeneration(
       throw error;
     }
 
+    const format = client.getLastServerInfoMessage()?.restartCheckpointFormat;
+    if (format !== undefined && !targetFormats.includes(format)) {
+      throw {
+        code: "DEPLOY_CHECKPOINT_INCOMPATIBLE",
+        message: `Replacement package cannot read checkpoint format ${format}. The running daemon was not paused.`,
+      } satisfies CommandError;
+    }
     const result = await client.prepareRestart(reason);
     if (!result.generationId) {
       const error: CommandError = {
@@ -216,7 +276,21 @@ async function waitForGenerationRunning(
     if (client) {
       const info = client.getLastServerInfoMessage();
       await client.close().catch(() => undefined);
-      if (info?.restartRecoveryState === "paused" && info.restartRecoveryError) {
+      if (
+        info?.restartRecoveryPreviousGeneration === generationId &&
+        info.restartRecoveryGeneration !== generationId
+      ) {
+        throw {
+          code: "DEPLOY_GENERATION_SUPERSEDED",
+          message: `Generation '${generationId}' was superseded by recovery generation '${info.restartRecoveryGeneration}'. Inspect that recovery attempt before deploying again.`,
+        } satisfies CommandError;
+      }
+      if (
+        info?.restartRecoveryError &&
+        (info.restartRecoveryState === "paused" ||
+          info.restartRecoveryStage === "stopping" ||
+          info.restartRecoveryStage === "blocked")
+      ) {
         throw {
           code: "DEPLOY_RECOVERY_FAILED",
           message: info.restartRecoveryError,
@@ -259,6 +333,15 @@ export async function runDeployCommand(
     throw error;
   }
 
+  const targetCli = options.targetCli;
+  if (typeof targetCli !== "string" || !path.isAbsolute(targetCli)) {
+    throw {
+      code: "DEPLOY_TARGET_REQUIRED",
+      message:
+        "Supply --target-cli with the immutable replacement package's absolute executable path.",
+    } satisfies CommandError;
+  }
+
   const timeoutMs = parseTimeoutMs(options.timeout, DEFAULT_STOP_TIMEOUT_MS, "INVALID_TIMEOUT");
   const waitTimeoutMs =
     options.waitTimeout === undefined
@@ -272,7 +355,9 @@ export async function runDeployCommand(
   const lock = await deps.acquireLock(state.home);
 
   try {
-    const generationId = await prepareGeneration(state, reason, timeoutMs, deps);
+    const targetFormats = await deps.targetFormats(targetCli);
+    const generationId = await prepareGeneration(state, reason, timeoutMs, deps, targetFormats);
+    await deps.validateTarget(targetCli, state.home, generationId);
 
     const activation = await deps.spawnActivation(argv);
     if (activation.code !== 0 || activation.signal) {

@@ -4,6 +4,7 @@ import { runStatusCommand } from "./status.js";
 import { runStopCommand } from "./stop.js";
 import { runRestartCommand } from "./restart.js";
 import { runDeployCommand } from "./deploy.js";
+import { runCheckpointCheckCommand } from "./checkpoint-check.js";
 import { runSetPasswordCommand } from "./set-password.js";
 import { pairCommand } from "./pair.js";
 import { runDaemonReloadCommand } from "./reload.js";
@@ -21,6 +22,16 @@ export function createDaemonCommand(): Command {
 
   daemon.addCommand(startCommand());
   daemon.addCommand(pairCommand());
+
+  addJsonOption(
+    daemon
+      .command("checkpoint-check")
+      .description("Validate checkpoint compatibility offline, without claiming or restoring it"),
+  )
+    .option("--formats", "Print formats readable by this package")
+    .option("--home <path>", "Paseo home containing the checkpoint")
+    .option("--generation <id>", "Expected ready generation to validate")
+    .action(withOutput(runCheckpointCheckCommand));
 
   addJsonAndDaemonHostOptions(
     daemon.command("reload").description("Reload config.json without restarting the daemon"),
@@ -40,6 +51,15 @@ export function createDaemonCommand(): Command {
   addJsonOption(
     daemon
       .command("restart")
+      .option("--retry-recovery", "Retry a quiescent failed restoration in the existing daemon")
+      .option(
+        "--acknowledge-crash <generation>",
+        "Reconcile an unexpected crash without replaying the consumed checkpoint",
+      )
+      .option(
+        "--orphan-execution-reconciled",
+        "Attest orphan provider work was inspected/stopped; accept lost Paseo-only history and completion obligations",
+      )
       .description(
         "Restart the local daemon. If it is running, this checkpoints in-flight work over " +
           "RPC and lets the supervisor replace the process — no forced kill. Use --force for " +
@@ -91,6 +111,10 @@ export function createDaemonCommand(): Command {
   addJsonOption(
     daemon
       .command("deploy")
+      .requiredOption(
+        "--target-cli <path>",
+        "Immutable replacement package's paseo executable for offline checkpoint validation",
+      )
       .description(
         "Prepare a checkpoint on the running daemon, then run the given activation command " +
           "and confirm the replacement daemon reports that same checkpoint generation running. " +

@@ -69,12 +69,89 @@ function stubClient(overrides: Partial<RestartDaemonClient> = {}): RestartDaemon
   return {
     getLastServerInfoMessage: () => ({ features: { restartRecovery: true } }),
     restartServer: async () => ({ generationId: "gen-1" }),
+    retryRecovery: async () => ({ generationId: "successor-1" }),
+    acknowledgeCrash: async () => ({ generationId: "crash-successor-1" }),
     close: async () => {},
     ...overrides,
   };
 }
 
 describe("runRestartCommand", () => {
+  it("acknowledges the exact consumed generation without replacing the daemon", async () => {
+    const client = stubClient();
+    const acknowledge = vi.spyOn(client, "acknowledgeCrash");
+    const restart = vi.spyOn(client, "restartServer");
+    const { deps, calls } = makeDeps({ connect: async () => client });
+    const result = await runRestartCommand(
+      { acknowledgeCrash: "consumed", orphanExecutionReconciled: true },
+      {} as never,
+      deps,
+    );
+    expect(result.data).toMatchObject({
+      action: "crash_acknowledged",
+      generationId: "crash-successor-1",
+    });
+    expect(acknowledge).toHaveBeenCalledWith("consumed", true);
+    expect(restart).not.toHaveBeenCalled();
+    expect(calls.start).toEqual([]);
+    expect(calls.stop).toEqual([]);
+  });
+  it.each([
+    { acknowledgeCrash: "consumed" },
+    { acknowledgeCrash: "consumed", orphanExecutionReconciled: true, force: true },
+    { acknowledgeCrash: "consumed", orphanExecutionReconciled: true, retryRecovery: true },
+    { orphanExecutionReconciled: true },
+  ])(
+    "rejects incomplete or conflicting crash acknowledgment before connecting: %j",
+    async (options) => {
+      const { deps, calls } = makeDeps();
+      await expect(runRestartCommand(options, {} as never, deps)).rejects.toMatchObject({
+        code: "INVALID_OPTIONS",
+      });
+      expect(calls.connect).toBe(0);
+      expect(calls.start).toEqual([]);
+      expect(calls.stop).toEqual([]);
+    },
+  );
+  it("does not start a daemon for crash acknowledgment", async () => {
+    const { deps, calls } = makeDeps({
+      resolveState: () => baseState({ running: false, pidInfo: null }),
+    });
+    await expect(
+      runRestartCommand(
+        { acknowledgeCrash: "consumed", orphanExecutionReconciled: true },
+        {} as never,
+        deps,
+      ),
+    ).rejects.toMatchObject({ code: "DAEMON_NOT_RUNNING" });
+    expect(calls.start).toEqual([]);
+  });
+  it("retries the current recovery without replacing the process", async () => {
+    const client = stubClient();
+    const restart = vi.spyOn(client, "restartServer");
+    const { deps, calls } = makeDeps({ connect: async () => client });
+    const result = await runRestartCommand({ retryRecovery: true }, {} as never, deps);
+    expect(result.data).toMatchObject({ action: "recovery_retried", generationId: "successor-1" });
+    expect(restart).not.toHaveBeenCalled();
+    expect(calls.stop).toEqual([]);
+    expect(calls.start).toEqual([]);
+  });
+  it("refuses to start a new process for a retry of retained recovery state", async () => {
+    const { deps, calls } = makeDeps({
+      resolveState: () => baseState({ pidInfo: null, running: false }),
+    });
+    await expect(
+      runRestartCommand({ retryRecovery: true }, {} as never, deps),
+    ).rejects.toMatchObject({ code: "DAEMON_NOT_RUNNING" });
+    expect(calls.start).toEqual([]);
+  });
+  it("refuses forced replacement in a recovery retry", async () => {
+    const { deps, calls } = makeDeps();
+    await expect(
+      runRestartCommand({ retryRecovery: true, force: true }, {} as never, deps),
+    ).rejects.toMatchObject({ code: "INVALID_OPTIONS" });
+    expect(calls.stop).toEqual([]);
+  });
   it("starts fresh without any RPC when the daemon is not running", async () => {
     const { deps, calls } = makeDeps({
       resolveState: () => baseState({ pidInfo: null, running: false, stalePidFile: false }),

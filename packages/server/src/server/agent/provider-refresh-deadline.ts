@@ -1,8 +1,9 @@
-import type { ProviderRefreshContext } from "./agent-sdk-types.js";
+import type { AgentProbeContext, ProviderRefreshContext } from "./agent-sdk-types.js";
 
 interface RunProviderRefreshOptions<T> {
   label: string;
   timeoutMs: number;
+  probe?: AgentProbeContext;
   operation: (context: ProviderRefreshContext) => Promise<T>;
 }
 
@@ -36,17 +37,21 @@ export async function runProviderRefreshWithDeadline<T>(
   options: RunProviderRefreshOptions<T>,
 ): Promise<T> {
   const controller = new AbortController();
+  const signal = options.probe
+    ? AbortSignal.any([controller.signal, options.probe.signal])
+    : controller.signal;
   const activityCounts = new Map<string, number>();
   let timeoutError: Error | undefined;
 
   const context: ProviderRefreshContext = {
-    signal: controller.signal,
+    signal,
+    ...(options.probe ? { probe: { signal, own: options.probe.own } } : {}),
     async runActivity(name, operation) {
-      controller.signal.throwIfAborted();
+      signal.throwIfAborted();
       activityCounts.set(name, (activityCounts.get(name) ?? 0) + 1);
       try {
         const result = await operation();
-        controller.signal.throwIfAborted();
+        signal.throwIfAborted();
         return result;
       } finally {
         const remaining = (activityCounts.get(name) ?? 1) - 1;

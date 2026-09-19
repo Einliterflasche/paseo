@@ -1,3 +1,4 @@
+import { ProviderInitializationCleanupError } from "../provider-initialization-cleanup-error.js";
 import { type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -3140,11 +3141,16 @@ describe("ACPAgentSession", () => {
       events.push(event as { type: string; turnId?: string; error?: string });
     });
 
+    const failed = new Promise<void>((resolve) => {
+      session.subscribe((event) => {
+        if (event.type === "turn_failed") resolve();
+      });
+    });
+
     const { turnId } = await session.startTurn("hello");
 
     rejectPrompt(new Error("prompt failed"));
-    await Promise.resolve();
-    await Promise.resolve();
+    await failed;
 
     const turnFailedEvent = events.find((event) => event.type === "turn_failed");
     expect(turnFailedEvent).toMatchObject({
@@ -3170,6 +3176,12 @@ describe("ACPAgentSession", () => {
     asInternals<ACPSessionInternals>(session).connection = { prompt };
     session.subscribe((event) => events.push(event));
 
+    const failed = new Promise<void>((resolve) => {
+      session.subscribe((event) => {
+        if (event.type === "turn_failed") resolve();
+      });
+    });
+
     const { turnId } = await session.startTurn([
       { type: "image", data: "AA==", mimeType: "image/png" },
     ]);
@@ -3182,8 +3194,7 @@ describe("ACPAgentSession", () => {
     });
 
     rejectPrompt(new Error("prompt failed"));
-    await Promise.resolve();
-    await Promise.resolve();
+    await failed;
 
     expect(
       events.filter((event) => event.type === "timeline" || event.type === "turn_failed"),
@@ -3280,6 +3291,98 @@ interface ACPCloseInternals {
   sessionId: string | null;
 }
 
+describe("ACPAgentSession interruption certification", () => {
+  test("a real ACP cancel notification waits for the original prompt receipt and retains late output", async () => {
+    const session = createSession();
+    const clientToAgent = new TransformStream();
+    const agentToClient = new TransformStream();
+    const receipt = Promise.withResolvers<PromptResponse>();
+    const canceled = Promise.withResolvers<void>();
+    const agent: Agent = {
+      async initialize() {
+        return { protocolVersion: PROTOCOL_VERSION, agentCapabilities: {} };
+      },
+      async newSession() {
+        return { sessionId: "interrupt-session" };
+      },
+      async prompt() {
+        return receipt.promise;
+      },
+      async authenticate() {},
+      async cancel() {
+        canceled.resolve();
+      },
+    };
+    const upstream = new AgentSideConnection(
+      () => agent,
+      ndJsonStream(agentToClient.writable, clientToAgent.readable),
+    );
+    const connection = new ClientSideConnection(
+      () => session,
+      ndJsonStream(clientToAgent.writable, agentToClient.readable),
+    );
+    await connection.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const response = await connection.newSession({ cwd: "/tmp/paseo-acp-test", mcpServers: [] });
+    asInternals<ACPSessionInternals>(session).sessionId = response.sessionId;
+    asInternals<ACPSessionInternals>(session).connection = connection;
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const { turnId } = await session.startTurn("work");
+    let settled = false;
+    const interrupt = session.interrupt().then(() => {
+      settled = true;
+      return undefined;
+    });
+    await canceled.promise;
+    expect(settled).toBe(false);
+    await upstream.sessionUpdate({
+      sessionId: response.sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "late output" },
+      },
+    });
+    receipt.resolve({ stopReason: "cancelled" });
+    await interrupt;
+    expect(
+      events.filter(
+        (event) => event.type === "timeline" && event.item.type === "assistant_message",
+      ),
+    ).toEqual([
+      expect.objectContaining({ turnId, item: expect.objectContaining({ text: "late output" }) }),
+    ]);
+    expect(events.filter((event) => event.type === "turn_canceled")).toEqual([
+      expect.objectContaining({ turnId }),
+    ]);
+  });
+
+  test("a pending session-scoped cancel keeps successor turns blocked after the old prompt ends", async () => {
+    const session = createSession();
+    const receipt = Promise.withResolvers<PromptResponse>();
+    const notification = Promise.withResolvers<void>();
+    let cancels = 0;
+    asInternals<ACPCloseInternals>(session).sessionId = "interrupt-session";
+    asInternals<ACPCloseInternals>(session).connection = {
+      prompt: () => receipt.promise,
+      cancel: () => {
+        cancels++;
+        return notification.promise;
+      },
+    };
+    await session.startTurn("first");
+    const first = session.interrupt();
+    const second = session.interrupt();
+    receipt.resolve({ stopReason: "cancelled" });
+    await receipt.promise;
+    await Promise.resolve();
+    await expect(session.startTurn("successor")).rejects.toThrow("already active");
+    expect(cancels).toBe(1);
+    notification.resolve();
+    await Promise.all([first, second]);
+    await expect(session.startTurn("successor")).resolves.toHaveProperty("turnId");
+  });
+});
+
 async function startTerminal(
   session: ACPAgentSession,
   child: ChildProcess,
@@ -3324,6 +3427,27 @@ describe("ACPAgentSession close() tree-kill", () => {
         item: { type: "user_message", text: "[image]" },
       },
     ]);
+  });
+
+  test("close retries uncertain child termination without clearing its ownership", async () => {
+    let confirmed = false;
+    const terminated: TreeKillTarget[] = [];
+    const session = createSession(async (child) => {
+      terminated.push(child);
+      return confirmed ? "terminated" : "kill-timeout";
+    });
+    const internals = asInternals<ACPCloseInternals>(session);
+    const child = createTerminalChildStub();
+    internals.child = child;
+    const first = session.close();
+    expect(session.close()).toBe(first);
+    await expect(first).rejects.toThrow("cessation is unconfirmed");
+    expect(internals.child).toBe(child);
+    confirmed = true;
+    await session.close();
+    await session.close();
+    expect(terminated).toEqual([child, child]);
+    expect(internals.child).toBeNull();
   });
 
   test("close() terminates the main child process via the process tree", async () => {
@@ -3406,6 +3530,46 @@ describe("ACPAgentSession close() tree-kill", () => {
 });
 
 describe("ACPAgentSession initialization cleanup", () => {
+  test("retains the session when initialization and its process cleanup both fail", async () => {
+    const child = createProbeChildStub();
+    const startupError = new Error("session/new failed before handoff");
+    let confirmed = false;
+    class FailingNewSession extends ACPAgentSession {
+      protected override async spawnProcess(): Promise<SpawnedACPProcess> {
+        return {
+          child,
+          connection: {
+            newSession: async () => {
+              throw startupError;
+            },
+            closed: Promise.resolve(),
+          } as unknown as ClientSideConnection,
+          initialize: { agentCapabilities: {} },
+        };
+      }
+    }
+    const session = new FailingNewSession(
+      { provider: "copilot", cwd: process.cwd() },
+      {
+        provider: "copilot",
+        logger: createTestLogger(),
+        defaultCommand: ["copilot", "--acp"],
+        defaultModes: [],
+        capabilities: { supportsStreaming: true, supportsSessionPersistence: true },
+        terminateProcess: async () => (confirmed ? "terminated" : "kill-timeout"),
+      },
+    );
+    const failure = await session.initializeNewSession().catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(ProviderInitializationCleanupError);
+    if (!(failure instanceof ProviderInitializationCleanupError))
+      throw new Error("Missing cleanup owner");
+    expect(failure.initializationError).toBe(startupError);
+    expect(failure.cleanup).toBe(session);
+    confirmed = true;
+    await failure.cleanup.close();
+    expect(asInternals<ACPCloseInternals>(session).child).toBeNull();
+  });
+
   test("terminates the ACP process when session/new fails", async () => {
     const terminator = new FakeTerminator();
     const child = createProbeChildStub();
@@ -3623,6 +3787,44 @@ describe("ACPAgentClient probe cleanup", () => {
     expect(closeSession).toHaveBeenCalledWith({ sessionId: "late-catalog-probe-session" });
     expect(terminator.terminated).toContain(child);
   });
+
+  test.each(["features", "catalog"])(
+    "retains %s probe ownership when termination is uncertain",
+    async (operation) => {
+      const child = createProbeChildStub();
+      let confirmed = false;
+      class ProbeClient extends ACPAgentClient {
+        protected override async spawnProcess(): Promise<SpawnedACPProcess> {
+          return {
+            child,
+            connection: {
+              newSession: async () => ({ sessionId: "probe-session", configOptions: [] }),
+            },
+            initialize: { agentCapabilities: {} },
+          } as unknown as SpawnedACPProcess;
+        }
+      }
+      const client = new ProbeClient({
+        provider: "copilot",
+        logger: createTestLogger(),
+        defaultCommand: ["copilot", "--acp"],
+        configFeatureOptions: [COPILOT_AGENT_FEATURE_OPTION],
+        terminateProcess: async () => (confirmed ? "already-exited" : "kill-timeout"),
+      });
+      const result =
+        operation === "features"
+          ? client.listFeatures({ provider: "copilot", cwd: "/tmp/acp-features" })
+          : client.fetchCatalog({ scope: "workspace", cwd: "/tmp/acp-features", force: false });
+      const error = await result.catch((failure: unknown) => failure);
+      expect(error).toBeInstanceOf(ProviderInitializationCleanupError);
+      if (!(error instanceof ProviderInitializationCleanupError))
+        throw new Error("expected owned cleanup");
+      expect(child.stdout.destroyed).toBe(false);
+      confirmed = true;
+      await error.cleanup.close();
+      expect(child.stdout.destroyed).toBe(true);
+    },
+  );
 
   test("closes the native feature probe session before terminating its process", async () => {
     const terminator = new FakeTerminator();
