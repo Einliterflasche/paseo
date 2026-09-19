@@ -21,40 +21,16 @@ function previewErrorKey(state: PreviewOpenState): string {
 function ServicePreviewPanel() {
   const { t } = useTranslation();
   const { coordinator, state } = useServicePreview();
-  const { coordinator: browserTab, state: browserTabState } = useServicePreview("tab");
-  const browserTabBusy =
-    browserTabState.status === "preparing" || browserTabState.status === "cancelling";
   const opening = state.status === "preparing" || state.status === "loading";
   const busy = opening || state.status === "cancelling";
-  const open = useCallback(() => {
-    if (coordinator) void coordinator.open({ reload: coordinator.getSnapshot().status === "open" });
-  }, [coordinator]);
   const recover = useCallback(() => {
     void coordinator?.open({ recover: true });
   }, [coordinator]);
   const cancel = useCallback(() => coordinator?.cancel(), [coordinator]);
-  const openBrowserTab = useCallback(() => {
-    if (browserTab?.getSnapshot().status === "ready") browserTab.launch();
-    else void browserTab?.open();
-  }, [browserTab]);
-  const cancelBrowserTab = useCallback(() => browserTab?.cancel(), [browserTab]);
-  const recoverBrowserTab = useCallback(() => {
-    void browserTab?.open({ recover: true });
-  }, [browserTab]);
   return (
     <View style={styles.panel}>
       {coordinator ? (
         <View style={styles.toolbar}>
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={busy}
-            loading={busy}
-            onPress={open}
-            testID="service-preview-open"
-          >
-            {t(state.status === "open" ? "services.reloadPreview" : "services.openPreview")}
-          </Button>
           {opening ? (
             <Button size="sm" variant="ghost" onPress={cancel}>
               {t("common.actions.cancel")}
@@ -66,46 +42,6 @@ function ServicePreviewPanel() {
             </Button>
           ) : null}
           {busy ? <Text style={styles.message}>{t("common.loading")}</Text> : null}
-          {browserTab ? (
-            <Button
-              size="sm"
-              variant="ghost"
-              disabled={browserTabBusy}
-              loading={browserTabBusy}
-              onPress={openBrowserTab}
-              testID="service-preview-browser-tab"
-            >
-              {t(
-                browserTabState.status === "ready"
-                  ? "services.openBrowserTabReady"
-                  : "services.openBrowserTab",
-              )}
-            </Button>
-          ) : null}
-          {["ready", "preparing", "open"].includes(browserTabState.status) ? (
-            <Button
-              size="sm"
-              variant="ghost"
-              onPress={cancelBrowserTab}
-              testID="service-preview-browser-tab-cancel"
-            >
-              {t(
-                browserTabState.status === "open"
-                  ? "services.closeBrowserPreview"
-                  : "common.actions.cancel",
-              )}
-            </Button>
-          ) : null}
-          {browserTabState.status === "error" && browserTabState.recovery ? (
-            <Button
-              size="sm"
-              variant="ghost"
-              onPress={recoverBrowserTab}
-              testID="service-preview-browser-tab-recover"
-            >
-              {t("services.recoverPreview")}
-            </Button>
-          ) : null}
         </View>
       ) : null}
       {state.status === "error" ? (
@@ -113,13 +49,6 @@ function ServicePreviewPanel() {
           variant="warning"
           description={t(previewErrorKey(state))}
           testID="service-preview-error"
-        />
-      ) : null}
-      {browserTabState.status === "error" ? (
-        <Alert
-          variant="warning"
-          description={t(previewErrorKey(browserTabState))}
-          testID="service-preview-browser-tab-error"
         />
       ) : null}
       <ServicePreviewAnchor>

@@ -28,3 +28,13 @@ export function useBrowserServicePreview(_context: { serverId: string; serviceId
 } {
   return { coordinator: null, state: { status: "idle" } };
 }
+
+export function useServicePreviewForTab(
+  _context: { serverId: string; workspaceId: string; tabId: string; serviceId: string } | null,
+  _mode: "iframe" | "tab",
+): {
+  coordinator: ReturnType<typeof createPreviewCoordinator> | null;
+  state: PreviewOpenState;
+} {
+  return { coordinator: null, state: { status: "idle" } };
+}
