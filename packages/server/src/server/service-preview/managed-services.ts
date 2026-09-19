@@ -127,6 +127,24 @@ export class ManagedPreviewServices {
     }
   }
 
+  /** Catalog service definitions are previewable without a persisted UI decision. */
+  restoreDefault(workspaceId: string, scriptName: string): string {
+    const serviceId = managedPreviewServiceId({ workspaceId, scriptName });
+    const existing = this.entries.get(serviceId);
+    if (!existing?.enabled) {
+      this.entries.set(serviceId, {
+        workspaceId,
+        scriptName,
+        name: scriptName,
+        mount: "strip",
+        enabled: true,
+      });
+      this.publish();
+    }
+    this.restoreWorkspace(workspaceId);
+    return serviceId;
+  }
+
   blockWorkspace(workspaceId: string): void {
     // Even a quick archive/restore cannot revive an earlier pending Enable.
     for (const [serviceId, entry] of this.enabling) {

@@ -96,7 +96,6 @@ function fixture(
     serverId: "host",
     entry,
     action: "enable",
-    mount: "preserve",
     getSnapshot,
   };
   const state = (target = entry) =>
@@ -167,6 +166,11 @@ describe("managed action ownership", () => {
     await Promise.all(reentrant);
     expect(f.calls).toHaveLength(1);
     expect(f.calls[0].action).toBe("enable");
+    expect(f.calls[0].input).toEqual({
+      workspaceId: "workspace-a",
+      scriptName: "web",
+      mount: "strip",
+    });
     unsubscribe();
     f.enableResult.resolve({ result: { status: "ok", serviceId: "managed-atlas" } });
     expect(await first).toBe(true);

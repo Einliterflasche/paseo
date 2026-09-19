@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo } from "react";
 import { Text, View } from "react-native";
 import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
@@ -6,9 +6,7 @@ import { StyleSheet } from "react-native-unistyles";
 import { AdaptiveModalSheet } from "@/components/adaptive-modal-sheet";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { SelectField } from "@/components/ui/select-field";
 import { useReplicaQuery } from "@/data/query";
-import { useIsCompactFormFactor } from "@/constants/layout";
 import { getHostRuntimeStore, useHostRuntimeSnapshot } from "@/runtime/host-runtime";
 import type { ServiceCatalogEntry } from "./catalog";
 import {
@@ -51,18 +49,13 @@ export function ManagedPreviewSheet({
 function OpenManagedPreviewSheet({ serverId, entry, eligible, onClose }: OpenManagedPreviewProps) {
   const { t } = useTranslation();
   const client = useQueryClient();
-  const compact = useIsCompactFormFactor();
   const runtime = useHostRuntimeSnapshot(serverId);
-  const [mount, setMount] = useState<"preserve" | "strip">(
-    entry.previewEnrollment?.mount ?? "preserve",
-  );
   const outcome = useReplicaQuery<ManagedActionState>({
     queryKey: managedActionKey(serverId, entry),
     pushEvent: "services.managed.action",
   });
   const saving = outcome.data?.status === "pending";
   const enabled = entry.previewEnrollment?.enabled === true;
-  const displayedMount = entry.previewEnrollment?.enabled ? entry.previewEnrollment.mount : mount;
   const available =
     eligible &&
     runtime?.connectionStatus === "online" &&
@@ -77,11 +70,10 @@ function OpenManagedPreviewSheet({ serverId, entry, eligible, onClose }: OpenMan
       serverId,
       entry,
       action: enabled ? "disable" : "enable",
-      mount,
       getSnapshot: () => getHostRuntimeStore().getSnapshot(serverId),
     });
     if (saved) onClose();
-  }, [available, saving, client, serverId, entry, enabled, mount, onClose]);
+  }, [available, saving, client, serverId, entry, enabled, onClose]);
   const header = useMemo(
     () => ({ title: `${t("services.managed.settings")}: ${entry.scriptName}` }),
     [t, entry.scriptName],
@@ -104,27 +96,6 @@ function OpenManagedPreviewSheet({ serverId, entry, eligible, onClose }: OpenMan
     ),
     [close, saving, t, submit, available, enabled],
   );
-  const options = useMemo(
-    () => [
-      {
-        id: "preserve",
-        value: "preserve" as const,
-        label: t("services.registration.preservePath"),
-      },
-      { id: "strip", value: "strip" as const, label: t("services.registration.stripPath") },
-    ],
-    [t],
-  );
-  const display = useMemo(
-    () => ({
-      label: t(
-        displayedMount === "preserve"
-          ? "services.registration.preservePath"
-          : "services.registration.stripPath",
-      ),
-    }),
-    [t, displayedMount],
-  );
   return (
     <AdaptiveModalSheet
       visible
@@ -137,18 +108,6 @@ function OpenManagedPreviewSheet({ serverId, entry, eligible, onClose }: OpenMan
         <Text style={styles.description}>
           {t(enabled ? "services.managed.disableHelp" : "services.managed.enableHelp")}
         </Text>
-        <SelectField
-          label={t("services.registration.mount")}
-          value={displayedMount}
-          selectedDisplay={display}
-          options={options}
-          onChange={setMount}
-          placeholder={t("services.registration.mount")}
-          emptyText={t("common.empty.noResults")}
-          disabled={saving || enabled}
-          size={compact ? "md" : "sm"}
-          triggerTestID="service-managed-mount"
-        />
         {entry.previewEnrollment ? (
           <Text style={styles.description} selectable>
             {t("services.registration.basePath")}: /__paseo_services/apps/

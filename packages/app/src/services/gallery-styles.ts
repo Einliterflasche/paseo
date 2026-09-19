@@ -35,6 +35,13 @@ export const serviceGalleryStyles = StyleSheet.create((theme) => ({
     borderBottomWidth: 1,
     borderColor: theme.colors.border,
   },
+  menuTrigger: {
+    width: 34,
+    height: 34,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: theme.borderRadius.md,
+  },
   cardBody: { padding: theme.spacing[4], gap: theme.spacing[3] },
   cardHeading: {
     flexDirection: "row",

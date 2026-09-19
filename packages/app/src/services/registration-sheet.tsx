@@ -103,23 +103,9 @@ function OpenRegistrationSheet({
       .filter((item) => !item.archivingAt)
       .map((item) => ({ id: item.id, value: item.id, label: item.title || item.name })),
   ];
-  const mountOptions = [
-    { id: "preserve", value: "preserve" as const, label: t("services.registration.preservePath") },
-    { id: "strip", value: "strip" as const, label: t("services.registration.stripPath") },
-  ];
   const workspaceDisplay = useMemo(
     () => ({ label: state.values.workspaceLabel }),
     [state.values.workspaceLabel],
-  );
-  const mountDisplay = useMemo(
-    () => ({
-      label: t(
-        state.values.mount === "preserve"
-          ? "services.registration.preservePath"
-          : "services.registration.stripPath",
-      ),
-    }),
-    [t, state.values.mount],
   );
   return (
     <AdaptiveModalSheet
@@ -163,18 +149,6 @@ function OpenRegistrationSheet({
           disabled={saving}
           size={size}
           triggerTestID="service-register-workspace"
-        />
-        <SelectField
-          label={t("services.registration.mount")}
-          value={state.values.mount}
-          selectedDisplay={mountDisplay}
-          options={mountOptions}
-          onChange={model.setMount}
-          placeholder={t("services.registration.mount")}
-          emptyText={t("common.empty.noResults")}
-          disabled={saving}
-          size={size}
-          triggerTestID="service-register-mount"
         />
         {!available ? (
           <Alert variant="warning" description={t("services.registration.unavailable")} />

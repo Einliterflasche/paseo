@@ -1,6 +1,13 @@
 import { serviceGalleryStyles as styles } from "./gallery-styles";
 import { memo, useCallback, useMemo, useState } from "react";
-import { FlatList, Text, View, type ViewStyle, type LayoutChangeEvent } from "react-native";
+import {
+  FlatList,
+  Pressable,
+  Text,
+  View,
+  type ViewStyle,
+  type LayoutChangeEvent,
+} from "react-native";
 import { Globe, LayoutGrid, List } from "lucide-react-native";
 import { withUnistyles } from "react-native-unistyles";
 import { useTranslation } from "react-i18next";
@@ -12,7 +19,7 @@ import { StatusBadge } from "@/components/ui/status-badge";
 import type { ServiceCatalogEntry } from "./catalog";
 import type { ExternalCatalogEntry } from "./external-catalog";
 import { ExternalServiceCard } from "./external-card";
-import { ManagedPreviewControls } from "./managed-controls";
+import { BrowserPreviewActions, ServiceLifecycleActions } from "./browser-preview-actions";
 import type { ServicesViewMode } from "./preferences";
 
 import type { Theme } from "@/styles/theme";
@@ -53,7 +60,6 @@ interface ServiceGalleryProps {
   onLogs: (entry: ServiceCatalogEntry) => void;
   onOpen?: (entry: GalleryEntry) => void;
   onRegister?: () => void;
-  onManagePreview?: (entry: ServiceCatalogEntry) => void;
 }
 
 export function ServiceGallery(props: ServiceGalleryProps) {
@@ -108,7 +114,6 @@ export function ServiceGallery(props: ServiceGalleryProps) {
     onAction,
     onLogs,
     onOpen,
-    onManagePreview,
   } = props;
   const cellStyle = useMemo<ViewStyle>(() => ({ width: `${100 / columns}%` }), [columns]);
   const empty = useMemo(() => {
@@ -143,7 +148,6 @@ export function ServiceGallery(props: ServiceGalleryProps) {
             onAction={onAction}
             onLogs={onLogs}
             onOpen={onOpen}
-            onManagePreview={onManagePreview}
           />
         )}
       </View>
@@ -159,7 +163,6 @@ export function ServiceGallery(props: ServiceGalleryProps) {
       onAction,
       onLogs,
       onOpen,
-      onManagePreview,
       serverId,
     ],
   );
@@ -266,21 +269,93 @@ function serviceKey(entry: GalleryEntry) {
 function ServicePreviewPlaceholder({
   entry,
   canOpen,
+  onOpen,
 }: {
   entry: ServiceCatalogEntry;
   canOpen: boolean;
+  onOpen: () => void;
 }) {
   const { t } = useTranslation();
+  const enabled = Boolean(entry.previewServiceId && canOpen);
   return (
-    <View style={styles.preview}>
+    <Pressable
+      style={styles.preview}
+      disabled={!enabled}
+      onPress={onOpen}
+      accessibilityRole="button"
+      accessibilityLabel={`${t("services.openPreview")}: ${entry.scriptName}`}
+      testID={`service-preview-${entry.scriptName}`}
+    >
       <ThemedGlobe size={32} uniProps={mutedColorMapping} />
       <Text style={styles.caption}>
-        {t(
-          entry.previewServiceId && canOpen
-            ? "services.previewReady"
-            : "services.previewUnavailable",
-        )}
+        {t(enabled ? "services.previewReady" : "services.previewUnavailable")}
       </Text>
+    </Pressable>
+  );
+}
+
+function ServiceCardActions({
+  serverId,
+  entry,
+  compact,
+  online,
+  stale,
+  canManage,
+  busy,
+  pending,
+  onToggle,
+  onLogs,
+  onOpen,
+}: {
+  serverId: string;
+  entry: ServiceCatalogEntry;
+  compact: boolean;
+  online: boolean;
+  stale: boolean;
+  canManage: boolean;
+  busy: boolean;
+  pending: boolean;
+  onToggle: () => void;
+  onLogs: () => void;
+  onOpen: () => void;
+}) {
+  const { t } = useTranslation();
+  const running = entry.lifecycle === "running";
+  const actionLabel = t(running ? "services.stop" : "services.start");
+  return (
+    <View style={styles.actions}>
+      {compact && entry.previewServiceId ? (
+        <Button size="sm" variant="outline" disabled={!online || stale || busy} onPress={onOpen}>
+          {t("services.openPreview")}
+        </Button>
+      ) : null}
+      {entry.previewServiceId ? (
+        <BrowserPreviewActions
+          serverId={serverId}
+          serviceId={entry.previewServiceId}
+          name={entry.scriptName}
+          available={online && !stale}
+          disabled={busy}
+          onToggle={onToggle}
+          toggleLabel={actionLabel}
+          toggleDisabled={!online || !canManage || busy}
+          togglePending={pending}
+          toggleTestID={`service-${running ? "stop" : "start"}-${entry.scriptName}`}
+          onLogs={onLogs}
+          logsDisabled={!online || !entry.terminalId}
+        />
+      ) : (
+        <ServiceLifecycleActions
+          name={entry.scriptName}
+          onToggle={onToggle}
+          toggleLabel={actionLabel}
+          toggleDisabled={!online || !canManage || busy}
+          togglePending={pending}
+          toggleTestID={`service-${running ? "stop" : "start"}-${entry.scriptName}`}
+          onLogs={onLogs}
+          logsDisabled={!online || !entry.terminalId}
+        />
+      )}
     </View>
   );
 }
@@ -297,7 +372,6 @@ const ServiceCard = memo(function ServiceCard({
   onAction,
   onLogs,
   onOpen,
-  onManagePreview,
 }: {
   serverId: string;
   entry: ServiceCatalogEntry;
@@ -310,7 +384,6 @@ const ServiceCard = memo(function ServiceCard({
   onAction: ServiceGalleryProps["onAction"];
   onLogs: ServiceGalleryProps["onLogs"];
   onOpen: ServiceGalleryProps["onOpen"];
-  onManagePreview: ServiceGalleryProps["onManagePreview"];
 }) {
   const { t } = useTranslation();
   const running = entry.lifecycle === "running";
@@ -320,11 +393,15 @@ const ServiceCard = memo(function ServiceCard({
   );
   const logs = useCallback(() => onLogs(entry), [entry, onLogs]);
   const open = useCallback(() => onOpen?.(entry), [entry, onOpen]);
-  const serviceDescription = `${entry.scriptName} · ${entry.projectName} · ${entry.workspaceName}`;
-  const actionLabel = t(running ? "services.stop" : "services.start");
   return (
     <View style={styles.card} testID={`service-card-${entry.workspaceId}-${entry.scriptName}`}>
-      {!compact ? <ServicePreviewPlaceholder entry={entry} canOpen={Boolean(onOpen)} /> : null}
+      {!compact ? (
+        <ServicePreviewPlaceholder
+          entry={entry}
+          canOpen={Boolean(onOpen) && online && !stale && !busy}
+          onOpen={open}
+        />
+      ) : null}
       <View style={styles.cardBody}>
         <View style={styles.cardHeading}>
           <Text style={styles.name} numberOfLines={1}>
@@ -346,49 +423,20 @@ const ServiceCard = memo(function ServiceCard({
             />
           ) : null}
         </View>
-        <View style={styles.actions}>
-          {entry.previewServiceId && onOpen ? (
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={!online || stale || busy}
-              onPress={open}
-              accessibilityLabel={`${t("services.openPreview")}: ${serviceDescription}`}
-              testID={`service-open-${entry.scriptName}`}
-            >
-              {t("services.openPreview")}
-            </Button>
-          ) : null}
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={!online || !canManage || busy}
-            loading={pending}
-            onPress={toggle}
-            accessibilityLabel={`${actionLabel}: ${serviceDescription}`}
-            testID={`service-${running ? "stop" : "start"}-${entry.scriptName}`}
-          >
-            {actionLabel}
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            disabled={!online || !entry.terminalId}
-            onPress={logs}
-            accessibilityLabel={`${t("services.logs")}: ${serviceDescription}`}
-          >
-            {t("services.logs")}
-          </Button>
-        </View>
+        <ServiceCardActions
+          serverId={serverId}
+          entry={entry}
+          compact={compact && Boolean(onOpen)}
+          online={online}
+          stale={stale}
+          canManage={canManage}
+          busy={busy}
+          pending={pending}
+          onToggle={toggle}
+          onLogs={logs}
+          onOpen={open}
+        />
         {!canManage ? <Text style={styles.caption}>{t("services.readOnly")}</Text> : null}
-        {onManagePreview ? (
-          <ManagedPreviewControls
-            serverId={serverId}
-            entry={entry}
-            disabled={!online || stale || busy}
-            onConfigure={onManagePreview}
-          />
-        ) : null}
       </View>
     </View>
   );

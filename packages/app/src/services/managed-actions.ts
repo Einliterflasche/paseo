@@ -62,7 +62,6 @@ export interface ManagedActionInput {
   serverId: string;
   entry: ServiceCatalogEntry;
   action: ManagedAction;
-  mount: "preserve" | "strip";
   getSnapshot(): ManagedRuntime | null;
 }
 
@@ -83,7 +82,7 @@ async function execute(input: ManagedActionInput): Promise<string> {
     throw new ManagedActionError("unknown-service");
   const target = { workspaceId: input.entry.workspaceId, scriptName: input.entry.scriptName };
   const { result } = await (input.action === "enable"
-    ? client.enableManagedServicePreview({ ...target, mount: input.mount })
+    ? client.enableManagedServicePreview({ ...target, mount: "strip" })
     : client.disableManagedServicePreview(target));
   try {
     currentClient(input.getSnapshot, captured);

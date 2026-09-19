@@ -9,6 +9,7 @@ import {
 } from "../workspace-script-runtime-store.js";
 import { PreviewBroker, type PreviewAuthorizedJob } from "./broker.js";
 import { ManagedPreviewRoutes, type ManagedPreviewEnrollment } from "./managed.js";
+import { managedPreviewServiceId } from "./policy.js";
 import { PreviewRouteError, PreviewRoutes } from "./routes.js";
 import { PreviewSources, PREVIEW_SOURCE_CAPABILITY } from "./sources.js";
 
@@ -103,6 +104,23 @@ function fixture(report: (error: unknown) => void | Promise<void> = () => {}) {
 }
 
 type Fixture = ReturnType<typeof fixture>;
+
+it("enables a running managed service by default with a stripped mount", () => {
+  const f = fixture();
+  f.endpoint();
+  f.runtime.set(runtimeEntry());
+  f.managed.restoreDefault(enrollment.workspaceId, enrollment.scriptName);
+
+  const serviceId = managedPreviewServiceId(enrollment);
+  expect(f.routes.describe()).toContainEqual(
+    expect.objectContaining({
+      serviceId,
+      workspaceId: enrollment.workspaceId,
+      scriptName: enrollment.scriptName,
+      port: 5173,
+    }),
+  );
+});
 
 function start(f: Fixture) {
   f.endpoint();

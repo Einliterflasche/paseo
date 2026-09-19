@@ -151,6 +151,15 @@ export async function openPreviewFeature(options: PreviewFeatureOptions) {
     managedServices.restoreWorkspace(workspaceId);
   }
 
+  function restoreConfiguredDefaults(workspace: { workspaceId: string; cwd: string }): void {
+    const config = readPaseoConfig(workspace.cwd);
+    if (!config.ok) return;
+    for (const [scriptName, script] of getScriptConfigs(config.config)) {
+      if (isServiceScript(script))
+        managedServices.restoreDefault(workspace.workspaceId, scriptName);
+    }
+  }
+
   async function reportFailure(error: unknown): Promise<void> {
     try {
       await onFailure(error);
@@ -160,6 +169,15 @@ export async function openPreviewFeature(options: PreviewFeatureOptions) {
   }
 
   try {
+    cleanup.push(
+      options.runtime.subscribe((workspaceId) => {
+        if (closed || blockedWorkspaces.has(workspaceId)) return;
+        for (const runtime of options.runtime.listForWorkspace(workspaceId)) {
+          if (runtime.type === "service")
+            managedServices.restoreDefault(workspaceId, runtime.scriptName);
+        }
+      }),
+    );
     cleanup.push(
       workspaces.subscribeBeforeUnavailable(async (workspaceId) => {
         blockedWorkspaces.add(workspaceId);
@@ -182,14 +200,12 @@ export async function openPreviewFeature(options: PreviewFeatureOptions) {
             void reportFailure(error);
           }
         }
-        return undefined;
       }),
     );
-    for (const declaration of managedServices.describe()) {
-      const workspace = await workspaces.get(declaration.workspaceId);
-      if (!workspace || workspace.archivedAt || blockedWorkspaces.has(declaration.workspaceId))
-        continue;
-      activateWorkspace(declaration.workspaceId);
+    for (const workspace of await workspaces.list()) {
+      if (workspace.archivedAt || blockedWorkspaces.has(workspace.workspaceId)) continue;
+      restoreConfiguredDefaults(workspace);
+      activateWorkspace(workspace.workspaceId);
     }
     worker = startPreviewGatewayWorker({
       broker,

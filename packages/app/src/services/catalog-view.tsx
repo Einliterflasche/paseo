@@ -11,7 +11,6 @@ import { useServicesPreferences } from "./preferences";
 import { useOpenServicePreview } from "./preview-host";
 import { buildExternalCatalog, type ExternalCatalogEntry } from "./external-catalog";
 import { ServiceRegistrationSheet } from "./registration-sheet";
-import { ManagedPreviewSheet } from "./managed-sheet";
 
 import {
   CatalogChangedError,
@@ -31,8 +30,6 @@ export function ServiceCatalogView({
 }) {
   const { t } = useTranslation();
   const [registering, setRegistering] = useState(false);
-  const [managedEntry, setManagedEntry] = useState<ServiceCatalogEntry | null>(null);
-  const hideManaged = useCallback(() => setManagedEntry(null), []);
   const showRegistration = useCallback(() => setRegistering(true), []);
   const hideRegistration = useCallback(() => setRegistering(false), []);
   const preferences = useServicesPreferences({ serverId, workspaceId });
@@ -69,9 +66,6 @@ export function ServiceCatalogView({
         ...buildExternalCatalog({ serverId, workspaces: workspaces?.values() ?? [], previews }),
       ].filter((entry) => !workspaceId || entry.workspaceId === workspaceId),
     [serverId, workspaces, workspaceId, previews],
-  );
-  const currentManagedEntry = services.find(
-    (entry): entry is ServiceCatalogEntry => !("kind" in entry) && entry.id === managedEntry?.id,
   );
   const operations = useMemo(
     () =>
@@ -160,14 +154,6 @@ export function ServiceCatalogView({
         onLogs={onLogs}
         onOpen={openPreview ? onOpen : undefined}
         onRegister={previews?.externalRegistration === 1 ? showRegistration : undefined}
-        onManagePreview={previews?.managedRegistration === 1 ? setManagedEntry : undefined}
-      />
-      <ManagedPreviewSheet
-        serverId={serverId}
-        entry={managedEntry}
-        currentEntry={currentManagedEntry}
-        eligible={active && ready}
-        onClose={hideManaged}
       />
       <ServiceRegistrationSheet
         visible={registering}
