@@ -1,3 +1,4 @@
+import { AgentTurnStartUncertainError } from "./agent-turn-start-uncertain-error.js";
 import type { Logger } from "pino";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
@@ -628,7 +629,7 @@ export async function startWithFinishNotification<T>(
     if (!ownsRun(result)) stop();
     return result;
   } catch (error) {
-    stop();
+    if (!(error instanceof AgentTurnStartUncertainError)) stop();
     throw error;
   }
 }

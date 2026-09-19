@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { AgentManager } from "../agent/agent-manager.js";
 import { AgentStorage } from "../agent/agent-storage.js";
+import { AgentTurnStartUncertainError } from "../agent/agent-turn-start-uncertain-error.js";
 import { createAgentCommand } from "../agent/create-agent/create.js";
 import type {
   AgentCapabilityFlags,
@@ -3940,6 +3941,7 @@ describe("ScheduleService", () => {
     const inspected = await service.inspect(created.id);
     expect(inspected.runs[0]?.status).toBe("running");
     await expect(service.runOnce(created.id)).rejects.toThrow("already running");
+    await expect(service.delete(created.id)).rejects.toThrow("completion is still being saved");
 
     expect(await service.snapshotForRestart()).toEqual({ runs: [] });
     expect((await service.inspect(created.id)).runs[0]).toMatchObject({
@@ -3947,6 +3949,247 @@ describe("ScheduleService", () => {
       output: "real success",
       error: null,
     });
+    await service.delete(created.id);
+    expect(await service.snapshotForRestart()).toEqual({ runs: [] });
+  });
+
+  test.each(["new-agent", "agent"] as const)(
+    "an uncertain %s handoff preserves its schedule obligation across restart",
+    async (targetType) => {
+      const client = createCheckpointAgentClient();
+      const createSession = client.createSession.bind(client);
+      client.createSession = async (...args) => {
+        const session = await createSession(...args);
+        const start = session.startTurn.bind(session);
+        session.startTurn = async (...input) => {
+          await start(...input);
+          throw new AgentTurnStartUncertainError(new Error("native acknowledgement lost"));
+        };
+        return session;
+      };
+      const logger = createTestLogger();
+      const manager = new AgentManager({
+        logger,
+        registry: agentStorage,
+        clients: { codex: client },
+      });
+      const archiveWorkspace = vi.fn(async () => {});
+      const service = createScheduleService({
+        paseoHome: tempDir,
+        logger,
+        agentManager: manager,
+        agentStorage,
+        providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+        now: () => now,
+        archiveWorkspace,
+      });
+      const agent =
+        targetType === "agent"
+          ? await manager.createAgent({ provider: "codex", cwd: tempDir }, undefined, {
+              workspaceId: "existing-workspace",
+            })
+          : null;
+      const schedule = await service.create({
+        prompt: "preserve the uncertain scheduled work",
+        cadence: { type: "every", everyMs: 60_000 },
+        target: agent
+          ? { type: "agent", agentId: agent.id }
+          : {
+              type: "new-agent",
+              config: { provider: "codex", cwd: tempDir, archiveOnFinish: true },
+            },
+      });
+      const completion = service.runOnce(schedule.id);
+      try {
+        await vi.waitFor(async () => {
+          const running = (await service.inspect(schedule.id)).runs[0];
+          expect(running?.agentId).toBeTruthy();
+          expect(manager.getRunOutcome(running!.agentId!)).toMatchObject({
+            type: "uncertain",
+            runId: running!.id,
+          });
+        });
+        expect((await service.inspect(schedule.id)).runs[0]?.status).toBe("running");
+        expect(archiveWorkspace).not.toHaveBeenCalled();
+        await expect(service.delete(schedule.id)).rejects.toThrow("current run");
+        await service.pauseForRestart();
+        const agents = await manager.quiesceForRestart();
+        await completion;
+        const schedules = await service.snapshotForRestart();
+        expect(schedules.runs).toHaveLength(1);
+        const run = schedules.runs[0]!;
+        const retained = agents.agents.find((entry) => entry.record.id === run.agentId)!;
+        expect(retained).toMatchObject({ continue: true, runId: run.logicalRunId });
+        expect(retained.inputs).toHaveLength(1);
+        expect(retained.inputs[0]?.id).toBe(run.runId);
+        const restoredManager = new AgentManager({
+          logger,
+          registry: agentStorage,
+          clients: { codex: createCheckpointAgentClient() },
+        });
+        const restored = createScheduleService({
+          paseoHome: tempDir,
+          logger,
+          agentManager: restoredManager,
+          agentStorage,
+          providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+          now: () => now,
+          archiveWorkspace,
+        });
+        try {
+          restored.restoreAfterRestart(schedules);
+          await restoredManager.installRestartCheckpoint(agents);
+          await restoredManager.resumeRestartCheckpoint(agents, () =>
+            restored.resumeRestoredRuns(),
+          );
+          await vi.waitFor(async () =>
+            expect((await restored.inspect(schedule.id)).runs).toEqual([
+              expect.objectContaining({
+                id: run.runId,
+                status: "succeeded",
+                output: "partial-outputlate-close-outputcontinued-output",
+              }),
+            ]),
+          );
+          expect(await restored.snapshotForRestart()).toEqual({ runs: [] });
+          expect(archiveWorkspace).toHaveBeenCalledTimes(targetType === "new-agent" ? 1 : 0);
+        } finally {
+          await restored.stop();
+          await restoredManager.quiesceForRestart();
+        }
+      } finally {
+        await service.pauseForRestart();
+        await manager.quiesceForRestart();
+        await completion;
+      }
+    },
+  );
+
+  test("deletion retains an active run until its outcome is durable, then permits checkpointing", async () => {
+    const started = Promise.withResolvers<void>();
+    const finished = Promise.withResolvers<ScheduleExecutionResult>();
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner: async () => {
+        started.resolve();
+        return finished.promise;
+      },
+    });
+    const schedule = await service.create({
+      prompt: "finish before deleting",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+    const completion = service.runOnce(schedule.id);
+    try {
+      await started.promise;
+      await expect(service.delete(schedule.id)).rejects.toThrow("current run");
+      expect((await service.inspect(schedule.id)).runs[0]?.status).toBe("running");
+    } finally {
+      finished.resolve({ agentId: null, output: "completed once" });
+      await completion;
+    }
+    expect((await service.inspect(schedule.id)).runs[0]).toMatchObject({
+      status: "succeeded",
+      output: "completed once",
+    });
+    await service.delete(schedule.id);
+    expect(await service.list()).toEqual([]);
+    expect(await service.snapshotForRestart()).toEqual({ runs: [] });
+  });
+
+  test("a stale schedule read after deletion cannot create an execution or orphan settlement", async () => {
+    const read = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const runner = vi.fn(async () => ({ agentId: null, output: "must not run" }));
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner,
+    });
+    const schedule = await service.create({
+      prompt: "deleted before dispatch",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+    const originalGet = ScheduleStore.prototype.get;
+    let held = false;
+    const get = vi.spyOn(ScheduleStore.prototype, "get").mockImplementation(async function (
+      this: ScheduleStore,
+      id: string,
+    ) {
+      const current = await originalGet.call(this, id);
+      if (id === schedule.id && !held) {
+        held = true;
+        read.resolve();
+        await release.promise;
+      }
+      return current;
+    });
+    const completion = service.runOnce(schedule.id);
+    const rejected = expect(completion).rejects.toThrow("not found");
+    try {
+      await read.promise;
+      await service.delete(schedule.id);
+      release.resolve();
+      await rejected;
+      expect(runner).not.toHaveBeenCalled();
+      expect(await service.snapshotForRestart()).toEqual({ runs: [] });
+    } finally {
+      release.resolve();
+      get.mockRestore();
+    }
+  });
+
+  test("deletion excludes new admissions and releases its lease after failure", async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const runner = vi.fn(async () => ({ agentId: null, output: "after failed delete" }));
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner,
+    });
+    const schedule = await service.create({
+      prompt: "retain on failed delete",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+    const remove = vi.spyOn(ScheduleStore.prototype, "delete").mockImplementationOnce(async () => {
+      entered.resolve();
+      await release.promise;
+      throw new Error("delete write denied");
+    });
+    const deletion = service.delete(schedule.id);
+    const rejected = expect(deletion).rejects.toThrow("delete write denied");
+    try {
+      await entered.promise;
+      await expect(service.delete(schedule.id)).rejects.toThrow("being deleted");
+      await expect(service.runOnce(schedule.id)).rejects.toThrow("being deleted");
+      expect(runner).not.toHaveBeenCalled();
+      expect((await service.inspect(schedule.id)).runs).toEqual([]);
+    } finally {
+      release.resolve();
+      await rejected;
+      remove.mockRestore();
+    }
+    await service.runOnce(schedule.id);
+    expect(runner).toHaveBeenCalledTimes(1);
+    await service.delete(schedule.id);
+    expect(await service.snapshotForRestart()).toEqual({ runs: [] });
   });
 
   test("terminal bookkeeping retry never advances cadence twice after a committed outcome", async () => {
@@ -3984,6 +4227,7 @@ describe("ScheduleService", () => {
     read.mockRestore();
     expect(failedAfterCommit).toBe(true);
     await expect(service.runOnce(created.id)).rejects.toThrow("already running");
+    await expect(service.delete(created.id)).rejects.toThrow("completion is still being saved");
     expect(await service.snapshotForRestart()).toEqual({ runs: [] });
     expect(await service.inspect(created.id)).toEqual(committed);
     await service.stop();

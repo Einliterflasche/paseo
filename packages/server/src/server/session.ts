@@ -4779,7 +4779,8 @@ export class Session {
       return this.isProviderVisibleToClient(payload.provider) ? payload : null;
     }
 
-    const record = await this.agentStorage.get(agentId);
+    const record =
+      (await this.agentStorage.get(agentId)) ?? this.agentManager.getRetainedAgentRecord(agentId);
     if (!record || record.internal) {
       return null;
     }
@@ -7756,12 +7757,16 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "agent.fork_context.request" }>,
   ): Promise<void> {
     try {
-      const snapshot = await ensureAgentLoaded(msg.agentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-      });
-      const agentPayload = await this.buildAgentPayload(snapshot);
+      const agentPayload = this.agentManager.hasInstalledHistory(msg.agentId)
+        ? await this.getAgentPayloadById(msg.agentId)
+        : await this.buildAgentPayload(
+            await ensureAgentLoaded(msg.agentId, {
+              agentManager: this.agentManager,
+              agentStorage: this.agentStorage,
+              logger: this.sessionLogger,
+            }),
+          );
+      if (!agentPayload) throw new Error(`Agent not found: ${msg.agentId}`);
       const timeline = this.agentManager.fetchTimeline(msg.agentId, {
         direction: "tail",
         limit: 0,
@@ -7773,7 +7778,7 @@ export class Session {
           : null,
         boundaryMessageId: msg.boundaryMessageId,
         agentTitle: agentPayload.title,
-        cwd: snapshot.cwd,
+        cwd: agentPayload.cwd,
       });
 
       this.emit({

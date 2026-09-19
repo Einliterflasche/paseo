@@ -1,4 +1,5 @@
 import { AgentNotFoundError } from "./agent-not-found-error.js";
+import { AgentTurnStartUncertainError } from "./agent-turn-start-uncertain-error.js";
 import { AgentProbe } from "./agent-probe.js";
 import type { PluginLifecycle } from "../plugins/lifecycle/index.js";
 import { describeHookAgent, publishAgentStream } from "../plugins/lifecycle/index.js";
@@ -963,16 +964,22 @@ export class AgentManager {
     return snapshot;
   }
 
+  private retainRecoveryEntry(entry: AgentCheckpoint["agents"][number]): void {
+    if (this.recoveryInventory.has(entry.record.id)) return;
+    // Legacy autonomous continuations have neither an input nor a logical ID.
+    // Normalize once, before finish watches attach, and persist that identity in successors.
+    const runId = entry.runId ?? entry.inputs[0]?.id ?? randomUUID();
+    this.recoveryInventory.set(entry.record.id, { ...entry, runId });
+    this.runs.restoreInputs(entry.record.id, entry.inputs, runId);
+    if (entry.continue) this.suspendedForRestart.set(entry.record.id, entry.inputs);
+  }
+
   async installRestartCheckpoint(snapshot: AgentCheckpoint): Promise<void> {
     await this.admissions.freeze();
     // Register the complete inventory before fallible persistence; capture cannot drop an
     // unstarted agent after an installation error. Existing owned histories are never replaced.
     for (const entry of snapshot.agents) {
-      if (!this.recoveryInventory.has(entry.record.id)) {
-        this.recoveryInventory.set(entry.record.id, entry);
-        this.runs.restoreInputs(entry.record.id, entry.inputs, entry.runId);
-        if (entry.continue) this.suspendedForRestart.set(entry.record.id, entry.inputs);
-      }
+      this.retainRecoveryEntry(entry);
     }
     for (const [id, timeline] of Object.entries(snapshot.timelines)) {
       if (!this.timelineStore.has(id)) this.timelineStore.restoreSnapshot(id, timeline);
@@ -989,10 +996,7 @@ export class AgentManager {
   ): Promise<void> {
     await this.admissions.freeze();
     try {
-      for (const entry of snapshot.agents) {
-        if (!this.recoveryInventory.has(entry.record.id))
-          this.recoveryInventory.set(entry.record.id, entry);
-      }
+      for (const entry of snapshot.agents) this.retainRecoveryEntry(entry);
       await this.retireIdleRestartSessions(snapshot);
       for (const entry of snapshot.agents.filter((candidate) => candidate.continue)) {
         const { record } = entry;
@@ -1042,7 +1046,11 @@ export class AgentManager {
           inputs[0]?.options ? { ...inputs[0].options, clientMessageId: undefined } : undefined,
           (operation) => Promise.resolve().then(operation),
         );
-        this.runs.restoreInputs(record.id, inputs, entry.runId);
+        this.runs.restoreInputs(
+          record.id,
+          inputs,
+          entry.runId ?? this.recoveryInventory.get(record.id)!.runId,
+        );
         await iterator.next();
         this.suspendedForRestart.delete(record.id);
         this.emitState(this.requireAgent(record.id));
@@ -1111,7 +1119,7 @@ export class AgentManager {
       resolveOutcome = fulfill;
     });
     const unsubscribe = this.runs.subscribeOutcome(agentId, (outcome) => {
-      if (outcome.runId !== runId) return;
+      if (outcome.runId !== runId || outcome.type === "uncertain") return;
       unsubscribe();
       resolveOutcome(outcome);
     });
@@ -1120,6 +1128,7 @@ export class AgentManager {
       await Promise.race([completion, this.waitForAgentRunStart(agentId)]);
       return { completion };
     } catch (error) {
+      if (error instanceof AgentTurnStartUncertainError) return { completion };
       unsubscribe();
       throw error;
     }
@@ -1618,6 +1627,11 @@ export class AgentManager {
 
   hasInstalledHistory(id: string): boolean {
     return this.timelineStore.has(id) && (this.agents.has(id) || this.recoveryInventory.has(id));
+  }
+
+  getRetainedAgentRecord(id: string): StoredAgentRecord | undefined {
+    // Checkpoint history is installed before fallible metadata persistence.
+    return this.recoveryInventory.get(id)?.record;
   }
 
   private requireRetainedAgent(id: string, publicOnly = false): void {
@@ -2790,22 +2804,29 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): Promise<AgentRunResult> {
+    const before = this.timelineStore.fetch(agentId, { limit: 1 });
     const events = this.streamAgent(agentId, prompt, options);
+    const runId = this.runs.getLogicalId(agentId)!;
     const timeline: AgentTimelineItem[] = [];
     let finalText = "";
     let usage: AgentUsage | undefined;
     let canceled = false;
 
-    for await (const event of events) {
-      if (event.type === "timeline") {
-        timeline.push(event.item);
-      } else if (event.type === "turn_completed") {
-        usage = event.usage;
-      } else if (event.type === "turn_failed") {
-        throw new Error(this.formatTurnFailedMessage(event));
-      } else if (event.type === "turn_canceled") {
-        canceled = true;
+    try {
+      for await (const event of events) {
+        if (event.type === "timeline") {
+          timeline.push(event.item);
+        } else if (event.type === "turn_completed") {
+          usage = event.usage;
+        } else if (event.type === "turn_failed") {
+          throw new Error(this.formatTurnFailedMessage(event));
+        } else if (event.type === "turn_canceled") {
+          canceled = true;
+        }
       }
+    } catch (error) {
+      if (!(error instanceof AgentTurnStartUncertainError)) throw error;
+      return this.completeUncertainRun(agentId, runId, before.epoch, before.window.nextSeq);
     }
 
     if (canceled && this.isRestartSuspended(agentId)) throw new AgentRestartSuspendedError(agentId);
@@ -2823,6 +2844,56 @@ export class AgentManager {
       timeline,
       canceled,
     };
+  }
+
+  /** An uncertain receipt is not a terminal result and never holds command admission. */
+  private completeUncertainRun(
+    agentId: string,
+    runId: string,
+    epoch: string,
+    firstSeq: number,
+  ): Promise<AgentRunResult> {
+    const sessionId = this.requireAgent(agentId).persistence?.sessionId;
+    if (!sessionId)
+      return Promise.reject(
+        new Error(`Agent ${agentId} has no native session for its uncertain run`),
+      );
+    return new Promise((resolveResult, reject) => {
+      const observe = (outcome: AgentRunOutcome) => {
+        if (outcome.runId !== runId || outcome.type === "uncertain") return;
+        unsubscribe();
+        if (outcome.type === "suspended") {
+          reject(new AgentRestartSuspendedError(agentId));
+          return;
+        }
+        if (outcome.type === "failed") {
+          reject(new Error(outcome.error));
+          return;
+        }
+        try {
+          // Read during terminal publication, before another accepted run can add
+          // rows. Store fetches retain committed lazy items without expanding logs.
+          const page = this.timelineStore.fetch(agentId, {
+            direction: "after",
+            cursor: { epoch, seq: firstSeq - 1 },
+            limit: 0,
+          });
+          const timeline = page.epoch === epoch ? page.rows.map((row) => row.item) : [];
+          resolveResult({
+            sessionId,
+            timeline,
+            finalText: this.getLastAssistantMessageFromTimeline(timeline) ?? "",
+            canceled: outcome.type === "user_canceled",
+            usage: this.getAgent(agentId)?.lastUsage,
+          });
+        } catch (error) {
+          reject(error);
+        }
+      };
+      const unsubscribe = this.runs.subscribeOutcome(agentId, observe);
+      const previous = this.runs.getOutcome(agentId);
+      if (previous) observe(previous);
+    });
   }
 
   /**
@@ -2940,19 +3011,21 @@ export class AgentManager {
       }
       agent.pendingReplacement = false;
       const errorMsg = error instanceof Error ? error.message : "Failed to start turn";
-      if (!this.admissions.isOpen) {
+      if (!this.admissions.isOpen || error instanceof AgentTurnStartUncertainError) {
         // A rejected handoff does not prove the provider did no work. Preserve and
         // ingest everything it already emitted, and keep the attempt owned until
         // an actual terminal or certified close settles it. A synthetic failure
         // here would discard staged output and hide a subsequent real completion.
         pendingRun.start = { status: "failed", error: errorMsg };
         this.uncertainStarts.add(agentId);
+        this.recordPendingSubmittedPrompt(agent, prompt, options, pendingRun);
         for (const event of pendingRun.stagedEvents.splice(0))
           this.enqueueSessionEvent(agentId, event);
         await this.drainSessionEvents(agentId);
         const outcome = this.runs.getOutcome(agentId);
         if (!outcome || outcome.type === "uncertain" || outcome.type === "suspended")
           this.publishRunOutcome({ type: "uncertain", agentId, error: errorMsg });
+        this.emitState(agent);
         throw error;
       }
       pendingRun.start = { status: "failed", error: errorMsg };
@@ -2965,6 +3038,31 @@ export class AgentManager {
       this.runs.settleForegroundRun(agentId, pendingRun.token);
       throw error;
     }
+  }
+
+  private recordPendingSubmittedPrompt(
+    agent: ActiveManagedAgent,
+    prompt: AgentPromptInput,
+    options: AgentRunOptions | undefined,
+    pendingRun: PendingForegroundRun,
+    turnId?: string,
+  ): void {
+    if (!options?.clientMessageId) return;
+    const echoIndex = pendingRun.stagedEvents.findIndex(
+      (event) =>
+        event.type === "timeline" &&
+        event.item.type === "user_message" &&
+        event.item.clientMessageId === options.clientMessageId,
+    );
+    const echo = echoIndex >= 0 ? pendingRun.stagedEvents.splice(echoIndex, 1)[0] : undefined;
+    this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, {
+      messageId: options.clientMessageId,
+      turnId,
+      providerMessageId:
+        echo?.type === "timeline" && echo.item.type === "user_message"
+          ? echo.item.messageId
+          : undefined,
+    });
   }
 
   streamAgent(
@@ -3048,28 +3146,11 @@ export class AgentManager {
         { type: "turn_started", provider: agent.provider, turnId },
         { timestamp: turnStartedAt.toISOString() },
       );
-      const stagedSubmittedPromptEcho = options?.clientMessageId
-        ? pendingRun.stagedEvents.find(
-            (event): event is Extract<AgentStreamEvent, { type: "timeline" }> =>
-              event.type === "timeline" &&
-              event.item.type === "user_message" &&
-              event.item.clientMessageId === options.clientMessageId,
-          )
-        : undefined;
-      if (options?.clientMessageId) {
-        this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, {
-          messageId: options.clientMessageId,
-          turnId,
-          providerMessageId:
-            stagedSubmittedPromptEcho?.item.type === "user_message"
-              ? stagedSubmittedPromptEcho.item.messageId
-              : undefined,
-        });
-      }
+      this.recordPendingSubmittedPrompt(agent, prompt, options, pendingRun, turnId);
       for (const stagedEvent of pendingRun.stagedEvents.splice(0)) {
         const isAcceptedTurnStart =
           stagedEvent.type === "turn_started" && getAgentStreamEventTurnId(stagedEvent) === turnId;
-        if (isAcceptedTurnStart || stagedEvent === stagedSubmittedPromptEcho) {
+        if (isAcceptedTurnStart) {
           continue;
         }
         this.enqueueSessionEvent(agent.id, stagedEvent);
@@ -3395,7 +3476,9 @@ export class AgentManager {
 
     const pendingRun = this.runs.getPendingRun(agentId);
     if (
-      (snapshot.lifecycle === "running" || pendingRun?.start.status === "started") &&
+      (snapshot.lifecycle === "running" ||
+        pendingRun?.start.status === "started" ||
+        this.uncertainStarts.has(agentId)) &&
       !snapshot.pendingReplacement
     ) {
       return;
@@ -3462,7 +3545,9 @@ export class AgentManager {
 
         const currentPendingRun = this.runs.getPendingRun(agentId);
         if (
-          (current.lifecycle === "running" || currentPendingRun?.start.status === "started") &&
+          (current.lifecycle === "running" ||
+            currentPendingRun?.start.status === "started" ||
+            this.uncertainStarts.has(agentId)) &&
           !current.pendingReplacement
         ) {
           finishOk();

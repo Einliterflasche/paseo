@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentManager } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
+import { AgentTurnStartUncertainError } from "./agent-turn-start-uncertain-error.js";
 import {
   drainFinishNotificationWatches,
   formatSystemNotificationPrompt,
@@ -15,6 +16,7 @@ import {
   restoreFinishNotificationWatch,
   retryPendingFinishNotifications,
   setupFinishNotification,
+  startWithFinishNotification,
   snapshotFinishNotificationWatches,
   waitForAgentRunStartWithTimeout,
 } from "./agent-prompt.js";
@@ -668,6 +670,35 @@ describe("finish notification restart recovery", () => {
       },
     };
   }
+
+  test("uncertain handoff retains the finish watch until the real terminal outcome", async () => {
+    const prompts: string[] = [];
+    const scenario = buildManagerAndStorage({
+      lastAssistantMessage: "completed despite timeout",
+      onPrompt: (prompt) => prompts.push(prompt),
+    });
+    await expect(
+      startWithFinishNotification(
+        {
+          agentManager: scenario.agentManager,
+          agentStorage: scenario.agentStorage,
+          childAgentId: "child-agent",
+          callerAgentId: "caller-agent",
+          runId: "logical-child-run",
+          logger: createTestLogger(),
+        },
+        async () => {
+          throw new AgentTurnStartUncertainError(new Error("native start receipt timed out"));
+        },
+      ),
+    ).rejects.toBeInstanceOf(AgentTurnStartUncertainError);
+    expect(snapshotFinishNotificationWatches(scenario.agentManager)).toHaveLength(1);
+    scenario.complete();
+    await drainFinishNotificationWatches(scenario.agentManager);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain("completed despite timeout");
+    expect(snapshotFinishNotificationWatches(scenario.agentManager)).toEqual([]);
+  });
 
   test("draining before a snapshot waits for an already-accepted delivery, so it is never captured for redelivery", async () => {
     const prompts: Array<{ prompt: string; messageId: string | undefined }> = [];

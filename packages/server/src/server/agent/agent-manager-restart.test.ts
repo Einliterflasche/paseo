@@ -10,6 +10,15 @@ import { createTestLogger } from "../../test-utils/test-logger.js";
 import { createCheckpointAgentClient } from "../test-utils/checkpoint-agent-client.js";
 import { RestartInProgressError } from "../restart/restart-errors.js";
 import type { AgentClient, AgentSession, AgentStreamEvent } from "./agent-sdk-types.js";
+import { AgentTurnStartUncertainError } from "./agent-turn-start-uncertain-error.js";
+import { CodexAppServerAgentSession } from "./providers/codex-app-server-agent.js";
+import { createFakeCodexAppServer } from "./providers/codex/test-utils/fake-app-server.js";
+import {
+  drainFinishNotificationWatches,
+  restoreFinishNotificationWatch,
+  retryPendingFinishNotifications,
+  snapshotFinishNotificationWatches,
+} from "./agent-prompt.js";
 
 async function manager(home: string, client: AgentClient = createCheckpointAgentClient()) {
   const logger = createTestLogger();
@@ -17,6 +26,249 @@ async function manager(home: string, client: AgentClient = createCheckpointAgent
   await registry.initialize();
   return new AgentManager({ clients: { codex: client }, registry, logger });
 }
+
+test.each(["no native events", "staged output", "late completion", "transport loss"] as const)(
+  "ordinary written Codex start timeout retains its owner and input through %s",
+  async (mode) => {
+    const home = await mkdtemp(join(tmpdir(), "paseo-codex-uncertain-start-"));
+    const response = recoveryGate();
+    const codex = createFakeCodexAppServer({
+      "turn/start": async () => {
+        await response.promise;
+        return {};
+      },
+    });
+    const client = createCheckpointAgentClient();
+    client.createSession = async (config) => {
+      const session = new CodexAppServerAgentSession(
+        config,
+        null,
+        createTestLogger(),
+        async () => codex.child,
+        { turnStartTimeoutMs: 10 },
+      );
+      await session.connect();
+      return session;
+    };
+    const instance = await manager(home, client);
+    const agent = await instance.createAgent(
+      { provider: "codex", cwd: home, model: "gpt-5.4", modeId: "auto" },
+      undefined,
+      { workspaceId: "workspace" },
+    );
+    const running = instance.streamAgent(agent.id, "keep accepted input", {
+      clientMessageId: "written-input",
+    });
+    const rejected = expect(running.next()).rejects.toBeInstanceOf(AgentTurnStartUncertainError);
+    try {
+      await codex.waitForRequest("turn/start");
+      if (mode === "staged output") {
+        codex.startsTurn({ threadId: "thread-1", turnId: "native-start" });
+        codex.says({ threadId: "thread-1", itemId: "staged-output", text: "before timeout" });
+      }
+      if (mode === "transport loss") codex.disconnect();
+      await rejected;
+      expect(instance.recoveryPhase).toBe("running");
+      expect(instance.getRunOutcome(agent.id)).toMatchObject({
+        type: "uncertain",
+        runId: "written-input",
+      });
+      expect(() => instance.streamAgent(agent.id, "unsafe successor")).toThrow(
+        "already has an active run",
+      );
+      if (mode === "late completion") {
+        const completed = recoveryGate();
+        const unsubscribe = instance.subscribeRunOutcome(agent.id, (outcome) => {
+          if (outcome.type === "completed") completed.resolve();
+        });
+        codex.startsTurn({ threadId: "thread-1", turnId: "native-start" });
+        codex.says({
+          threadId: "thread-1",
+          itemId: "completed-output",
+          text: "completed after timeout",
+        });
+        codex.completeTurn({ threadId: "thread-1", turnId: "native-start" });
+        await completed.promise;
+        unsubscribe();
+        expect(instance.getRunOutcome(agent.id)).toMatchObject({
+          type: "completed",
+          runId: "written-input",
+        });
+      }
+      const saved = await instance.quiesceForRestart();
+      expect(saved.agents[0]).toMatchObject({
+        runId: "written-input",
+        continue: mode !== "late completion",
+      });
+      expect(saved.agents[0]!.inputs.map((input) => input.id)).toEqual(
+        mode === "late completion" ? [] : ["written-input"],
+      );
+      const items = saved.timelines[agent.id]!.rows.map((row) => row.item);
+      expect(items.filter((item) => item.type === "user_message")).toMatchObject([
+        { text: "keep accepted input", clientMessageId: "written-input" },
+      ]);
+      let expectedOutput: string[] = [];
+      if (mode === "staged output") expectedOutput = ["before timeout"];
+      if (mode === "late completion") expectedOutput = ["completed after timeout"];
+      expect(
+        items.filter((item) => item.type === "assistant_message").map((item) => item.text),
+      ).toEqual(expectedOutput);
+      expect(codex.requests().filter((request) => request.method === "turn/start")).toHaveLength(1);
+      codex.assertNoErrors();
+    } finally {
+      response.resolve();
+      await instance.quiesceForRestart();
+      await running.return(undefined);
+    }
+  },
+);
+
+test("legacy autonomous continuation keeps one logical identity through finish delivery", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-legacy-finish-identity-"));
+  const before = await manager(home);
+  const caller = await before.createAgent({ provider: "codex", cwd: home }, undefined, {
+    workspaceId: "workspace",
+  });
+  const child = await before.createAgent({ provider: "codex", cwd: home }, undefined, {
+    workspaceId: "workspace",
+  });
+  await before.streamAgent(child.id, "legacy autonomous work").next();
+  const saved = await before.quiesceForRestart();
+  const entry = saved.agents.find((candidate) => candidate.record.id === child.id)!;
+  entry.inputs = [];
+  delete entry.runId;
+  const client = createCheckpointAgentClient();
+  const resume = client.resumeSession.bind(client);
+  const delivered: string[] = [];
+  const callerSessionId = saved.agents.find((candidate) => candidate.record.id === caller.id)!
+    .record.persistence!.sessionId;
+  client.resumeSession = async (handle, ...args) => {
+    const session = await resume(handle, ...args);
+    if (handle.sessionId === callerSessionId) {
+      const start = session.startTurn.bind(session);
+      session.startTurn = (prompt, options) => {
+        delivered.push(typeof prompt === "string" ? prompt : JSON.stringify(prompt));
+        return start(prompt, options);
+      };
+    }
+    return session;
+  };
+  const after = await manager(home, client);
+  await after.installRestartCheckpoint(saved);
+  const originalIdentity = after.getRunIdentity(child.id)!;
+  const registry = new AgentStorage(join(home, "agents"), createTestLogger());
+  await registry.initialize();
+  const completed = after.waitForRunOutcome(child.id, originalIdentity);
+  await after.resumeRestartCheckpoint(saved, () =>
+    restoreFinishNotificationWatch(
+      { agentManager: after, agentStorage: registry, logger: createTestLogger() },
+      {
+        watchId: "legacy-finish-watch",
+        childAgentId: child.id,
+        callerAgentId: caller.id,
+        requireParentOwnership: false,
+        hasSeenRunning: true,
+        notifiedPermissionRequestIds: [],
+        pending: [],
+      },
+    ),
+  );
+  expect(await completed).toMatchObject({ type: "completed", runId: originalIdentity });
+  retryPendingFinishNotifications(after);
+  await drainFinishNotificationWatches(after);
+  expect(snapshotFinishNotificationWatches(after)).toEqual([]);
+  expect(delivered).toHaveLength(1);
+  expect(delivered[0]).toContain("continued-output");
+  retryPendingFinishNotifications(after);
+  await drainFinishNotificationWatches(after);
+  expect(delivered).toHaveLength(1);
+  const successor = await after.quiesceForRestart();
+  expect(successor.agents.find((candidate) => candidate.record.id === child.id)).toMatchObject({
+    runId: originalIdentity,
+    continue: false,
+  });
+});
+
+test.each(["completed", "suspended"] as const)(
+  "blocking run retains uncertain Codex handoff until %s without holding admission",
+  async (terminal) => {
+    const home = await mkdtemp(join(tmpdir(), "paseo-codex-uncertain-result-"));
+    const response = recoveryGate();
+    const codex = createFakeCodexAppServer({
+      "turn/start": async () => {
+        await response.promise;
+        return {};
+      },
+    });
+    const client = createCheckpointAgentClient();
+    client.createSession = async (config) => {
+      const session = new CodexAppServerAgentSession(
+        config,
+        null,
+        createTestLogger(),
+        async () => codex.child,
+        { turnStartTimeoutMs: 10 },
+      );
+      await session.connect();
+      return session;
+    };
+    const instance = await manager(home, client);
+    const agent = await instance.createAgent(
+      { provider: "codex", cwd: home, model: "gpt-5.4", modeId: "auto" },
+      undefined,
+      { workspaceId: "workspace" },
+    );
+    const uncertain = recoveryGate();
+    const unsubscribe = instance.subscribeRunOutcome(agent.id, (outcome) => {
+      if (outcome.type === "uncertain") uncertain.resolve();
+    });
+    const result = instance.runAgent(agent.id, "retained result", {
+      clientMessageId: "uncertain-result",
+    });
+    const observedResult = result.then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+    const handoff = instance.waitForAgentRunStart(agent.id);
+    try {
+      await codex.waitForRequest("turn/start");
+      codex.says({ threadId: "thread-1", itemId: "staged-result", text: "staged result" });
+      await uncertain.promise;
+      await handoff;
+      await instance.freezeRestartAdmissions();
+      if (terminal === "completed") {
+        codex.startsTurn({ threadId: "thread-1", turnId: "native-result" });
+        codex.says({ threadId: "thread-1", itemId: "final-result", text: "final result" });
+        codex.completeTurn({ threadId: "thread-1", turnId: "native-result" });
+        const completed = await result;
+        expect(completed.finalText).toContain("final result");
+        expect(
+          completed.timeline
+            .filter((item) => item.type === "assistant_message")
+            .map((item) => item.text),
+        ).toEqual(["staged result", "final result"]);
+        for (const item of completed.timeline)
+          expect(instance.getTimeline(agent.id)).toContain(item);
+      } else {
+        const saved = await instance.quiesceForRestart();
+        expect(await observedResult).toMatchObject({
+          error: { name: "AgentRestartSuspendedError" },
+        });
+        expect(saved.agents[0]).toMatchObject({
+          continue: true,
+          runId: "uncertain-result",
+          inputs: [{ id: "uncertain-result" }],
+        });
+      }
+      expect(codex.requests().filter((request) => request.method === "turn/start")).toHaveLength(1);
+    } finally {
+      unsubscribe();
+      response.resolve();
+      await instance.quiesceForRestart();
+      await observedResult;
+    }
+  },
+);
 
 test("failed durable completion keeps admissions closed after restoring history", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-recovery-completion-"));

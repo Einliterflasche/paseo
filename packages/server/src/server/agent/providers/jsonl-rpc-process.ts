@@ -3,7 +3,11 @@ import type { Logger } from "pino";
 
 import { spawnProcess } from "../../../utils/spawn.js";
 import { withTimeout } from "../../../utils/promise-timeout.js";
-import { terminateWithTreeKill, type ProcessTerminator } from "../../../utils/tree-kill.js";
+import {
+  prepareProcessTreeTermination,
+  terminateWithTreeKill,
+  type ProcessTerminator,
+} from "../../../utils/tree-kill.js";
 import { JsonlFrameDecoder } from "./jsonl-frame-decoder.js";
 export { supportsJsonlRpcProtocolV2 } from "./jsonl-frame-decoder.js";
 
@@ -230,6 +234,11 @@ export class JsonlRpcProcess {
     // notification can precede final stdout; close is the pipe-drain boundary.
     this.disposed = true;
     this.shutdownError = error;
+    const terminate = this.options.terminateProcess ?? terminateWithTreeKill;
+    if (terminate === terminateWithTreeKill)
+      await prepareProcessTreeTermination(this.child, {
+        timeoutMs: GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+      });
     for (const pending of this.pending.values()) {
       if (pending.timer) clearTimeout(pending.timer);
       pending.timer = null;
@@ -239,7 +248,7 @@ export class JsonlRpcProcess {
     } catch {
       // Ignore cleanup races.
     }
-    const result = await (this.options.terminateProcess ?? terminateWithTreeKill)(this.child, {
+    const result = await terminate(this.child, {
       gracefulTimeoutMs: GRACEFUL_SHUTDOWN_TIMEOUT_MS,
       forceTimeoutMs: FORCE_SHUTDOWN_TIMEOUT_MS,
       onForceSignal: () => {

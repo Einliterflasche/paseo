@@ -8,7 +8,11 @@ import type { Logger } from "pino";
 
 import { findExecutable } from "../../../../executable-resolution/executable-resolution.js";
 import { spawnProcess, type SpawnProcessOptions } from "../../../../utils/spawn.js";
-import { terminateWithTreeKill, type ProcessTerminator } from "../../../../utils/tree-kill.js";
+import {
+  prepareProcessTreeTermination,
+  terminateWithTreeKill,
+  type ProcessTerminator,
+} from "../../../../utils/tree-kill.js";
 import type { ManagedProcessRegistry } from "../../../managed-processes/managed-processes.js";
 import {
   createProviderEnvSpec,
@@ -32,6 +36,7 @@ const OPENCODE_SERVER_FORCE_SHUTDOWN_TIMEOUT_MS = 1_000;
 export interface OpenCodeServerAcquisition {
   server: { port: number; url: string };
   events: OpenCodeEventSource;
+  prepareRelease: () => Promise<void>;
   release: () => Promise<void>;
 }
 
@@ -51,6 +56,7 @@ export interface OpenCodeServerGeneration {
   retired: boolean;
   ready: Promise<void>;
   events: OpenCodeEventConsumer;
+  stopPromise?: Promise<void>;
   managedProcessId?: string;
   managedProcessRecord?: Promise<{ id: string } | null>;
 }
@@ -223,6 +229,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     return {
       server: { port: server.port, url: server.url },
       events: server.events,
+      prepareRelease: () => this.prepareServerRelease(server),
       release: async () => {
         if (releasePromise) {
           return releasePromise;
@@ -462,7 +469,10 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
           "OpenCode server generation exited",
         );
         resolveProcessExit(new Error(`OpenCode server exited with code ${code}`));
-        this.removeManagedServerRecord(server);
+        // The leader exiting does not certify that its native tool descendants
+        // stopped. Retain the generation and its process record until tree stop.
+        server.retired = true;
+        this.retiredServers.add(server);
         if (!started) {
           failStartup(
             new Error(buildStartupErrorMessage(`OpenCode server exited with code ${code}`)),
@@ -470,11 +480,6 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
         }
         if (this.currentServer?.process === serverProcess) {
           this.currentServer = null;
-        }
-        for (const retired of Array.from(this.retiredServers)) {
-          if (retired.process === serverProcess) {
-            this.retiredServers.delete(retired);
-          }
         }
       });
     });
@@ -526,14 +531,27 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     await Promise.all(cleanup);
   }
 
-  private async killServer(server: OpenCodeServerGeneration): Promise<void> {
-    if (
-      (server.process.exitCode !== null && server.process.exitCode !== undefined) ||
-      (server.process.signalCode !== null && server.process.signalCode !== undefined)
-    ) {
-      await server.events.close();
-      return;
-    }
+  private async prepareServerRelease(server: OpenCodeServerGeneration): Promise<void> {
+    // Injected terminators own their process-inspection contract (tests use
+    // synthetic processes). The production terminator retains the actual tree.
+    if (this.terminateProcess !== terminateWithTreeKill) return;
+    await prepareProcessTreeTermination(server.process, {
+      timeoutMs: OPENCODE_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+    });
+  }
+
+  private killServer(server: OpenCodeServerGeneration): Promise<void> {
+    if (server.stopPromise) return server.stopPromise;
+    const attempt = this.stopServer(server);
+    server.stopPromise = attempt;
+    void attempt.catch(() => {
+      if (server.stopPromise === attempt) server.stopPromise = undefined;
+    });
+    return attempt;
+  }
+
+  private async stopServer(server: OpenCodeServerGeneration): Promise<void> {
+    await this.prepareServerRelease(server);
     const result = await this.terminateProcess(server.process, {
       gracefulTimeoutMs: OPENCODE_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
       forceTimeoutMs: OPENCODE_SERVER_FORCE_SHUTDOWN_TIMEOUT_MS,

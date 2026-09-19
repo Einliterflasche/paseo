@@ -57,7 +57,11 @@ describe("ACP actual SDK output drain", () => {
         // An interrupt waiting for a native prompt reply must also settle once
         // physical termination and the final SDK output drain are certified.
         const interruption = mode === "unanswered" ? session.interrupt() : Promise.resolve();
-        await Promise.all([session.close(), interruption]);
+        if (mode === "already-dead") {
+          await expect(session.close()).rejects.toThrow("descendant ownership was inspected");
+        } else {
+          await Promise.all([session.close(), interruption]);
+        }
         const text = events.flatMap((event) =>
           event.type === "timeline" && event.item.type === "assistant_message"
             ? [event.item.text]
@@ -81,10 +85,14 @@ describe("ACP actual SDK output drain", () => {
           turnId,
         });
         if (mode === "failed") expect(terminal[0]).toMatchObject({ error: "native failure" });
-        await session.close();
+        if (mode === "already-dead")
+          await expect(session.close()).rejects.toThrow("descendant ownership was inspected");
+        else await session.close();
       } finally {
         unsubscribe();
-        await session.close();
+        if (mode === "already-dead")
+          await expect(session.close()).rejects.toThrow("descendant ownership was inspected");
+        else await session.close();
       }
     },
   );

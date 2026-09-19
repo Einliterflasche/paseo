@@ -31,6 +31,28 @@ afterEach(() => {
 });
 
 describe("OpenCodeServerManager generations", () => {
+  test("leader exit retains its generation until descendant termination is certified", async () => {
+    let confirmed = false;
+    let attempts = 0;
+    const { manager, runtime } = createTestManager([4096], {
+      terminateProcess: async () => {
+        attempts++;
+        return confirmed ? "already-exited" : "kill-timeout";
+      },
+    });
+    const acquisition = await manager.acquireCurrent();
+    runtime.processForPort(4096).exitNormally();
+    expect(await runtime.managedProcesses.list()).toHaveLength(1);
+    await expect(acquisition.release()).rejects.toThrow("did not report exit");
+    expect(attempts).toBe(1);
+    expect(await runtime.managedProcesses.list()).toHaveLength(1);
+
+    confirmed = true;
+    await manager.shutdown();
+    expect(attempts).toBe(2);
+    expect(await runtime.managedProcesses.list()).toEqual([]);
+  });
+
   test("a failed final release retains the generation for a fresh termination attempt", async () => {
     let confirmed = false;
     let attempts = 0;
@@ -381,7 +403,7 @@ describe("OpenCodeServerManager generations", () => {
 });
 
 describe("OpenCodeServerManager managed process ledger", () => {
-  test("records helper server starts and removes the record on process exit", async () => {
+  test("records helper server starts and removes the record after certified shutdown", async () => {
     const { manager, runtime } = createTestManager([4601]);
 
     await manager.acquireCurrent();
@@ -402,6 +424,8 @@ describe("OpenCodeServerManager managed process ledger", () => {
     runtime.processForPort(4601).exitNormally();
     await runtime.settle();
 
+    expect(await runtime.managedProcesses.list()).toHaveLength(1);
+    await manager.shutdown();
     expect(await runtime.managedProcesses.list()).toEqual([]);
   });
 

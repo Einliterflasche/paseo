@@ -1,4 +1,5 @@
 import { ProviderInitializationCleanupError } from "../provider-initialization-cleanup-error.js";
+import { AgentTurnStartUncertainError } from "../agent-turn-start-uncertain-error.js";
 import {
   getAgentStreamEventTurnId,
   type AgentPermissionAction,
@@ -851,6 +852,16 @@ function toCodexMcpConfig(config: McpServerConfig): CodexMcpServerConfig {
 
 function toObjectRecord(value: unknown): Record<string, unknown> | undefined {
   return isRecord(value) ? value : undefined;
+}
+
+function isDefinitiveCodexStartRejection(error: unknown, nativeTurnId: string | null): boolean {
+  // Codex also uses invalid-request (-32600) for runtime failures; it cannot
+  // establish that a dispatched turn did no work.
+  return (
+    nativeTurnId === null &&
+    error instanceof CodexAppServerRpcError &&
+    (error.code === -32700 || error.code === -32601 || error.code === -32602)
+  );
 }
 
 function isDefinitiveCodexSteerRejection(error: unknown): boolean {
@@ -3330,6 +3341,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
   private nextTurnOrdinal = 0;
   private activeForegroundTurnId: string | null = null;
+  private uncertainForegroundStart = false;
   private activeClientMessageId: string | null = null;
   private cachedRuntimeInfo: AgentRuntimeInfo | null = null;
   private serviceTier: "fast" | null = null;
@@ -3561,6 +3573,12 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.connected = false;
     const hasActiveRootTurn = this.activeForegroundTurnId !== null || this.currentTurnId !== null;
     this.clearPendingPermissions({ preservePlanApprovals: !hasActiveRootTurn });
+    // EOF/process loss cannot settle an unacknowledged handoff. The start
+    // rejection carries uncertainty to the manager, which owns certified stop.
+    if (hasActiveRootTurn && (this.pendingForegroundStart || this.uncertainForegroundStart)) {
+      this.uncertainForegroundStart = true;
+      return;
+    }
     if (hasActiveRootTurn) {
       this.emitEvent({
         type: "turn_failed",
@@ -4217,6 +4235,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       const turnStart = await this.buildTurnStartParams(effectivePrompt, options);
       const turnId = this.createTurnId();
       this.activeForegroundTurnId = turnId;
+      this.uncertainForegroundStart = false;
       this.activeClientMessageId = options?.clientMessageId ?? null;
       this.currentTurnId = null;
       this.pendingForegroundTurnIdentification?.resolve(null);
@@ -4248,15 +4267,21 @@ export class CodexAppServerAgentSession implements AgentSession {
         turnStart.params,
         this.deps.turnStartTimeoutMs ?? TURN_START_TIMEOUT_MS,
       );
+      if (this.uncertainForegroundStart)
+        throw new Error("Codex transport was lost during turn start");
       return { turnId };
     } catch (error) {
       // A written request can execute after its response wait fails. Keep its
       // owner until native lifecycle evidence or certified close settles it.
-      if (!dispatched) {
+      if (!dispatched || isDefinitiveCodexStartRejection(error, this.currentTurnId)) {
+        this.uncertainForegroundStart = false;
         this.pendingForegroundTurnIdentification?.resolve(null);
         this.pendingForegroundTurnIdentification = null;
         this.activeForegroundTurnId = null;
         this.activeClientMessageId = null;
+      } else {
+        this.uncertainForegroundStart = true;
+        throw new AgentTurnStartUncertainError(error);
       }
       throw error;
     } finally {
@@ -6004,6 +6029,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
     if (parsed.turnId && this.currentTurnId && parsed.turnId !== this.currentTurnId) return;
     const stoppedTurnId = this.currentTurnId;
+    this.uncertainForegroundStart = false;
     this.completePendingRootCompactions();
     if (parsed.status === "failed") {
       this.emitEvent({

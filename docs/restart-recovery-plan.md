@@ -105,6 +105,23 @@ so retry can obtain fresh evidence; a second no-op close is not confirmation.
 SDK iterator cleanup can discard queued messages, so its ordering belongs in the
 provider adapter's shutdown contract tests.
 
+Process-tree shutdown covers the leader and descendants observed when close starts,
+and later descendants of surviving owned members. Retain their OS creation identities
+across failed attempts, verify those identities before signaling, and confirm every
+owned member stopped before accepting adapter output drain. An inspection failure
+keeps recovery blocked. If the first inspection finds an already-dead leader without
+an inventory, provider execution remains unconfirmed. A foreground turn result cannot
+prove that background tasks stopped. Only a completed one-shot command can justify
+ordinary post-mortem cleanup; EOF or a synthesized process-exit failure cannot.
+
+This inspection and signaling are separate operations, not atomic containment.
+Creation-identity checks reduce PID-reuse risk but leave a read-to-signal race; macOS
+process creation timestamps also have coarser precision than Linux start ticks.
+Descendants reparented outside the observed family before capture are outside this
+certificate. Starting a new process group or session alone does not escape traversal
+while the parent relationship remains owned. Launch-time
+containment through cgroups or Windows Job Objects requires separate work.
+
 Bind completion obligations to the logical run, including across native-session
 replacement. Subscribe before dispatch so immediate completion cannot be missed.
 Record cancellation at the explicit stop initiator. Do not infer it from the final

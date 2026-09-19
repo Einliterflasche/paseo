@@ -140,7 +140,11 @@ import {
   type ResolvedProviderLaunch,
 } from "../../provider-launch-config.js";
 import { withTimeout } from "../../../../utils/promise-timeout.js";
-import { terminateWithTreeKill, type ProcessTerminator } from "../../../../utils/tree-kill.js";
+import {
+  prepareProcessTreeTermination,
+  terminateWithTreeKill,
+  type ProcessTerminator,
+} from "../../../../utils/tree-kill.js";
 import { execCommand } from "../../../../utils/spawn.js";
 import { composeSystemPromptParts } from "../../system-prompt.js";
 
@@ -2144,6 +2148,7 @@ class ClaudeAgentSession implements AgentSession {
   private recentStderr = "";
   private closed = false;
   private closePromise: Promise<void> | null = null;
+  private readonly retiredChildren = new Set<ChildProcess>();
   private closingQuery: Query | null = null;
   private closingChild: ChildProcess | null = null;
   private closingPump: Promise<void> | null = null;
@@ -2753,12 +2758,17 @@ class ClaudeAgentSession implements AgentSession {
       "provider.claude.session_close.start",
     );
     this.closed = true;
+    if (this.childProcess && this.terminateProcess === terminateWithTreeKill)
+      await prepareProcessTreeTermination(this.childProcess, {
+        timeoutMs: 2_000,
+      });
     this.closingQuery ??= this.query;
     this.closingChild ??= this.childProcess;
     this.closingPump ??= this.queryPumpPromise;
     this.rejectAllPendingPermissions(new Error("Claude session closed"));
     this.input?.end();
     await this.stopClosingRuntime();
+    await this.stopRetiredChildren();
     if (this.activeForegroundTurnId) {
       this.finishForegroundTurn({
         type: "turn_canceled",
@@ -2807,6 +2817,27 @@ class ClaudeAgentSession implements AgentSession {
       },
       "provider.claude.session_close.complete",
     );
+  }
+
+  private async retainRetiredChild(child: ChildProcess): Promise<void> {
+    if (this.terminateProcess === terminateWithTreeKill)
+      await prepareProcessTreeTermination(child, {
+        timeoutMs: 2_000,
+      });
+    this.retiredChildren.add(child);
+    if (this.childProcess === child) this.childProcess = null;
+  }
+
+  private async stopRetiredChildren(): Promise<void> {
+    for (const child of this.retiredChildren) {
+      const result = await this.terminateProcess(child, {
+        gracefulTimeoutMs: 2_000,
+        forceTimeoutMs: 2_000,
+      });
+      if (result === "kill-timeout")
+        throw new Error("Retired Claude process tree cessation is unconfirmed");
+      this.retiredChildren.delete(child);
+    }
   }
 
   private async stopClosingRuntime(): Promise<void> {
@@ -3205,7 +3236,13 @@ class ClaudeAgentSession implements AgentSession {
       return this.query;
     }
 
+    await this.stopRetiredChildren();
+    if (!this.query && this.childProcess) {
+      await this.retainRetiredChild(this.childProcess);
+      await this.stopRetiredChildren();
+    }
     if (this.queryRestartNeeded && this.query) {
+      if (this.childProcess) await this.retainRetiredChild(this.childProcess);
       const oldQuery = this.query;
       const oldInput = this.input;
       // Null out query/input BEFORE awaiting the old iterator's return so the
@@ -3216,9 +3253,7 @@ class ClaudeAgentSession implements AgentSession {
       this.queryRestartNeeded = false;
       // Ending the input retires the process on purpose. Detach first so its
       // exit is not reported as a crash.
-      const retiredChild = this.childProcess;
-      this.childProcess = null;
-      if (retiredChild) this.failRunningRuntimeTasks();
+      if (this.retiredChildren.size) this.failRunningRuntimeTasks();
       oldInput?.end();
       oldQuery.close?.();
       try {
@@ -3226,17 +3261,7 @@ class ClaudeAgentSession implements AgentSession {
       } catch {
         /* ignore */
       }
-      // Tree-kill the old process tree now that the SDK has cleaned up.
-      // If we skip this, MCP children of the previous claude process can
-      // survive as orphans when the session spawns a replacement query.
-      if (retiredChild) {
-        await terminateWithTreeKill(retiredChild, {
-          gracefulTimeoutMs: 2_000,
-          forceTimeoutMs: 2_000,
-        }).catch(() => {
-          /* process may already be dead */
-        });
-      }
+      await this.stopRetiredChildren();
     }
 
     // Preserve claudeSessionId across query recreation so buildOptions() passes
@@ -4135,23 +4160,13 @@ class ClaudeAgentSession implements AgentSession {
     this.failActiveTurns(staleResumeError);
     // Ending the input retires the process on purpose. Detach first so its exit
     // is not reported as a crash.
-    const retiredChild = this.childProcess;
-    this.childProcess = null;
+    if (this.childProcess) await this.retainRetiredChild(this.childProcess);
     this.input?.end();
     await this.awaitWithTimeout(
       activeQuery.return?.(),
       "query pump return on missing resumed conversation",
     );
-    // Tree-kill for the same reason the restart path does: MCP children of the
-    // retired claude process outlive it otherwise.
-    if (retiredChild) {
-      await terminateWithTreeKill(retiredChild, {
-        gracefulTimeoutMs: 2_000,
-        forceTimeoutMs: 2_000,
-      }).catch(() => {
-        /* process may already be dead */
-      });
-    }
+    await this.stopRetiredChildren();
     if (this.query === activeQuery) {
       this.query = null;
       this.input = null;

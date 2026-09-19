@@ -1,8 +1,11 @@
 import { fork, spawn, type ChildProcess } from "child_process";
 import { mkdirSync } from "node:fs";
+import { once } from "node:events";
+import { setTimeout as delay } from "node:timers/promises";
 import path from "node:path";
 import { createStream as createRotatingFileStream } from "rotating-file-stream";
-import { signalProcessTree } from "../src/utils/tree-kill.js";
+import { prepareProcessTreeTermination, terminateWithTreeKill } from "../src/utils/tree-kill.js";
+import { withTimeout } from "../src/utils/promise-timeout.js";
 
 const WORKER_HEARTBEAT_INTERVAL_MS = 1_000;
 const WORKER_TERMINATION_GRACE_MS = 10_000;
@@ -129,7 +132,15 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
   let restarting = false;
   let shuttingDown = false;
   let exiting = false;
-  let forceKillTimer: NodeJS.Timeout | null = null;
+  let workerStop: Promise<void> | null = null;
+  let workerStopCertified = false;
+  let workerClosed: Promise<void> = Promise.resolve();
+  let shutdownKeepAlive: NodeJS.Timeout | null = null;
+  let workerExit: {
+    child: ChildProcess;
+    code: number | null;
+    signal: NodeJS.Signals | null;
+  } | null = null;
   const logStream = createSupervisorLogStream(options.logFile);
 
   const writeDurableChunk = (chunk: string | Buffer): void => {
@@ -179,41 +190,64 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
       });
   };
 
-  const clearForceKillTimer = (): void => {
-    if (forceKillTimer) {
-      clearTimeout(forceKillTimer);
-      forceKillTimer = null;
+  const stopWorker = async (currentChild: ChildProcess, reason: string): Promise<void> => {
+    // Capture before IPC: a cooperative worker can exit immediately, leaving
+    // descendant stdio detached and no leader from which to discover ownership.
+    await prepareProcessTreeTermination(currentChild, { timeoutMs: WORKER_TERMINATION_GRACE_MS });
+    if (currentChild.exitCode === null && currentChild.signalCode === null) {
+      const waiting = new AbortController();
+      try {
+        const exited = once(currentChild, "exit", { signal: waiting.signal });
+        const expired = delay(WORKER_TERMINATION_GRACE_MS, "timeout", { signal: waiting.signal });
+        requestWorkerShutdown(currentChild, reason);
+        if ((await Promise.race([exited, expired])) === "timeout") {
+          writeLifecycleLog(
+            "Worker did not exit after graceful shutdown request; forcing process tree kill",
+            {
+              reason,
+              supervisorPid: process.pid,
+              workerPid: currentChild.pid ?? null,
+            },
+          );
+        }
+      } finally {
+        waiting.abort();
+      }
     }
+    const result = await terminateWithTreeKill(currentChild, {
+      gracefulSignal: "SIGKILL",
+      forceSignal: "SIGKILL",
+      gracefulTimeoutMs: WORKER_TERMINATION_GRACE_MS,
+      forceTimeoutMs: WORKER_TERMINATION_GRACE_MS,
+    });
+    if (result === "kill-timeout") throw new Error("Worker process tree cessation is unconfirmed");
+    await withTimeout(workerClosed, WORKER_TERMINATION_GRACE_MS, "Worker output drain");
   };
 
-  const scheduleForceKill = (reason: string): void => {
-    if (!child) {
-      return;
-    }
+  const beginWorkerStop = (reason: string): void => {
+    if (!child || workerStop) return;
     const currentChild = child;
-    clearForceKillTimer();
-    forceKillTimer = setTimeout(() => {
-      forceKillTimer = null;
-      if (child !== currentChild) {
-        return;
-      }
-      writeLifecycleLog(
-        "Worker did not exit after graceful shutdown request; forcing process tree kill",
-        {
-          reason,
-          supervisorPid: process.pid,
-          workerPid: currentChild.pid ?? null,
-        },
-      );
-      void signalProcessTree(currentChild, "SIGKILL").catch((error) => {
-        writeLifecycleLog("Failed to force-kill worker process tree", {
-          error: error instanceof Error ? error.message : String(error),
-          supervisorPid: process.pid,
-          workerPid: currentChild.pid ?? null,
-        });
-      });
-    }, WORKER_TERMINATION_GRACE_MS);
-    forceKillTimer.unref();
+    // Keep a failed controlled stop present for inspection/retry, rather than
+    // exiting implicitly and letting an external supervisor launch a successor.
+    shutdownKeepAlive ??= setInterval(() => {}, WORKER_HEARTBEAT_INTERVAL_MS);
+    const attempt = stopWorker(currentChild, reason);
+    workerStop = attempt;
+    void attempt.then(
+      () => {
+        workerStopCertified = true;
+        if (shutdownKeepAlive) clearInterval(shutdownKeepAlive);
+        shutdownKeepAlive = null;
+        if (workerExit?.child === currentChild)
+          finishWorkerExit(workerExit.code, workerExit.signal);
+        return undefined;
+      },
+      (error: unknown) => {
+        if (workerStop === attempt) workerStop = null;
+        log(
+          `Worker shutdown remains blocked: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      },
+    );
   };
 
   const spawnWorker = () => {
@@ -243,7 +277,11 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
       });
     }
 
+    workerExit = null;
+    workerStop = null;
+    workerStopCertified = false;
     const currentChild = child;
+    workerClosed = new Promise((resolve) => currentChild.once("close", () => resolve()));
     const heartbeat = setInterval(() => {
       const message: SupervisorHeartbeatMessage = { type: "paseo:supervisor-heartbeat" };
       if (currentChild.connected) {
@@ -305,41 +343,39 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
 
     child.on("exit", (code, signal) => {
       clearInterval(heartbeat);
-      clearForceKillTimer();
       const exitDescriptor = describeExit(code, signal);
       writeLifecycleLog("Worker exited", { code, signal, exit: exitDescriptor });
-
-      if (shuttingDown) {
-        log(`Worker exited (${exitDescriptor}). Supervisor shutting down.`);
-        exitSupervisor(0);
-        return;
-      }
-
-      const crashed =
-        restartOnCrash &&
-        ((code !== 0 && code !== null) || (signal !== null && signal !== "SIGTERM"));
-
-      if (restarting || crashed) {
-        restarting = false;
-        log(
-          crashed
-            ? `Worker crashed (${exitDescriptor}). Restarting worker...`
-            : `Worker exited (${exitDescriptor}). Restarting worker...`,
-        );
-        spawnWorker();
-        return;
-      }
-
-      log(`Worker exited (${exitDescriptor}). Supervisor exiting.`);
-      exitSupervisor(typeof code === "number" ? code : 1);
+      workerExit = { child: currentChild, code, signal };
+      // Controlled stop owns finalization until every captured member stopped.
+      if (workerStopCertified || (!restarting && !shuttingDown)) finishWorkerExit(code, signal);
     });
   };
 
-  const requestWorkerShutdown = (reason: string): void => {
-    if (!child) {
+  const finishWorkerExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+    const exitDescriptor = describeExit(code, signal);
+    if (shuttingDown) {
+      log(`Worker exited (${exitDescriptor}). Supervisor shutting down.`);
+      exitSupervisor(0);
       return;
     }
-    const currentChild = child;
+    const crashed =
+      restartOnCrash &&
+      ((code !== 0 && code !== null) || (signal !== null && signal !== "SIGTERM"));
+    if (restarting || crashed) {
+      restarting = false;
+      log(
+        crashed
+          ? `Worker crashed (${exitDescriptor}). Restarting worker...`
+          : `Worker exited (${exitDescriptor}). Restarting worker...`,
+      );
+      spawnWorker();
+      return;
+    }
+    log(`Worker exited (${exitDescriptor}). Supervisor exiting.`);
+    exitSupervisor(typeof code === "number" ? code : 1);
+  };
+
+  const requestWorkerShutdown = (currentChild: ChildProcess, reason: string): void => {
     const message: SupervisorGracefulShutdownMessage = {
       type: "paseo:graceful-shutdown",
       reason,
@@ -376,12 +412,12 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     restarting = true;
     writeLifecycleLog("Restart requested", { reason });
     log(`${reason}. Stopping worker for restart...`);
-    requestWorkerShutdown(reason);
-    scheduleForceKill(reason);
+    beginWorkerStop(reason);
   };
 
   const requestShutdown = (reason: string) => {
     if (shuttingDown) {
+      beginWorkerStop(reason);
       return;
     }
     shuttingDown = true;
@@ -392,8 +428,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
       exitSupervisor(0);
       return;
     }
-    requestWorkerShutdown(reason);
-    scheduleForceKill(reason);
+    beginWorkerStop(reason);
   };
 
   const forwardSignal = (signal: NodeJS.Signals) => {

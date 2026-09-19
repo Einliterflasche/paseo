@@ -6,6 +6,8 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { buildSelfNodeCommand } from "../server/paseo-env.js";
 import { execCommand, spawnProcess } from "./spawn.js";
+import { AgentProbe } from "../server/agent/agent-probe.js";
+import { ProcessTreeOwnershipUnknownError } from "./tree-kill.js";
 
 const printEnvScript = `
 const keys = [
@@ -39,6 +41,40 @@ describe("execCommand", () => {
 
     expect(result.stdout.trim()).toBe("hello");
     expect(result.stderr).toBe("");
+  });
+
+  test("a completed owned query releases its cleanup owner", async () => {
+    const probe = new AgentProbe();
+    const result = await probe.run((context) =>
+      execCommand(process.execPath, ["-e", "console.log('query result')"], { probe: context }),
+    );
+    expect(result.stdout.trim()).toBe("query result");
+    await expect(probe.close()).resolves.toBeUndefined();
+  });
+
+  test("an owned query's nonzero exit retains its error and unknown descendant ownership", async () => {
+    const owned = new Set<{ close(): Promise<void> }>();
+    const failed = await execCommand(
+      process.execPath,
+      ["-e", "process.stderr.write('query failed'); process.exitCode = 7"],
+      {
+        probe: {
+          signal: new AbortController().signal,
+          own(cleanup) {
+            owned.add(cleanup);
+            return () => {
+              owned.delete(cleanup);
+            };
+          },
+        },
+      },
+    ).catch((error: unknown) => error);
+    expect(failed).toBeInstanceOf(AggregateError);
+    if (!(failed instanceof AggregateError)) throw new Error("Missing retained cleanup failure");
+    expect(failed.errors[0]).toMatchObject({ code: 7, stderr: "query failed" });
+    expect(failed.errors[1]).toBeInstanceOf(ProcessTreeOwnershipUnknownError);
+    expect(owned.size).toBe(1);
+    await expect([...owned][0]!.close()).rejects.toBeInstanceOf(ProcessTreeOwnershipUnknownError);
   });
 
   test("rejects when the command times out", async () => {

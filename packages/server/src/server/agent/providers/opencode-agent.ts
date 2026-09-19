@@ -1586,6 +1586,7 @@ export class OpenCodeAgentClient implements AgentClient {
         url,
         false,
         unbindBridge,
+        acquisition.prepareRelease,
       );
     } catch (error) {
       try {
@@ -1648,6 +1649,7 @@ export class OpenCodeAgentClient implements AgentClient {
         url,
         registeredAcquisition !== null,
         unbindBridge,
+        acquisition.prepareRelease,
       );
     } catch (error) {
       try {
@@ -3511,6 +3513,7 @@ class OpenCodeAgentSession implements AgentSession {
     private readonly serverUrl?: string,
     private readonly externallyDriven = false,
     releaseBridge?: () => void,
+    private readonly prepareServerRelease?: () => Promise<void>,
   ) {
     this.config = config;
     this.client = client;
@@ -5061,6 +5064,7 @@ class OpenCodeAgentSession implements AgentSession {
     this.recoveryAbortController.abort();
     // Closing command admission is separate from closing output. Both the
     // event subscription and its turn attribution survive until stop is proven.
+    await this.prepareServerRelease?.();
     if (!this.serverExited) {
       const stopAbort = new AbortController();
       try {

@@ -328,6 +328,47 @@ describe("supervisor durable logging", () => {
     7_000,
   );
 
+  test.skipIf(isPlatform("win32"))(
+    "certifies detached descendants stopped before spawning the requested replacement",
+    async () => {
+      const result = await runSupervisorFixture({
+        timeoutMs: 7_000,
+        workerSource: `
+          import { spawn } from "node:child_process";
+          import { existsSync, readFileSync, writeFileSync } from "node:fs";
+          const marker = process.argv[1] + ".descendant";
+          process.on("message", (message) => {
+            if (message?.type === "paseo:graceful-shutdown") process.exit(0);
+          });
+          if (!existsSync(marker)) {
+            const descendant = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], {
+              detached: true, stdio: "ignore",
+            });
+            descendant.unref();
+            writeFileSync(marker, String(descendant.pid));
+            process.send?.({ type: "paseo:restart", reason: "detached_tree_stop" });
+          } else {
+            const pid = Number(readFileSync(marker,"utf8"));
+            let alive = false;
+            try {
+              process.kill(pid, 0);
+              alive = process.platform !== "linux" || !/[) ] [ZX] /.test(readFileSync("/proc/"+pid+"/stat","utf8"));
+            } catch {}
+            process.stdout.write(alive ? "DESCENDANT_SURVIVED_REPLACEMENT\\n" : "DESCENDANT_STOPPED_BEFORE_REPLACEMENT\\n");
+            if (alive) process.kill(pid,"SIGKILL");
+            process.send?.({ type: "paseo:shutdown", reason: "detached_tree_done" });
+          }
+          setInterval(() => {}, 1000);
+        `,
+      });
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("DESCENDANT_STOPPED_BEFORE_REPLACEMENT");
+      expect(result.stdout).not.toContain("DESCENDANT_SURVIVED_REPLACEMENT");
+      expect(result.elapsedMs).toBeLessThan(2_500);
+    },
+    7_000,
+  );
+
   // POSIX-only: Windows reports the worker self-kill as an exit code, not SIGKILL.
   test.skipIf(isPlatform("win32"))(
     "logs worker signal exits even when the worker cannot log",

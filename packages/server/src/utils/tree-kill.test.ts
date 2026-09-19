@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -22,6 +23,10 @@ function isProcessRunning(pid: number): boolean {
 
   try {
     process.kill(pid, 0);
+    if (process.platform === "linux") {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      if (/^[ZX] /.test(stat.slice(stat.lastIndexOf(") ") + 2))) return false;
+    }
     return true;
   } catch {
     return false;
@@ -65,6 +70,7 @@ function killIfRunning(pid: number | null | undefined): void {
 function spawnOwnerWithDescendant(options: {
   childPidPath: string;
   detachedDescendant: boolean;
+  ownerExitsOnTerm?: boolean;
 }): ChildProcess {
   const descendantOptions = options.detachedDescendant
     ? '{ detached: true, stdio: "ignore" }'
@@ -77,7 +83,7 @@ function spawnOwnerWithDescendant(options: {
       "-e",
       `
         const { spawn } = require("node:child_process");
-        process.on("SIGTERM", () => {});
+        process.on("SIGTERM", () => { if (${options.ownerExitsOnTerm === true}) process.exit(0); });
         const child = spawn(process.execPath, [
           "-e",
           ${JSON.stringify(`
@@ -179,6 +185,33 @@ describe("terminateWithTreeKill", () => {
       await expectOwnerAndDescendantStopped(
         "owner or separate-process-group descendant survived terminateWithTreeKill",
       );
+    },
+  );
+  test.runIf(process.platform !== "win32")(
+    "retains a detached-stdio descendant after its leader exits on TERM, including failed-force retry",
+    async () => {
+      tempDir = await mkdtemp(join(tmpdir(), "paseo-tree-parent-exit-"));
+      const childPidPath = join(tempDir, "descendant.pid");
+      ownerProcess = spawnOwnerWithDescendant({
+        childPidPath,
+        detachedDescendant: true,
+        ownerExitsOnTerm: true,
+      });
+      await waitForFixtureReady(childPidPath);
+      const first = await terminateWithTreeKill(ownerProcess, {
+        gracefulTimeoutMs: 100,
+        forceTimeoutMs: 100,
+        forceSignal: "SIGTERM",
+      });
+      expect(first).toBe("kill-timeout");
+      expect(isProcessRunning(ownerProcess.pid!)).toBe(false);
+      expect(isProcessRunning(descendantPid!)).toBe(true);
+      const retried = await terminateWithTreeKill(ownerProcess, {
+        gracefulTimeoutMs: 100,
+        forceTimeoutMs: 2000,
+      });
+      expect(retried).toBe("killed");
+      await expectOwnerAndDescendantStopped("descendant survived parent-exit retry");
     },
   );
 });

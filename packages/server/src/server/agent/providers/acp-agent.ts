@@ -6,7 +6,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 
-import { terminateWithTreeKill } from "../../../utils/tree-kill.js";
+import { prepareProcessTreeTermination, terminateWithTreeKill } from "../../../utils/tree-kill.js";
 import type { ProcessTerminator } from "../../../utils/tree-kill.js";
 import type {
   ReadableStream as NodeReadableStream,
@@ -1508,17 +1508,22 @@ export class ACPAgentClient implements AgentClient {
     sessionId: string | null,
   ): Promise<void> {
     try {
-      if (sessionId && probe.initialize?.agentCapabilities?.sessionCapabilities?.close) {
-        await withTimeout(
-          probe.connection.unstable_closeSession({ sessionId }),
-          ACP_PROBE_CLOSE_TIMEOUT_MS,
-          `ACP probe session/close timed out after ${ACP_PROBE_CLOSE_TIMEOUT_MS}ms`,
+      if (this.terminateProcess === terminateWithTreeKill)
+        await prepareProcessTreeTermination(probe.child, { timeoutMs: ACP_PROBE_CLOSE_TIMEOUT_MS });
+      try {
+        if (sessionId && probe.initialize?.agentCapabilities?.sessionCapabilities?.close) {
+          await withTimeout(
+            probe.connection.unstable_closeSession({ sessionId }),
+            ACP_PROBE_CLOSE_TIMEOUT_MS,
+            `ACP probe session/close timed out after ${ACP_PROBE_CLOSE_TIMEOUT_MS}ms`,
+          );
+        }
+      } catch (error) {
+        this.logger.debug(
+          { err: error, sessionId },
+          "ACP probe closeSession failed during cleanup",
         );
       }
-    } catch (error) {
-      this.logger.debug({ err: error, sessionId }, "ACP probe closeSession failed during cleanup");
-    }
-    try {
       await terminateChildProcess(probe.child, 2_000, this.terminateProcess);
       this.probeOwnership.get(probe.child)?.();
       this.probeOwnership.delete(probe.child);
@@ -2537,6 +2542,21 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
   private async closeSession(): Promise<void> {
     this.closed = true;
+    if (this.terminateProcess === terminateWithTreeKill) {
+      const captures = [...this.terminalEntries.values()].map((terminal) =>
+        prepareProcessTreeTermination(terminal.child, {
+          timeoutMs: 2_000,
+          completedExecution: terminal.exit?.exitCode === 0,
+        }),
+      );
+      if (this.child)
+        captures.push(
+          prepareProcessTreeTermination(this.child, {
+            timeoutMs: 2_000,
+          }),
+        );
+      await Promise.all(captures);
+    }
     this.settleCommandsReady();
     for (const pending of this.pendingPermissions.values()) {
       pending.resolve({ outcome: { outcome: "cancelled" } });

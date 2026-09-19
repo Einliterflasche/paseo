@@ -672,6 +672,7 @@ export interface AgentSession {
   readonly capabilities: AgentCapabilityFlags;
   readonly features?: AgentFeature[];
   run(prompt: AgentPromptInput, options?: AgentRunOptions): Promise<AgentRunResult>;
+  /** Reject with AgentTurnStartUncertainError when a dispatched native request may have executed. */
   startTurn(prompt: AgentPromptInput, options?: AgentRunOptions): Promise<{ turnId: string }>;
   steerActiveTurn?(prompt: AgentPromptInput, options: SteerActiveTurnOptions): Promise<SteerResult>;
   subscribe(callback: (event: AgentStreamEvent) => void): () => void;
