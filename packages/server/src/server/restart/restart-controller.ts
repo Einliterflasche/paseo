@@ -1,5 +1,6 @@
 import {
   CheckpointStore,
+  CheckpointLoadError,
   type CheckpointClaim,
   type CheckpointCommitResult,
 } from "./checkpoint-store.js";
@@ -81,14 +82,26 @@ export class RestartController<T> {
       }
       return checkpoint;
     } catch (error) {
+      if (error instanceof CheckpointLoadError) {
+        this.generationId = error.generationId ?? undefined;
+      }
       this.failRestoration(error);
       throw error;
     }
   }
 
-  completeRestoration(): void {
-    this.phase = "running";
-    this.options.changed?.();
+  async completeRestoration(): Promise<void> {
+    if (this.phase !== "restoring" || !this.generationId) {
+      throw new Error("No checkpoint restoration is in progress");
+    }
+    try {
+      await this.options.store.markRestored(this.generationId);
+      this.phase = "running";
+      this.options.changed?.();
+    } catch (error) {
+      this.failRestoration(error);
+      throw error;
+    }
   }
 
   failRestoration(error: unknown): void {

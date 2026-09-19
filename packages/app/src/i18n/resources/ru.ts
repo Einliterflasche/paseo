@@ -3,6 +3,12 @@ import { pluginSettings } from "./plugin-settings";
 
 export const ru: TranslationResources = {
   common: {
+    hostRecovery: {
+      title: "Восстановление на {{hostName}} приостановлено",
+      description:
+        "Paseo приостановил работу агентов, чтобы защитить сохранённую историю. Оператор хоста должен устранить ошибку восстановления, прежде чем работа продолжится.",
+      generation: "Контрольная точка: {{generation}}",
+    },
     back: "Назад",
     loading: "Загрузка...",
     actions: {

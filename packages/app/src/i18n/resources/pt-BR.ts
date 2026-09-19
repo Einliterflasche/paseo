@@ -3,6 +3,12 @@ import { pluginSettings } from "./plugin-settings";
 
 export const ptBR: TranslationResources = {
   common: {
+    hostRecovery: {
+      title: "A recuperação está pausada em {{hostName}}",
+      description:
+        "O Paseo pausou o trabalho dos agentes para proteger o histórico salvo. O operador do host deve resolver o erro de recuperação antes de continuar.",
+      generation: "Ponto de controle: {{generation}}",
+    },
     back: "Voltar",
     loading: "Carregando...",
     actions: {

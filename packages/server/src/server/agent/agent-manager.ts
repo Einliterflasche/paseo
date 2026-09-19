@@ -738,6 +738,11 @@ export class AgentManager {
     return this.admissions.run(operation);
   }
 
+  async pauseForRecoveryFailure(): Promise<void> {
+    this.restartPhase = "paused";
+    await this.admissions.freeze();
+  }
+
   async quiesceForRestart(): Promise<AgentCheckpoint> {
     this.restartPhase = "preparing";
     try {
@@ -838,6 +843,7 @@ export class AgentManager {
   async resumeRestartCheckpoint(
     snapshot: AgentCheckpoint,
     beforeRuns?: () => void | Promise<void>,
+    beforeOpen?: () => Promise<void>,
   ): Promise<void> {
     try {
       await this.admissions.restore(async () => {
@@ -879,6 +885,7 @@ export class AgentManager {
           });
         }
       });
+      await beforeOpen?.();
       this.restartPhase = "running";
       this.admissions.open();
     } catch (error) {

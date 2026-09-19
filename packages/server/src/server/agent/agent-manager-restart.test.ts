@@ -16,6 +16,30 @@ async function manager(home: string, client: AgentClient = createCheckpointAgent
   return new AgentManager({ clients: { codex: client }, registry, logger });
 }
 
+test("failed durable completion keeps admissions closed after restoring history", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-recovery-completion-"));
+  const before = await manager(home);
+  const agent = await before.createAgent({ provider: "codex", cwd: home }, undefined, {
+    workspaceId: "workspace",
+  });
+  await before.runAgent(agent.id, "finish", { clientMessageId: "saved-input" });
+  const saved = await before.quiesceForRestart();
+  const after = await manager(home);
+  await after.installRestartCheckpoint(saved);
+  await expect(
+    after.resumeRestartCheckpoint(saved, undefined, async () => {
+      expect(() => after.assertAcceptingWork()).toThrow(RestartInProgressError);
+      throw new Error("completion fsync failed");
+    }),
+  ).rejects.toThrow("completion fsync failed");
+  expect(after.recoveryPhase).toBe("paused");
+  await expect(after.createAgent({ provider: "codex", cwd: home })).rejects.toThrow(
+    RestartInProgressError,
+  );
+  expect(() => after.streamAgent(agent.id, "must not dispatch")).toThrow(RestartInProgressError);
+  expect((await after.quiesceForRestart()).timelines).toEqual(saved.timelines);
+});
+
 test("restart preserves late output and user identity without native overwrite or visible continuation", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-manager-restart-"));
   const before = await manager(home);

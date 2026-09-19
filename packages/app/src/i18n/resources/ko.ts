@@ -3,6 +3,12 @@ import { pluginSettings } from "./plugin-settings";
 
 export const ko: TranslationResources = {
   common: {
+    hostRecovery: {
+      title: "{{hostName}}의 복구가 일시 중지되었습니다",
+      description:
+        "저장된 기록을 보호하기 위해 Paseo가 에이전트 작업을 일시 중지했습니다. 작업을 계속하려면 호스트 운영자가 복구 오류를 해결해야 합니다.",
+      generation: "체크포인트: {{generation}}",
+    },
     back: "뒤로",
     loading: "불러오는 중...",
     actions: {

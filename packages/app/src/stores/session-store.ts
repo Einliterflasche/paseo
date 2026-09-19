@@ -284,6 +284,8 @@ export interface DaemonServerInfo {
   capabilities?: ServerCapabilities;
   features?: ServerInfoStatusPayload["features"];
   restartRecoveryState?: ServerInfoStatusPayload["restartRecoveryState"];
+  restartRecoveryGeneration?: string;
+  restartRecoveryError?: string;
 }
 
 export interface AgentTimelineCursorState {
@@ -671,6 +673,28 @@ function areServerInfoFeaturesEqual(
   return JSON.stringify(current ?? null) === JSON.stringify(next ?? null);
 }
 
+function areRecoveryDetailsEqual(
+  current: DaemonServerInfo | null | undefined,
+  state: DaemonServerInfo["restartRecoveryState"],
+  generation: string | undefined,
+  error: string | undefined,
+): boolean {
+  return (
+    current?.restartRecoveryState === state &&
+    current?.restartRecoveryGeneration === generation &&
+    current?.restartRecoveryError === error
+  );
+}
+
+export function selectRecoveryPausedHostIds(state: Pick<SessionStore, "sessions">): string[] {
+  return Object.entries(state.sessions)
+    .filter(([, session]) => {
+      const info = session.serverInfo;
+      return info?.restartRecoveryState === "paused" && Boolean(info.restartRecoveryError?.trim());
+    })
+    .map(([serverId]) => serverId);
+}
+
 function isSessionServerInfoUnchanged(input: {
   currentServerInfo: SessionState["serverInfo"] | undefined;
   nextHostname: string | null;
@@ -680,6 +704,8 @@ function isSessionServerInfoUnchanged(input: {
   nextFeatures: ServerInfoStatusPayload["features"] | undefined;
   nextServerId: string;
   nextRestartRecoveryState: ServerInfoStatusPayload["restartRecoveryState"] | undefined;
+  nextRestartRecoveryGeneration: string | undefined;
+  nextRestartRecoveryError: string | undefined;
 }): boolean {
   const {
     currentServerInfo,
@@ -689,6 +715,8 @@ function isSessionServerInfoUnchanged(input: {
     nextCapabilities,
     nextFeatures,
     nextRestartRecoveryState,
+    nextRestartRecoveryGeneration,
+    nextRestartRecoveryError,
   } = input;
   const prevHostname = currentServerInfo?.hostname?.trim() || null;
   const prevVersion = currentServerInfo?.version?.trim() || null;
@@ -699,7 +727,12 @@ function isSessionServerInfoUnchanged(input: {
     currentServerInfo?.desktopManaged === nextDesktopManaged &&
     areServerCapabilitiesEqual(currentServerInfo?.capabilities, nextCapabilities) &&
     areServerInfoFeaturesEqual(currentServerInfo?.features, nextFeatures) &&
-    currentServerInfo?.restartRecoveryState === nextRestartRecoveryState
+    areRecoveryDetailsEqual(
+      currentServerInfo,
+      nextRestartRecoveryState,
+      nextRestartRecoveryGeneration,
+      nextRestartRecoveryError,
+    )
   );
 }
 
@@ -838,6 +871,8 @@ export const useSessionStore = create<SessionStore>()(
           const nextCapabilities = info.capabilities;
           const nextFeatures = info.features;
           const nextRestartRecoveryState = info.restartRecoveryState;
+          const nextRestartRecoveryGeneration = info.restartRecoveryGeneration;
+          const nextRestartRecoveryError = info.restartRecoveryError;
 
           if (
             isSessionServerInfoUnchanged({
@@ -849,6 +884,8 @@ export const useSessionStore = create<SessionStore>()(
               nextFeatures,
               nextServerId: info.serverId,
               nextRestartRecoveryState,
+              nextRestartRecoveryGeneration,
+              nextRestartRecoveryError,
             })
           ) {
             return prev;
@@ -871,6 +908,12 @@ export const useSessionStore = create<SessionStore>()(
                   ...(nextFeatures ? { features: nextFeatures } : {}),
                   ...(nextRestartRecoveryState
                     ? { restartRecoveryState: nextRestartRecoveryState }
+                    : {}),
+                  ...(nextRestartRecoveryGeneration !== undefined
+                    ? { restartRecoveryGeneration: nextRestartRecoveryGeneration }
+                    : {}),
+                  ...(nextRestartRecoveryError !== undefined
+                    ? { restartRecoveryError: nextRestartRecoveryError }
                     : {}),
                 },
               },

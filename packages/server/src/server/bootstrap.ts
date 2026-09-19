@@ -1368,23 +1368,35 @@ export async function createPaseoDaemon(
       const stableAgents = await agentManager.quiesceForRestart();
       await drainFinishNotificationWatches(agentManager);
       return DaemonCheckpointSchema.parse({
-        version: 1,
+        version: 2,
         agents: stableAgents,
         notifications: snapshotFinishNotificationWatches(agentManager),
         schedules: await scheduleService.snapshotForRestart(),
       });
     },
   });
-  const restartCheckpoint = await restartController.claim();
   const initializeScheduleRecovery = async () => {
-    if (restartCheckpoint) {
-      await agentManager.installRestartCheckpoint(restartCheckpoint.snapshot.agents);
-      scheduleService.restoreAfterRestart(restartCheckpoint.snapshot.schedules);
+    try {
+      const checkpoint = await restartController.claim();
+      if (checkpoint) {
+        await agentManager.installRestartCheckpoint(checkpoint.snapshot.agents);
+        scheduleService.restoreAfterRestart(checkpoint.snapshot.schedules);
+      }
+      await scheduleService.start();
+      if (checkpoint) await scheduleService.pauseForRestart();
+      return checkpoint;
+    } catch (error) {
+      // Keep recovery failures reachable through server_info and the normal UI.
+      // In particular, do not start ordinary schedule recovery or hydrate native
+      // agent history after refusing an already consumed/corrupt checkpoint.
+      await scheduleService.pauseForRestart();
+      await agentManager.pauseForRecoveryFailure();
+      restartController.failRestoration(error);
+      logger.error({ err: error }, "Restart recovery blocked; saved state retained");
+      return null;
     }
-    await scheduleService.start();
-    if (restartCheckpoint) await scheduleService.pauseForRestart();
   };
-  await initializeScheduleRecovery();
+  let restartCheckpoint = await initializeScheduleRecovery();
   agentManager.setAgentArchivedCallback(async (agentId) => {
     try {
       await scheduleService.completeForAgent(agentId);
@@ -1825,18 +1837,28 @@ export async function createPaseoDaemon(
       // model loading doesn't block the server from accepting connections.
       speechService.start();
       scriptHealthMonitor.start();
-      if (restartCheckpoint) {
+      if (restartCheckpoint && restartController.status.state === "restoring") {
         try {
-          await agentManager.resumeRestartCheckpoint(restartCheckpoint.snapshot.agents, () => {
-            for (const watch of restartCheckpoint.snapshot.notifications) {
-              restoreFinishNotificationWatch({ agentManager, agentStorage, logger }, watch);
-            }
-            scheduleService.resumeRestoredRuns();
-          });
+          const checkpoint = restartCheckpoint;
+          await agentManager.resumeRestartCheckpoint(
+            checkpoint.snapshot.agents,
+            () => {
+              for (const watch of checkpoint.snapshot.notifications) {
+                restoreFinishNotificationWatch({ agentManager, agentStorage, logger }, watch);
+              }
+              scheduleService.resumeRestoredRuns();
+            },
+            () => restartController.completeRestoration(),
+          );
           await retryPendingFinishNotifications(agentManager);
           scheduleService.resumeAfterRestartFailure();
-          restartController.completeRestoration();
+          // The stores now own immutable shared history. In particular, do not
+          // keep a legacy checkpoint's expanded log copies alive in start's
+          // closure for the entire lifetime of the daemon.
+          restartCheckpoint = null;
         } catch (error) {
+          await scheduleService.pauseForRestart();
+          await agentManager.pauseForRecoveryFailure();
           restartController.failRestoration(error);
           logger.error({ err: error }, "Restart restoration paused; saved state retained");
         }

@@ -3,6 +3,12 @@ import { pluginSettings } from "./plugin-settings";
 
 export const es: TranslationResources = {
   common: {
+    hostRecovery: {
+      title: "La recuperación está en pausa en {{hostName}}",
+      description:
+        "Paseo ha pausado el trabajo de los agentes para proteger el historial guardado. El operador del host debe resolver el error de recuperación antes de continuar.",
+      generation: "Punto de control: {{generation}}",
+    },
     back: "Atrás",
     loading: "Cargando...",
     actions: {

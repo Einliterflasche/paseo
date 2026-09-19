@@ -3,6 +3,12 @@ import { pluginSettings } from "./plugin-settings";
 
 export const ar: TranslationResources = {
   common: {
+    hostRecovery: {
+      title: "الاستعادة متوقفة مؤقتًا على {{hostName}}",
+      description:
+        "أوقف Paseo عمل الوكلاء مؤقتًا لحماية السجل المحفوظ. يجب على مشغّل المضيف حل خطأ الاستعادة قبل متابعة العمل.",
+      generation: "نقطة الحفظ: {{generation}}",
+    },
     back: "خلف",
     loading: "تحميل...",
     actions: {

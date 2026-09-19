@@ -1,5 +1,11 @@
 export const en = {
   common: {
+    hostRecovery: {
+      title: "Recovery is paused on {{hostName}}",
+      description:
+        "Paseo has paused agent work to protect saved history. The host operator must resolve the recovery error before work can continue.",
+      generation: "Checkpoint: {{generation}}",
+    },
     back: "Back",
     loading: "Loading...",
     actions: {

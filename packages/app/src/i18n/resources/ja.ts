@@ -3,6 +3,12 @@ import { pluginSettings } from "./plugin-settings";
 
 export const ja: TranslationResources = {
   common: {
+    hostRecovery: {
+      title: "{{hostName}} の復元は一時停止中です",
+      description:
+        "保存済みの履歴を保護するため、Paseo はエージェントの作業を一時停止しました。作業を続けるには、ホストの管理者が復元エラーを解決する必要があります。",
+      generation: "チェックポイント: {{generation}}",
+    },
     back: "戻る",
     loading: "読み込み中...",
     actions: {

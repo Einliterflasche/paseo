@@ -1,6 +1,6 @@
 # Controlled restart recovery
 
-Status: implemented and locally validated in the fork; not deployed.
+Status: controlled restart recovery has been deployed in the fork since 2026-09-16.
 Based on upstream `b8e24677e12b226c7c38c1c3a40649daa9f1152f`. Requirements are in
 [fork-requirements.md](fork-requirements.md). On 2026-09-16 Raphael accepted the
 controlled-restart limitation. The earlier Fable review covered the superseded
@@ -121,6 +121,7 @@ Use versioned JSON under `PASEO_HOME/restart-checkpoints/`:
 <generation>/manifest.json
 <generation>/snapshot.json
 <generation>/claimed.json
+<generation>/restored.json
 ready.json
 ```
 
@@ -129,6 +130,12 @@ One snapshot contains agent metadata/native handles, raw timelines and child
 timelines, unsettled inputs, notification obligations, and schedule ownership.
 A single file keeps the commit boundary small. Existing Zod schemas validate the
 whole generation before it can replace live state; incompatible versions fail closed.
+
+Checkpoint format 2 preserves shared cumulative log text instead of expanding every
+historical version into JSON. Format 1 remains readable only with its original
+inline strings. Older daemons reject format 2, so a rollback must understand the
+current checkpoint before activation; stripping unknown fields would otherwise
+turn shared references into empty logs. The public timeline wire format is unchanged.
 
 Image bytes and inline attachments are part of the snapshot. Completed file uploads
 already live under `PASEO_HOME/uploads` without expiry; checkpoint creation verifies
@@ -147,10 +154,14 @@ immutable file references or current snapshots. Rewind invalidates the inherited
 reference for that agent. Add no retention, expiry, or automatic deletion.
 
 At boot, validate then write/flush `claimed.json` before executing any recovered
-or new work. Never automatically replay a claimed generation after an unrelated
-crash. Incomplete, corrupt, or incompatible ready state blocks recovery visibly;
-do not silently replace it with shorter native history. Retain files for deliberate
-recovery. A crash during restoration is outside the controlled-restart guarantee.
+or new work. Write/flush `restored.json` before reopening ordinary admissions.
+Keep the ready pointer and claim after completion: later accepted work makes that
+snapshot unsafe to replay after an unrelated crash. A consumed, incomplete, corrupt,
+or incompatible generation leaves the listener reachable with execution and schedule
+recovery paused. The app shows the host, error, and generation on startup and workspace
+screens. Do not silently substitute native history or clear the pointer to bypass the
+failure. Preserve the files and reconcile later work before deliberate recovery.
+A crash during restoration remains outside the controlled-restart guarantee.
 
 ## 4. Restore work and its completion obligations
 
@@ -268,6 +279,7 @@ Local validation covers these boundaries:
 | Test                                         | Evidence                                                                                                                                                                                                                                                         |
 | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `controlled-restart.e2e.test.ts`             | Real daemon process replacement twice on the same state and port; exact saved history prefix and epoch; unopened history survives; duplicate send does not dispatch; explicit stop does not resume; failed commit leaves the old daemon alive.                   |
+| `recovery-blocked.e2e.test.ts`               | A crash after restoration and newer work leaves a reachable paused daemon; no old dispatch, native history hydration, schedule mutation, or checkpoint rewrite. Corrupt ready state stays visible without a worker boot loop.                                    |
 | `controlled-restart-reconnect.e2e.test.ts`   | One live SDK client holds a frozen send, reconnects automatically, and dispatches its original message ID once. No dispatch occurs while paused.                                                                                                                 |
 | `controlled-restart-obligations.e2e.test.ts` | A child sends no false completion while suspended, notifies its parent once after recovery, and does not notify again after a second restart.                                                                                                                    |
 | `controlled-restart-schedule.e2e.test.ts`    | An active scheduled task keeps its original run ID through two restarts, completes once, and is never falsely failed or archived.                                                                                                                                |

@@ -3,6 +3,12 @@ import { pluginSettings } from "./plugin-settings";
 
 export const fr: TranslationResources = {
   common: {
+    hostRecovery: {
+      title: "La récupération est en pause sur {{hostName}}",
+      description:
+        "Paseo a suspendu le travail des agents pour protéger l’historique enregistré. L’opérateur de l’hôte doit résoudre l’erreur de récupération avant de poursuivre.",
+      generation: "Point de contrôle : {{generation}}",
+    },
     back: "Dos",
     loading: "Chargement...",
     actions: {

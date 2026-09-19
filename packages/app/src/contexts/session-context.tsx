@@ -353,17 +353,9 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
     }
 
     updateSessionServerInfo(serverId, {
-      serverId: serverInfo.serverId,
-      hostname: serverInfo.hostname,
-      version: serverInfo.version,
-      ...(serverInfo.desktopManaged !== undefined
-        ? { desktopManaged: serverInfo.desktopManaged }
-        : {}),
-      ...(serverInfo.capabilities ? { capabilities: serverInfo.capabilities } : {}),
-      ...(serverInfo.features ? { features: serverInfo.features } : {}),
-      ...(serverInfo.restartRecoveryState
-        ? { restartRecoveryState: serverInfo.restartRecoveryState }
-        : {}),
+      ...serverInfo,
+      hostname: serverInfo.hostname ?? null,
+      version: serverInfo.version ?? null,
     });
   }, [client, serverId, updateSessionServerInfo]);
 
@@ -609,17 +601,9 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
           getTimelineDeliveryMode(serverInfo.features?.selectiveAgentTimeline),
         );
         updateSessionServerInfo(serverId, {
-          serverId: serverInfo.serverId,
-          hostname: serverInfo.hostname,
-          version: serverInfo.version,
-          ...(serverInfo.desktopManaged !== undefined
-            ? { desktopManaged: serverInfo.desktopManaged }
-            : {}),
-          ...(serverInfo.capabilities ? { capabilities: serverInfo.capabilities } : {}),
-          ...(serverInfo.features ? { features: serverInfo.features } : {}),
-          ...(serverInfo.restartRecoveryState
-            ? { restartRecoveryState: serverInfo.restartRecoveryState }
-            : {}),
+          ...serverInfo,
+          hostname: serverInfo.hostname ?? null,
+          version: serverInfo.version ?? null,
         });
         return;
       }

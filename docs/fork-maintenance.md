@@ -76,7 +76,8 @@ Develop against separate runtime state; the live state is
 
 Set `services.paseo.environment.PASEO_DAEMON_HEAP_MB` in the host configuration
 to choose the daemon worker's Node old-space limit in MiB. This VM uses `6144`
-as temporary headroom while cumulative transcript retention is investigated.
+as temporary headroom while the cumulative transcript fix is validated and observed
+under the production workload.
 The supervisor passes the limit directly to the worker and removes the setting
 from its environment; agent subprocesses keep their own defaults. Do not use
 service-wide `NODE_OPTIONS` for this adjustment. The heap limit is an allowance,
