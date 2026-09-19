@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, readFile, access } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 const script = resolve("scripts/deploy-nixos.sh");
 async function fixture() {
@@ -15,7 +15,7 @@ async function fixture() {
   await mkdir(join(closure, "sw/bin"), { recursive: true });
   const executable = (name, body) =>
     writeFile(name, `#!/usr/bin/env bash\nset -eu\n${body}\n`, { mode: 0o700 });
-  await executable(join(closure, "sw/bin/paseo"), "exit 0");
+  await executable(join(closure, "sw/bin/paseo"), 'printf "%s\\n" "$@" > "$TEST_ROOT/deploy-argv"');
   await executable(
     join(closure, "bin/switch-to-configuration"),
     'echo switch >> "$TEST_ROOT/actions"; if [[ "${SWITCH_EXIT:-0}" != 0 ]]; then exit "$SWITCH_EXIT"; fi; if [[ "${SWITCH_REPLACES:-0}" == 1 ]]; then echo replacement > "$TEST_ROOT/invocation"; fi',
@@ -107,6 +107,13 @@ test("build and deployment run outside Paseo as the operator with the selected s
   assert.equal(result.status, 0, result.stderr);
   const args = (await readFile(join(f.root, "systemd-argv"), "utf8")).trimEnd().split("\n");
   assert.ok(args.includes(`--uid=${process.getuid()}`));
+  assert.ok(!args.includes("--wait"));
+  const handoff = args
+    .find((arg) => arg.startsWith("--setenv=PASEO_DEPLOY_HANDOFF="))
+    .split("=")
+    .slice(2)
+    .join("=");
+  await access(join(handoff, "ready"));
   assert.ok(args.includes(`--setenv=PASEO_HOME=${paseoHome}`));
   assert.deepEqual(args.slice(-5), ["--", script, "--worker", "--reason", "quick update"]);
   await assert.rejects(access(join(f.root, "build-argv")), { code: "ENOENT" });
@@ -182,4 +189,42 @@ test("a failed activation never attempts an additional restart", async () => {
   const actions = await readFile(join(f.root, "actions"), "utf8");
   assert.ok(!actions.includes("restart"));
   assert.ok(!actions.includes("start paseo.service"));
+});
+
+test("worker cannot build or checkpoint while the privileged launcher is still present", async () => {
+  const f = await fixture();
+  const handoff = join(f.root, "handoff");
+  await mkdir(handoff);
+  await writeFile(join(handoff, "launcher-pid"), String(process.pid));
+  const child = spawn(script, ["--worker"], {
+    env: { ...f.env, PASEO_DEPLOY_HANDOFF: handoff },
+    stdio: "ignore",
+  });
+  const exited = new Promise((done) => child.on("exit", done));
+  try {
+    await new Promise((done) => setTimeout(done, 250));
+    await assert.rejects(access(join(f.root, "build-argv")), { code: "ENOENT" });
+    await assert.rejects(access(join(f.root, "deploy-argv")), { code: "ENOENT" });
+    await writeFile(join(handoff, "ready"), "");
+    assert.equal(await exited, 0);
+    await access(join(f.root, "build-argv"));
+    await access(join(f.root, "deploy-argv"));
+  } finally {
+    child.kill();
+  }
+});
+
+test("an abandoned launcher fails closed before checkpointing", async () => {
+  const f = await fixture();
+  const handoff = join(f.root, "handoff");
+  await mkdir(handoff);
+  const dead = spawnSync("true");
+  await writeFile(join(handoff, "launcher-pid"), String(dead.pid));
+  const result = spawnSync(script, ["--worker"], {
+    env: { ...f.env, PASEO_DEPLOY_HANDOFF: handoff },
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /launcher exited/);
+  await assert.rejects(access(join(f.root, "build-argv")), { code: "ENOENT" });
 });
