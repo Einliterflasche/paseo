@@ -760,6 +760,11 @@ export class AgentManager {
     return this.admissions.run(operation);
   }
 
+  async pauseForRecoveryFailure(): Promise<void> {
+    this.restartPhase = "paused";
+    await this.admissions.freeze();
+  }
+
   async quiesceForRestart(): Promise<AgentCheckpoint> {
     this.restartPhase = "preparing";
     try {
@@ -860,6 +865,7 @@ export class AgentManager {
   async resumeRestartCheckpoint(
     snapshot: AgentCheckpoint,
     beforeRuns?: () => void | Promise<void>,
+    beforeOpen?: () => Promise<void>,
   ): Promise<void> {
     try {
       await this.admissions.restore(async () => {
@@ -901,6 +907,7 @@ export class AgentManager {
           });
         }
       });
+      await beforeOpen?.();
       this.restartPhase = "running";
       this.admissions.open();
     } catch (error) {
@@ -1357,15 +1364,18 @@ export class AgentManager {
     return this.timelineStore.getItems(id);
   }
 
-  async getTimelineRows(id: string): Promise<AgentTimelineRow[]> {
+  async getCanonicalTimelineRows(id: string): Promise<AgentTimelineRow[]> {
     this.requireAgent(id);
-    if (this.durableTimelineStore) {
-      return projectTimelineRows({
-        rows: await this.durableTimelineStore.getCommittedRows(id),
-        mode: "projected",
-      }).map((entry) => Object.assign({ seq: entry.seqEnd }, entry));
-    }
-    return this.timelineStore.getRows(id);
+    return this.durableTimelineStore
+      ? this.durableTimelineStore.getCommittedRows(id)
+      : this.timelineStore.getRows(id);
+  }
+
+  async getTimelineRows(id: string): Promise<AgentTimelineRow[]> {
+    return projectTimelineRows({
+      rows: await this.getCanonicalTimelineRows(id),
+      mode: "projected",
+    }).map((entry) => Object.assign({ seq: entry.seqEnd }, entry));
   }
 
   fetchTimeline(id: string, options?: AgentTimelineFetchOptions): AgentTimelineFetchResult {

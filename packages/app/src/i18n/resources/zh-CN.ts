@@ -26,6 +26,12 @@ export const zhCN: TranslationResources = {
     total: "{{total}} 个匹配项",
   },
   common: {
+    hostRecovery: {
+      title: "{{hostName}} 的恢复已暂停",
+      description:
+        "Paseo 已暂停代理工作，以保护已保存的历史记录。主机管理员必须解决恢复错误后才能继续工作。",
+      generation: "检查点：{{generation}}",
+    },
     back: "返回",
     loading: "加载中...",
     actions: {

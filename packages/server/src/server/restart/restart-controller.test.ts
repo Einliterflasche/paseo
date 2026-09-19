@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "vitest";
@@ -44,6 +44,54 @@ test("failed restoration cannot overwrite a complete checkpoint with partial run
   controller.failRestoration(new Error("native session unavailable"));
   await expect(controller.prepare()).rejects.toThrow("native session unavailable");
   expect(captures).toBe(0);
+  expect((await store.peekStatus())?.generationId).toBe(original.generationId);
+});
+
+test("a completed restoration is recorded durably and a later boot stays blocked without replay", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-completed-restore-"));
+  const parse = z.object({ message: z.string() }).parse;
+  const store = new CheckpointStore(home, parse);
+  const original = await store.commit({ message: "complete history" });
+  const restored = new RestartController({ store, capture: async () => original.snapshot });
+  await restored.claim();
+  await restored.completeRestoration();
+  expect(restored.status).toEqual({
+    state: "running",
+    generationId: original.generationId,
+    error: undefined,
+  });
+  expect(
+    JSON.parse(
+      await readFile(
+        join(home, "restart-checkpoints", original.generationId, "restored.json"),
+        "utf8",
+      ),
+    ).generationId,
+  ).toBe(original.generationId);
+  const next = new RestartController({
+    store: new CheckpointStore(home, parse),
+    capture: async () => {
+      throw new Error("Must not capture stale state");
+    },
+  });
+  await expect(next.claim()).rejects.toMatchObject({ reason: "already_restored" });
+  expect(next.status.state).toBe("paused");
+  expect(next.status.generationId).toBe(original.generationId);
+  expect(next.status.error).toContain("later work");
+  await expect(next.prepare()).rejects.toMatchObject({ reason: "already_restored" });
+});
+
+test("completion write failure does not publish running or permit replacement", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-restored-write-failure-"));
+  const store = new CheckpointStore(home, z.string().parse);
+  const original = await store.commit("complete history");
+  const controller = new RestartController({ store, capture: async () => "must not replace" });
+  await controller.claim();
+  await mkdir(join(home, "restart-checkpoints", original.generationId, "restored.json"));
+  await expect(controller.completeRestoration()).rejects.toThrow();
+  expect(controller.status.state).toBe("paused");
+  expect(controller.status.generationId).toBe(original.generationId);
+  await expect(controller.prepare()).rejects.toThrow();
   expect((await store.peekStatus())?.generationId).toBe(original.generationId);
 });
 

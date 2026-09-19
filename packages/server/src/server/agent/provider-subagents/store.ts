@@ -193,6 +193,10 @@ export class ProviderSubagentStore {
     return this.descriptors.get(storeKey(parentAgentId, subagentId)) ?? null;
   }
 
+  getCanonicalRows(parentAgentId: string, subagentId: string): AgentTimelineRow[] {
+    return this.timelines.getRows(storeKey(parentAgentId, subagentId));
+  }
+
   fetchTimeline(
     parentAgentId: string,
     subagentId: string,

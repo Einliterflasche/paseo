@@ -9,6 +9,7 @@ const READY_FILE = "ready.json";
 const MANIFEST_FILE = "manifest.json";
 const SNAPSHOT_FILE = "snapshot.json";
 const CLAIMED_FILE = "claimed.json";
+const RESTORED_FILE = "restored.json";
 const MANIFEST_VERSION = 1;
 
 export type CheckpointLoadFailureReason =
@@ -18,7 +19,8 @@ export type CheckpointLoadFailureReason =
   | "manifest_checksum_mismatch"
   | "snapshot_corrupt"
   | "snapshot_invalid"
-  | "already_claimed";
+  | "already_claimed"
+  | "already_restored";
 
 /**
  * Typed failure for a ready generation that cannot be trusted. There is no fallback: every
@@ -139,6 +141,7 @@ async function pathExists(target: string): Promise<boolean> {
  */
 export class CheckpointStore<T> {
   private readonly root: string;
+  private claimedGenerationId: string | null = null;
 
   constructor(
     home: string,
@@ -198,6 +201,30 @@ export class CheckpointStore<T> {
     }
 
     if (await pathExists(path.join(generationDir, CLAIMED_FILE))) {
+      const restoredText = await readFileOrNull(path.join(generationDir, RESTORED_FILE));
+      if (restoredText !== null) {
+        let restored: unknown;
+        try {
+          restored = JSON.parse(restoredText);
+        } catch {
+          // A malformed completion marker cannot turn a consumed checkpoint into
+          // fresh work. Keep the claim authoritative and fail closed below.
+        }
+        if (
+          typeof restored === "object" &&
+          restored !== null &&
+          "generationId" in restored &&
+          restored.generationId === generationId &&
+          "restoredAt" in restored &&
+          typeof restored.restoredAt === "string"
+        ) {
+          throw new CheckpointLoadError(
+            "already_restored",
+            generationId,
+            `Generation '${generationId}' already completed restoration. Recovery is paused because later work must be reconciled before this checkpoint can be used again.`,
+          );
+        }
+      }
       throw new CheckpointLoadError(
         "already_claimed",
         generationId,
@@ -268,8 +295,23 @@ export class CheckpointStore<T> {
       await claimHandle.close();
     }
     await fsyncDirectory(generationDir);
+    this.claimedGenerationId = generationId;
 
     return { generationId, snapshot };
+  }
+
+  /**
+   * Record completion before opening new admissions. Keep ready.json and the
+   * claim: completion does not make this old snapshot safe after a later crash.
+   */
+  async markRestored(generationId: string): Promise<void> {
+    if (this.claimedGenerationId !== generationId) {
+      throw new Error("Only the store that claimed a checkpoint may complete its restoration");
+    }
+    await writeFileDurable(
+      path.join(this.root, generationId, RESTORED_FILE),
+      JSON.stringify({ generationId, restoredAt: new Date().toISOString() }),
+    );
   }
 
   /** Cheap status read for reporting: does not validate checksum/schema or claim anything. */

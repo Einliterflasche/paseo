@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { TimelineProjection, selectProjectedTimelinePage } from "./timeline-projection.js";
 import { AgentTimelineItemPayloadSchema } from "@getpaseo/protocol/messages";
 import { z } from "zod";
+import { SharedLogStore } from "./shared-log.js";
+import { decodeTextNodes, TextNodeSnapshotSchema, TextSnapshotWriter } from "./shared-text.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type {
   AgentTimelineFetchOptions,
@@ -14,7 +16,7 @@ import type {
  * `AgentTimelineFetchResult`, which is a paginated/projected UI view — restart checkpoints
  * must round-trip the exact rows, epoch, and sequence counter, not a fetch window.
  */
-export const AgentTimelineRowSchema: z.ZodType<AgentTimelineRow, unknown> = z.object({
+const CanonicalTimelineRowSchema = z.object({
   seq: z.number().int().nonnegative(),
   timestamp: z.string(),
   item: AgentTimelineItemPayloadSchema,
@@ -22,11 +24,19 @@ export const AgentTimelineRowSchema: z.ZodType<AgentTimelineRow, unknown> = z.ob
   providerMessageId: z.string().optional(),
 });
 
+export const AgentTimelineRowSchema: z.ZodType<AgentTimelineRow, unknown> =
+  CanonicalTimelineRowSchema;
+
 export const AgentTimelineSnapshotSchema = z
   .object({
     epoch: z.string(),
     nextSeq: z.number().int().nonnegative(),
-    rows: z.array(AgentTimelineRowSchema),
+    rows: z.array(
+      CanonicalTimelineRowSchema.extend({
+        logRef: z.number().int().nonnegative().nullable().optional(),
+      }),
+    ),
+    textNodes: z.array(TextNodeSnapshotSchema).optional(),
   })
   .refine(({ rows, nextSeq }) => {
     let previous = -1;
@@ -35,7 +45,29 @@ export const AgentTimelineSnapshotSchema = z
       previous = row.seq;
     }
     return true;
-  }, "Timeline sequences must increase and precede nextSeq");
+  }, "Timeline sequences must increase and precede nextSeq")
+  .superRefine((snapshot, ctx) => {
+    try {
+      decodeTextNodes(snapshot.textNodes ?? []);
+      for (const row of snapshot.rows) {
+        if (row.logRef === undefined) continue;
+        if (
+          !snapshot.textNodes ||
+          (row.logRef !== null && row.logRef >= snapshot.textNodes.length) ||
+          row.item.type !== "tool_call" ||
+          row.item.detail.type !== "sub_agent" ||
+          row.item.detail.log !== ""
+        ) {
+          throw new Error("Invalid shared log reference in timeline checkpoint");
+        }
+      }
+    } catch (error) {
+      ctx.addIssue({
+        code: "custom",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
 
 export type AgentTimelineSnapshot = z.infer<typeof AgentTimelineSnapshotSchema>;
 
@@ -53,9 +85,12 @@ interface AgentTimelineState {
   projection: TimelineProjection;
   minSeq: number;
   nextSeq: number;
+  logs: SharedLogStore;
 }
+
 const DEFAULT_TIMELINE_FETCH_LIMIT = 200;
-function cloneRow<T extends AgentTimelineRow>(row: T): T {
+
+function cloneRow(row: AgentTimelineRow): AgentTimelineRow {
   return { ...row };
 }
 
@@ -77,10 +112,29 @@ export class InMemoryAgentTimelineStore {
   /** Raw rows/epoch/nextSeq for one agent, not a projected fetch window. */
   exportSnapshot(agentId: string): AgentTimelineSnapshot {
     const state = this.requireState(agentId);
+    const text = new TextSnapshotWriter();
+    const rows: AgentTimelineSnapshot["rows"] = state.rows.map((row) => {
+      const version = state.logs.version(row.item);
+      if (
+        version === undefined ||
+        row.item.type !== "tool_call" ||
+        row.item.detail.type !== "sub_agent"
+      ) {
+        return cloneRow(row);
+      }
+      // Never spread the lazy detail: its log getter would expand this version.
+      const { log: _log, ...detail } = Object.getOwnPropertyDescriptors(row.item.detail);
+      const compactDetail: typeof row.item.detail = { type: "sub_agent", log: "" };
+      Object.defineProperties(compactDetail, detail);
+      return { ...row, item: { ...row.item, detail: compactDetail }, logRef: text.add(version) };
+    });
     return {
       epoch: state.epoch,
       nextSeq: state.nextSeq,
-      rows: state.rows.map(cloneRow),
+      rows,
+      ...(text.nodes.length || rows.some((row) => row.logRef !== undefined)
+        ? { textNodes: text.nodes }
+        : {}),
     };
   }
 
@@ -94,14 +148,25 @@ export class InMemoryAgentTimelineStore {
 
   /** Replaces this agent's state exactly with the snapshot, no derivation. */
   restoreSnapshot(agentId: string, snapshot: AgentTimelineSnapshot): void {
+    const logs = new SharedLogStore();
+    const nodes = decodeTextNodes(snapshot.textNodes ?? []);
+    const rows = snapshot.rows.map(({ logRef, ...row }) => ({
+      ...row,
+      item:
+        logRef === undefined
+          ? logs.retain(row.item)
+          : logs.attach(row.item, logRef === null ? null : nodes[logRef]),
+    }));
+    logs.seedLatest(rows.map((row) => row.item));
     const projection = new TimelineProjection();
-    for (const row of snapshot.rows) projection.append(row);
+    for (const row of rows) projection.append(row);
     this.states.set(agentId, {
-      projection,
-      minSeq: snapshot.rows[0]?.seq ?? 0,
       epoch: snapshot.epoch,
       nextSeq: snapshot.nextSeq,
-      rows: snapshot.rows.map(cloneRow),
+      rows,
+      logs,
+      projection,
+      minSeq: rows[0]?.seq ?? 0,
     });
   }
 
@@ -111,14 +176,17 @@ export class InMemoryAgentTimelineStore {
       ? options.rows.map(cloneRow)
       : this.buildRowsFromItems(options?.items ?? [], options?.nextSeq ?? 1, timestamp);
     const nextSeq = rows.reduce((next, row) => Math.max(next, row.seq + 1), options?.nextSeq ?? 1);
+    const logs = new SharedLogStore();
+    for (const row of rows) row.item = logs.retain(row.item);
     const projection = new TimelineProjection();
     for (const row of rows) projection.append(row);
     this.states.set(agentId, {
       epoch: options?.epoch ?? randomUUID(),
       rows,
+      nextSeq,
+      logs,
       projection,
       minSeq: rows[0]?.seq ?? 0,
-      nextSeq,
     });
   }
 
@@ -137,13 +205,11 @@ export class InMemoryAgentTimelineStore {
   }
 
   getSubmittedUserMessage(agentId: string, clientMessageId: string): AgentTimelineRow | null {
-    const row = this.requireState(agentId)
-      .projection.getRows()
-      .find(
-        (candidate) =>
-          candidate.item.type === "user_message" &&
-          candidate.item.clientMessageId === clientMessageId,
-      );
+    const row = this.requireState(agentId).rows.find(
+      (candidate) =>
+        candidate.item.type === "user_message" &&
+        candidate.item.clientMessageId === clientMessageId,
+    );
     return row ? cloneRow(row) : null;
   }
 
@@ -154,13 +220,18 @@ export class InMemoryAgentTimelineStore {
   ): AgentTimelineRow | null {
     const state = this.requireState(agentId);
     const index = state.rows.findIndex(
-      (row) => row.item.type === "user_message" && row.item.clientMessageId === clientMessageId,
+      (candidate) =>
+        candidate.item.type === "user_message" &&
+        candidate.item.clientMessageId === clientMessageId,
     );
-    if (index < 0) return null;
-    const row = { ...state.rows[index], providerMessageId };
-    state.rows[index] = row;
+    const row = state.rows[index];
+    if (!row || row.item.type !== "user_message") {
+      return null;
+    }
+    const enriched: AgentTimelineRow = { ...row, providerMessageId };
+    state.rows[index] = enriched;
     state.projection.enrichSubmittedUserMessage(clientMessageId, providerMessageId);
-    return cloneRow(row);
+    return cloneRow(enriched);
   }
 
   getEpoch(agentId: string): string {
@@ -212,13 +283,13 @@ export class InMemoryAgentTimelineStore {
     const row: AgentTimelineRow = {
       seq: state.nextSeq,
       timestamp: options?.timestamp ?? new Date().toISOString(),
-      item,
+      item: state.logs.retain(item),
       ...(options?.turnId ? { turnId: options.turnId } : {}),
       ...(options?.providerMessageId ? { providerMessageId: options.providerMessageId } : {}),
     };
     state.nextSeq += 1;
-    if (state.minSeq === 0) state.minSeq = row.seq;
     state.rows.push(row);
+    if (state.minSeq === 0) state.minSeq = row.seq;
     state.projection.append(row);
     return cloneRow(row);
   }

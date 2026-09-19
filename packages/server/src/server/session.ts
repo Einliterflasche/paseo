@@ -8012,8 +8012,9 @@ export class Session {
         direction: "tail",
         limit: 0,
       });
+      const canonicalRows = await this.agentManager.getCanonicalTimelineRows(msg.agentId);
       const forkContext = buildAgentForkContextAttachment({
-        rows: timeline.rows,
+        rows: canonicalRows,
         cursorBoundary: msg.boundaryCursor
           ? { timelineEpoch: timeline.epoch, cursor: msg.boundaryCursor }
           : null,
