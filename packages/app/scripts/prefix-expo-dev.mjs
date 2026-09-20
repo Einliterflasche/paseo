@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import http from "node:http";
 import net from "node:net";
 import path from "node:path";
+import { Transform } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 const listenPort = Number.parseInt(process.env.PASEO_PORT ?? "", 10);
@@ -26,6 +27,39 @@ const expo = spawn(
   ["start", "--web", "--port", String(upstreamPort)],
   { cwd: appRoot, env: process.env, stdio: "inherit" },
 );
+
+const developmentBaseGuard = Buffer.from("if (process.env.NODE_ENV !== 'development') {");
+
+class DevelopmentBaseUrlTransform extends Transform {
+  #pending = "";
+
+  _transform(chunk, _encoding, callback) {
+    this.#pending += chunk.toString("utf8");
+    this.#drain(false);
+    callback();
+  }
+
+  _flush(callback) {
+    this.#drain(true);
+    callback();
+  }
+
+  #drain(flush) {
+    const needle = developmentBaseGuard.toString("utf8");
+    while (true) {
+      const match = this.#pending.indexOf(needle);
+      if (match < 0) break;
+      this.push(this.#pending.slice(0, match));
+      this.push("if (true) {");
+      this.#pending = this.#pending.slice(match + needle.length);
+    }
+    const readyLength = flush ? this.#pending.length : this.#pending.length - needle.length + 1;
+    if (readyLength > 0) {
+      this.push(this.#pending.slice(0, readyLength));
+      this.#pending = this.#pending.slice(readyLength);
+    }
+  }
+}
 expo.once("error", (error) => {
   console.error(error);
   server.close(() => {
@@ -44,6 +78,13 @@ function proxyRequest(req, res) {
     },
     (upstreamResponse) => {
       const contentType = String(upstreamResponse.headers["content-type"] ?? "");
+      if (contentType.includes("javascript")) {
+        const headers = { ...upstreamResponse.headers };
+        delete headers["content-length"];
+        res.writeHead(upstreamResponse.statusCode ?? 200, headers);
+        upstreamResponse.pipe(new DevelopmentBaseUrlTransform()).pipe(res);
+        return;
+      }
       if (!contentType.includes("text/html")) {
         res.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
         upstreamResponse.pipe(res);
