@@ -155,7 +155,43 @@ it("keeps a reachable custom TCP service running without advertising a web route
   expect(checked).toEqual([7132]);
 
   runtime.set(runtimeEntry());
-  expect(checked).toEqual([7132]);
+  await Promise.resolve();
+  expect(checked).toEqual([7132, 7132]);
+  expect(routes.capture(managedPreviewServiceId(enrollment))).toBeNull();
+  managed.close();
+});
+
+it("requalifies the same binding after a later lifecycle notification", async () => {
+  const runtime = new WorkspaceScriptRuntimeStore();
+  const endpoints = createServiceProxySubsystem({ logger: pino({ level: "silent" }) });
+  const routes = new PreviewRoutes({ excludedPorts: [] });
+  let attempts = 0;
+  const managed = new ManagedPreviewRoutes({
+    runtime,
+    endpoints,
+    routes,
+    qualifyHttp() {
+      attempts += 1;
+      return Promise.resolve(attempts > 1);
+    },
+    onFailure() {},
+  });
+  endpoints.registerWorkspaceService({
+    workspaceId: enrollment.workspaceId,
+    projectSlug: "slow-http",
+    branchName: "main",
+    scriptName: enrollment.scriptName,
+    port: 7133,
+  });
+  runtime.set(runtimeEntry());
+  managed.restoreDefault(enrollment.workspaceId, enrollment.scriptName);
+  await Promise.resolve();
+  expect(routes.capture(managedPreviewServiceId(enrollment))).toBeNull();
+
+  runtime.set(runtimeEntry());
+  await Promise.resolve();
+  expect(attempts).toBe(2);
+  expect(routes.capture(managedPreviewServiceId(enrollment))?.route.port).toBe(7133);
   managed.close();
 });
 

@@ -10,6 +10,7 @@ const { getNativeReleaseVersion } = require("./native-release-version");
 const appVariant = process.env.APP_VARIANT ?? "production";
 const isFdroidBuild = process.env.PASEO_FDROID_BUILD === "1";
 const isProfileBuild = process.env.PASEO_PROFILE_BUILD === "1";
+const webBaseUrl = process.env.PASEO_DEV_BASE_URL?.trim().replace(/\/+$/, "");
 
 const buildProfile = isFdroidBuild
   ? {
@@ -184,6 +185,7 @@ export default {
       typedRoutes: true,
       reactCompiler: true,
       autolinkingModuleResolution: true,
+      ...(webBaseUrl ? { baseUrl: webBaseUrl } : {}),
     },
     extra: {
       fdroidBuild: isFdroidBuild,
