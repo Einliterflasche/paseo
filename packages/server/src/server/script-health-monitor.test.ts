@@ -260,9 +260,11 @@ describe("ScriptHealthMonitor", () => {
     });
 
     const onChange = vi.fn<(workspaceId: string, services: ScriptHealthEntry[]) => void>();
+    const onProbe = vi.fn<(workspaceId: string) => void>();
     const monitor = new ScriptHealthMonitor({
       serviceProxy: routeStore,
       onChange,
+      onProbe,
       pollIntervalMs: 1_000,
       probeTimeoutMs: 100,
       graceMs: 0,
@@ -273,6 +275,8 @@ describe("ScriptHealthMonitor", () => {
     monitor.stop();
 
     expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onProbe).toHaveBeenCalledTimes(3);
+    expect(onProbe).toHaveBeenLastCalledWith("workspace-a");
   });
 
   it("resets cached health when the same service hostname moves to a new port", async () => {
