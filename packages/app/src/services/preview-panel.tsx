@@ -1,5 +1,5 @@
 import { Globe } from "lucide-react-native";
-import { useCallback } from "react";
+import { useCallback, useEffect } from "react";
 import { View, Text } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { useTranslation } from "react-i18next";
@@ -23,19 +23,16 @@ function ServicePreviewPanel() {
   const { coordinator, state } = useServicePreview();
   const opening = state.status === "preparing" || state.status === "loading";
   const busy = opening || state.status === "cancelling";
+  useEffect(() => {
+    if (coordinator && state.status === "idle") void coordinator.open();
+  }, [coordinator, state.status]);
   const recover = useCallback(() => {
     void coordinator?.open({ recover: true });
   }, [coordinator]);
-  const cancel = useCallback(() => coordinator?.cancel(), [coordinator]);
   return (
     <View style={styles.panel}>
       {coordinator ? (
         <View style={styles.toolbar}>
-          {opening ? (
-            <Button size="sm" variant="ghost" onPress={cancel}>
-              {t("common.actions.cancel")}
-            </Button>
-          ) : null}
           {state.status === "error" && state.recovery ? (
             <Button size="sm" variant="ghost" onPress={recover}>
               {t("services.recoverPreview")}
