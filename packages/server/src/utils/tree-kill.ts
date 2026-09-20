@@ -51,8 +51,18 @@ interface OwnedProcess {
   depth: number;
 }
 
+/**
+ * The OS refused the signal for a process the daemon did not create with its
+ * own identity: a setuid transition (sudo, pkexec) inside the tree changed the
+ * owner. The daemon can never stop it, so it is not part of the certified tree.
+ */
+function isForeignProcessSignal(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException)?.code === "EPERM";
+}
+
 class ProcessTreeOwner {
   private readonly owned = new Map<string, OwnedProcess>();
+  private readonly foreign = new Set<string>();
   private initialized = false;
   private certified = false;
   private preparing: Promise<void> | undefined;
@@ -163,7 +173,7 @@ class ProcessTreeOwner {
     while (true) {
       const snapshot = await this.snapshot(inspectionTimeout);
       this.extend(snapshot);
-      const live = this.live(snapshot);
+      const live = this.stoppable(snapshot);
       if (live.length === 0) {
         this.certified = true;
         return true;
@@ -183,19 +193,23 @@ class ProcessTreeOwner {
         ),
       );
       await Promise.all(
-        candidates.map((entry, index) => {
+        candidates.map(async (entry, index) => {
           const identity = current[index];
           const key = identityKey(entry.identity);
           signaled.add(key);
-          return identity && !identity.stopped && identityKey(identity) === key
-            ? this.inspection.signal(identity.pid, signal)
-            : Promise.resolve();
+          if (!identity || identity.stopped || identityKey(identity) !== key) return;
+          try {
+            await this.inspection.signal(identity.pid, signal);
+          } catch (error) {
+            if (!isForeignProcessSignal(error)) throw error;
+            this.foreign.add(key);
+          }
         }),
       );
       if (Date.now() >= deadline) {
         const final = await this.snapshot(inspectionTimeout);
         this.extend(final);
-        if (this.live(final).length === 0) {
+        if (this.stoppable(final).length === 0) {
           this.certified = true;
           return true;
         }
@@ -225,6 +239,16 @@ class ProcessTreeOwner {
         ? [entry]
         : [];
     });
+  }
+
+  /**
+   * Live processes whose cessation certifies teardown. A foreign-owned process
+   * stays in the traversal so its own descendants are still discovered and
+   * signaled, but it can neither be stopped nor emit through the provider pipe
+   * the daemon owns, so it never blocks certification.
+   */
+  private stoppable(snapshot: ProcessIdentity[]): OwnedProcess[] {
+    return this.live(snapshot).filter((entry) => !this.foreign.has(identityKey(entry.identity)));
   }
 
   private extend(snapshot: ProcessIdentity[]): void {
