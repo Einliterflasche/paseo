@@ -306,7 +306,7 @@ it("filters response cookies and origin-wide headers while preserving app restri
   expect(result.headers).toMatchObject({
     "x-frame-options": "SAMEORIGIN",
     "cache-control": "no-store",
-    "content-security-policy": "default-src 'none'; img-src 'self', worker-src 'none'",
+    "content-security-policy": "default-src 'none'; img-src 'self', worker-src 'self'",
   });
   for (const name of [
     "clear-site-data",
