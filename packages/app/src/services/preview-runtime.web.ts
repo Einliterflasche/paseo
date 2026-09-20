@@ -14,6 +14,7 @@ import { browserPreviewProfile } from "./preview-browser-profile.web";
 import { submitPreviewForm } from "./preview-form.web";
 import { openPreviewDocument } from "./preview-navigation.web";
 import { reserveStandalonePreview } from "./preview-standalone-navigation.web";
+import { createPreviewThumbnailFrame } from "./preview-thumbnail-frame.web";
 
 export interface PreviewWorkspaceContext {
   serverId: string;
@@ -91,15 +92,17 @@ export function createPreviewRuntime({ document, onCloseFailure }: PreviewRuntim
     mode,
     lifetime,
     record,
+    frame: suppliedFrame,
   }: {
     serverId: string;
     serviceId: string;
     mode: "iframe" | "tab";
     lifetime: AbortSignal;
     record?: Resident;
+    frame?: HTMLIFrameElement;
   }) {
     const host = getHostRuntimeStore();
-    const frame = record?.surface.frame;
+    const frame = suppliedFrame ?? record?.surface.frame;
     const coordinator: ReturnType<typeof createPreviewCoordinator> = createPreviewCoordinator({
       serviceId,
       mode,
@@ -166,6 +169,33 @@ export function createPreviewRuntime({ document, onCloseFailure }: PreviewRuntim
     owner,
     get,
     acquireBrowser: browserPreviews.acquire,
+    createThumbnail({
+      serverId,
+      serviceId,
+      anchor,
+    }: {
+      serverId: string;
+      serviceId: string;
+      anchor: HTMLElement;
+    }) {
+      const lifetime = new AbortController();
+      const thumbnail = createPreviewThumbnailFrame({ document, anchor, serviceId });
+      const coordinator = initializeCoordinator({
+        serverId,
+        serviceId,
+        mode: "iframe",
+        lifetime: lifetime.signal,
+        frame: thumbnail.frame,
+      });
+      void coordinator.open();
+      return {
+        close() {
+          coordinator.close();
+          lifetime.abort();
+          thumbnail.close();
+        },
+      };
+    },
     close() {
       browserPreviews.close();
       owner.close();
