@@ -180,6 +180,11 @@ export class ManagedPreviewRoutes {
     }
   }
 
+  /** Reconsider an unqualified binding after the shared TCP health owner changes state. */
+  refreshWorkspace(workspaceId: string): void {
+    this.refresh(workspaceId);
+  }
+
   private resolve(enrollment: ManagedPreviewEnrollment) {
     const runtime = this.options.runtime.get(enrollment);
     if (!runtime || runtime.type !== "service" || runtime.lifecycle !== "running") return null;

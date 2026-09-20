@@ -217,7 +217,14 @@ export async function openPreviewFeature(options: PreviewFeatureOptions) {
     });
     await worker.ready;
     void worker.closed.then(close);
-    return { broker, managed, socketPath: worker.socketPath, close, shutdown };
+    return {
+      broker,
+      managed,
+      socketPath: worker.socketPath,
+      refreshWorkspace: (workspaceId: string) => managed.refreshWorkspace(workspaceId),
+      close,
+      shutdown,
+    };
   } catch (error) {
     try {
       await shutdown();
