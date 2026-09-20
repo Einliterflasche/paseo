@@ -65,6 +65,7 @@ import type { ServiceProxySubsystem } from "./service-proxy.js";
 import type { WorkspaceScriptRuntimeStore } from "./workspace-script-runtime-store.js";
 import type { SpeechReadinessSnapshot, SpeechService } from "./speech/speech-runtime.js";
 import type { VoiceCallerContext, VoiceSpeakHandler } from "./voice-types.js";
+import { CURRENT_CHECKPOINT_FORMAT } from "./restart/daemon-checkpoint.js";
 import {
   computeNotificationPlan,
   isPushEligibleAttentionReason,
@@ -1767,7 +1768,7 @@ export class VoiceAssistantWebSocketServer {
             restartRecoveryStage: this.getRestartStatus().stage,
             restartRecoveryPreviousGeneration: this.getRestartStatus().previousGenerationId,
             restartRecoveryAffectedAgents: this.getRestartStatus().affectedAgentIds,
-            restartCheckpointFormat: 3,
+            restartCheckpointFormat: CURRENT_CHECKPOINT_FORMAT,
           }
         : {}),
       serverId: this.serverId,

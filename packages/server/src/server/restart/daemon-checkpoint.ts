@@ -5,6 +5,7 @@ import { ScheduleRestartSnapshotSchema } from "../schedule/service.js";
 import { WorkspaceServiceRestartSnapshotSchema } from "./workspace-service-checkpoint.js";
 
 export const READABLE_CHECKPOINT_FORMATS = [1, 2, 3, 4] as const;
+export const CURRENT_CHECKPOINT_FORMAT = 4;
 
 export const DaemonCheckpointSchema = z
   .object({
