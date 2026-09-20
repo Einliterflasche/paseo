@@ -294,6 +294,7 @@ export function useWorkspaceTerminals(input: UseWorkspaceTerminalsInput) {
     query,
     queryKey,
     removeTerminalFromCache,
+    scriptTerminalIds,
     standaloneTerminalIds,
     terminals,
   };
