@@ -104,7 +104,11 @@ function proxyRequest(req, res) {
         const html = Buffer.concat(chunks)
           .toString("utf8")
           .replaceAll('src="/', `src="${baseUrl}/`)
-          .replaceAll('href="/', `href="${baseUrl}/`);
+          .replaceAll('href="/', `href="${baseUrl}/`)
+          // Expo's generated web shell disables Metro HMR by default. This
+          // wrapper exists specifically for the live Paseo development
+          // preview, so opt its bundle into Fast Refresh.
+          .replaceAll("hot=false", "hot=true");
         const headers = { ...upstreamResponse.headers };
         delete headers["content-length"];
         res.writeHead(upstreamResponse.statusCode ?? 200, headers);
