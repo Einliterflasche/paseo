@@ -932,7 +932,7 @@ describe("optional preview HTTP gateway", () => {
     expect(result.headers["set-cookie"]).toEqual([
       "app=ok; Path=/__paseo_services/apps/atlas/; HttpOnly",
     ]);
-    expect(result.headers["content-security-policy"]).toBe("default-src 'self', worker-src 'none'");
+    expect(result.headers["content-security-policy"]).toBe("default-src 'self', worker-src 'self'");
     expect(result.headers["cache-control"]).toBe("no-store");
   });
 

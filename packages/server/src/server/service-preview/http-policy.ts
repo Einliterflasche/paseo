@@ -259,7 +259,12 @@ export function createPreviewHttpPolicy({
     const policies: string[] = [];
     if (typeof existingCsp === "string") policies.push(existingCsp);
     else if (existingCsp) policies.push(...existingCsp);
-    policies.push("worker-src 'none'");
+    // Same-origin workers (dedicated/shared) are allowed: previewed web apps
+    // legitimately run wasm engines and similar in a Worker. Service workers
+    // stay unreachable because the admission layer rejects any request that
+    // carries a `Service-Worker` header, and a service worker's scope can never
+    // exceed the directory of the script it is registered from.
+    policies.push("worker-src 'self'");
     headers["content-security-policy"] = policies;
     headers["cache-control"] = "no-store";
     return headers;
