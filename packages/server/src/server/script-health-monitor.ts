@@ -21,6 +21,7 @@ interface RouteHealthState {
 export class ScriptHealthMonitor {
   private readonly serviceProxy: ServiceProxySubsystem;
   private readonly onChange: (workspaceId: string, scripts: ScriptHealthEntry[]) => void;
+  private readonly onProbe: (workspaceId: string) => void;
   private readonly pollIntervalMs: number;
   private readonly probeTimeoutMs: number;
   private readonly graceMs: number;
@@ -34,6 +35,7 @@ export class ScriptHealthMonitor {
   constructor({
     serviceProxy,
     onChange,
+    onProbe = () => {},
     pollIntervalMs = 3_000,
     probeTimeoutMs = 500,
     graceMs = 5_000,
@@ -41,6 +43,7 @@ export class ScriptHealthMonitor {
   }: {
     serviceProxy: ServiceProxySubsystem;
     onChange: (workspaceId: string, scripts: ScriptHealthEntry[]) => void;
+    onProbe?: (workspaceId: string) => void;
     pollIntervalMs?: number;
     probeTimeoutMs?: number;
     graceMs?: number;
@@ -48,6 +51,7 @@ export class ScriptHealthMonitor {
   }) {
     this.serviceProxy = serviceProxy;
     this.onChange = onChange;
+    this.onProbe = onProbe;
     this.pollIntervalMs = pollIntervalMs;
     this.probeTimeoutMs = probeTimeoutMs;
     this.graceMs = graceMs;
@@ -130,6 +134,10 @@ export class ScriptHealthMonitor {
       }
 
       this.pruneRemovedRoutes(activeHostnames);
+
+      for (const workspaceId of new Set(routes.map((route) => route.workspaceId))) {
+        this.onProbe(workspaceId);
+      }
 
       for (const workspaceId of changedWorkspaceIds) {
         const scripts = this.buildWorkspaceScriptList(workspaceId);

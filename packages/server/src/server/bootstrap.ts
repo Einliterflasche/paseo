@@ -858,9 +858,9 @@ export async function createPaseoDaemon(
   });
   const scriptHealthMonitor = new ScriptHealthMonitor({
     serviceProxy,
+    onProbe: (workspaceId) => previewFeature?.refreshWorkspace(workspaceId),
     onChange: (workspaceId, scripts) => {
       emitScriptStatus(workspaceId, scripts);
-      previewFeature?.refreshWorkspace(workspaceId);
     },
   });
   const handleBranchChange = createBranchChangeRouteHandler({
