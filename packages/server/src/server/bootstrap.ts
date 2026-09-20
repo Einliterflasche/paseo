@@ -843,21 +843,25 @@ export async function createPaseoDaemon(
   });
   let wsServer: VoiceAssistantWebSocketServer | null = null;
   let serviceProxyListenTarget: ListenTarget | null = null;
+  const emitScriptStatus = createScriptStatusEmitter({
+    sessions: () =>
+      wsServer?.listSessions().map((session) => ({
+        emit: (message) => session.emitServerMessage(message),
+      })) ?? [],
+    serviceProxy,
+    runtimeStore: scriptRuntimeStore,
+    daemonPort: () => (boundListenTarget?.type === "tcp" ? boundListenTarget.port : null),
+    resolveWorkspaceDirectory: async (workspaceId) =>
+      (await workspaceRegistry?.get(workspaceId))?.cwd ?? null,
+    logger,
+    serviceProxyPublicBaseUrl,
+  });
   const scriptHealthMonitor = new ScriptHealthMonitor({
     serviceProxy,
-    onChange: createScriptStatusEmitter({
-      sessions: () =>
-        wsServer?.listSessions().map((session) => ({
-          emit: (message) => session.emitServerMessage(message),
-        })) ?? [],
-      serviceProxy,
-      runtimeStore: scriptRuntimeStore,
-      daemonPort: () => (boundListenTarget?.type === "tcp" ? boundListenTarget.port : null),
-      resolveWorkspaceDirectory: async (workspaceId) =>
-        (await workspaceRegistry?.get(workspaceId))?.cwd ?? null,
-      logger,
-      serviceProxyPublicBaseUrl,
-    }),
+    onChange: (workspaceId, scripts) => {
+      emitScriptStatus(workspaceId, scripts);
+      previewFeature?.refreshWorkspace(workspaceId);
+    },
   });
   const handleBranchChange = createBranchChangeRouteHandler({
     serviceProxy,
