@@ -82,15 +82,16 @@ http.createServer((req, res) => { fs.appendFileSync('requests.log', req.url+'\\n
     const gallery = page.getByTestId("services-gallery").filter({ visible: true });
     await expect(gallery).toBeVisible();
     await expect(gallery.locator('[data-testid^="service-card-"]')).toHaveCount(2);
-    await expect(gallery.getByTestId("service-start-web")).toBeEnabled();
+    await expect(gallery.getByTestId("service-preview-web")).toBeDisabled();
+    await expect(gallery.getByTestId("service-preview-start-web")).toBeEnabled();
     expect(
       (await client.listWorkspaceScripts(workspace.id)).scripts?.find(
         (script) => script.scriptName === "web",
       )?.lifecycle,
     ).toBe("stopped");
     await page.screenshot({ path: testInfo.outputPath("01-host-gallery.png") });
-    await gallery.getByTestId("service-start-web").dblclick();
-    await expect(gallery.getByTestId("service-stop-web")).toBeEnabled();
+    await gallery.getByTestId("service-preview-start-web").dblclick();
+    await expect(gallery.getByTestId("service-preview-stop-web")).toBeEnabled();
     const running = (await client.listWorkspaceScripts(workspace.id)).scripts?.find(
       (script) => script.scriptName === "web",
     );
@@ -114,8 +115,11 @@ http.createServer((req, res) => { fs.appendFileSync('requests.log', req.url+'\\n
     await page.reload();
     await expect(gallery.getByTestId("services-list")).toHaveAttribute("aria-selected", "true");
     await expect(gallery.locator('[data-testid^="service-card-"]')).toHaveCount(2);
-    await gallery.getByTestId("service-stop-web").click();
-    await expect(gallery.getByTestId("service-start-web")).toBeEnabled();
+    const webCard = gallery.getByTestId(`service-card-${workspace.id}-web`);
+    await webCard.getByRole("button", { name: "More actions: web", exact: true }).click();
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.getByTestId("service-stop-web").click();
+    await expect(webCard.getByText("Stopped", { exact: true })).toBeVisible();
     expect(
       (await client.listWorkspaceScripts(workspace.id)).scripts?.find(
         (script) => script.scriptName === "web",
@@ -155,7 +159,9 @@ http.createServer((req, res) => { fs.appendFileSync('requests.log', req.url+'\\n
     await expect(
       page.getByText("Host disconnected. Showing last known state; actions are unavailable."),
     ).toBeVisible();
+    await webCard.getByRole("button", { name: "More actions: web", exact: true }).click();
     await expect(page.getByTestId("service-start-web").filter({ visible: true })).toBeDisabled();
+    await page.keyboard.press("Escape");
     await page.screenshot({ path: testInfo.outputPath("04-offline-gallery.png") });
     expect(lifecycleRequests).toEqual(["workspace.script.start.request"]);
     expect(errors).toEqual([]);
