@@ -19,6 +19,7 @@ test.each(READABLE_CHECKPOINT_FORMATS)(
       agents: { agents: [], timelines: {}, children: [] },
       notifications: [],
       schedules: { runs: [] },
+      ...(version === 4 ? { services: [] } : {}),
     });
     const dir = join(home, "restart-checkpoints", saved.generationId);
     const before = await readFile(join(dir, "snapshot.json"), "utf8");

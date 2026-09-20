@@ -179,8 +179,11 @@ lack this command are rejected; do not flatten history or bypass preflight to us
 Recovery semantics also need the isolated handoff test; format acceptance alone is
 not rollback evidence.
 
-The package deployed before the systemic memory fix does not support that preflight
-or checkpoint format 3. Keep its archive for investigation; it is not a compatible
+Checkpoint format 4 includes running managed services. The deployment guard may allow
+their owned terminals only when the running daemon advertises format 4 and its live
+workspace inventory identifies every allowed terminal as a running service. Any
+ordinary or unclassified terminal still blocks activation, as does an older checkpoint
+format. A format-3 package cannot restore a format-4 generation and is not a compatible
 rollback target. Until another validated package supports the current format, recovery
 means repairing forward while preserving the paused daemon and its checkpoint.
 

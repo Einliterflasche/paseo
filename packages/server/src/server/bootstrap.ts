@@ -86,6 +86,41 @@ function assertControlListenerOwnership(config: PaseoDaemonConfig): void {
   }
 }
 
+function createWorkspaceServiceRestoration({
+  runtimeStore,
+  terminalManager,
+  launch,
+}: {
+  runtimeStore: WorkspaceScriptRuntimeStore;
+  terminalManager: TerminalManager;
+  launch(identity: { workspaceId: string; scriptName: string }): Promise<{
+    lifecycle: "running" | "stopped";
+    terminalId?: string | null;
+  }>;
+}): WorkspaceServiceRestoration {
+  return new WorkspaceServiceRestoration(
+    runtimeStore,
+    async (identity) => {
+      const service = await launch(identity);
+      if (service.lifecycle !== "running" || !service.terminalId) {
+        throw new Error(
+          `Restored workspace service did not start: ${identity.workspaceId}/${identity.scriptName}`,
+        );
+      }
+      return { terminalId: service.terminalId };
+    },
+    async (terminalId) => {
+      if (terminalManager.getTerminal(terminalId)) {
+        await terminalManager.killTerminalAndWait(terminalId);
+      }
+    },
+  );
+}
+
+function configuredGitProcessPolicy(config: PaseoDaemonConfig) {
+  return config.git ?? resolveGitProcessPolicy({ env: process.env });
+}
+
 function createControlAdmission({
   transport,
   getListenTarget,
@@ -306,6 +341,7 @@ import { ScriptHealthMonitor } from "./script-health-monitor.js";
 import { createScriptStatusEmitter } from "./script-status-projection.js";
 import { WorkspaceScriptRuntimeStore } from "./workspace-script-runtime-store.js";
 import { createWorkspaceScriptsService } from "./session/workspace-scripts/workspace-scripts-service.js";
+import { WorkspaceServiceRestoration } from "./restart/workspace-service-restoration.js";
 import { assertWorkspaceAutomationAllowedForWorkspace } from "./workspace-automation-gate.js";
 import { spawnWorkspaceScript } from "./worktree-bootstrap.js";
 import {
@@ -707,7 +743,7 @@ export async function createPaseoDaemon(
   dependencies: PaseoDaemonDependencies = {},
 ): Promise<PaseoDaemon> {
   assertControlListenerOwnership(config);
-  configureGitProcessPolicy(config.git ?? resolveGitProcessPolicy({ env: process.env }));
+  configureGitProcessPolicy(configuredGitProcessPolicy(config));
   const logger = rootLogger.child({ module: "bootstrap" });
   // Older transcript stores remain available for inspection or deliberate recovery.
   const bootstrapStart = performance.now();
@@ -1486,6 +1522,29 @@ export async function createPaseoDaemon(
     createPaseoWorktreeWorkspace: createSchedulePaseoWorktreeExternal,
     archiveWorkspace: archiveScheduleWorkspaceExternal,
   });
+  const restartWorkspaceScripts = createWorkspaceScriptsService({
+    serviceProxy,
+    scriptRuntimeStore,
+    terminalManager,
+    workspaceRegistry,
+    projectRegistry,
+    workspaceGitService,
+    getDaemonTcpPort: () => (boundListenTarget?.type === "tcp" ? boundListenTarget.port : null),
+    getDaemonTcpHost: () => (boundListenTarget?.type === "tcp" ? boundListenTarget.host : null),
+    serviceProxyPublicBaseUrl,
+    resolveScriptHealth: (hostname) => scriptHealthMonitor.getHealthForHostname(hostname),
+    logger,
+    emit: (message) => wsServer?.broadcast(wrapSessionMessage(message)),
+    spawnWorkspaceScript,
+    assertAutomationAllowed: (workspaceId) =>
+      assertWorkspaceAutomationAllowedForWorkspace(workspaceRegistry, workspaceId),
+    globalServicePorts: loadPersistedConfig(config.paseoHome).worktrees?.servicePorts,
+  });
+  const workspaceServiceRestoration = createWorkspaceServiceRestoration({
+    runtimeStore: scriptRuntimeStore,
+    terminalManager,
+    launch: (identity) => restartWorkspaceScripts.launch(identity),
+  });
   const restartController = new RestartController({
     store: new CheckpointStore(config.paseoHome, DaemonCheckpointSchema.parse),
     changed: () => wsServer?.broadcastRestartStatus(),
@@ -1501,17 +1560,20 @@ export async function createPaseoDaemon(
       await wsServer?.drainAgentRequests();
       await drainFinishNotificationWatches(agentManager);
       await scheduleService.snapshotForRestart();
+      await workspaceServiceRestoration.rollbackOrThrow();
     },
     affectedAgentIds: () => agentManager.recoveryBlockedAgents(),
     initialize: () => scheduleService.initializeRecoveryState(),
     capture: async () => ({
-      version: 3 as const,
+      version: 4 as const,
       agents: await agentManager.quiesceForRestart(),
       notifications: snapshotFinishNotificationWatches(agentManager),
       schedules: await scheduleService.snapshotForRestart(),
+      services: workspaceServiceRestoration.capture(),
     }),
     install: async (snapshot) => {
       await agentManager.installRestartCheckpoint(snapshot.agents);
+      workspaceServiceRestoration.install(snapshot.services);
       scheduleService.restoreAfterRestart(snapshot.schedules);
       await scheduleService.initializeRecoveryState();
       for (const watch of snapshot.notifications)
@@ -1519,11 +1581,15 @@ export async function createPaseoDaemon(
     },
     resume: async (snapshot) => {
       scheduleService.restoreAfterRestart(snapshot.schedules);
+      await workspaceServiceRestoration.resume();
       await agentManager.resumeRestartCheckpoint(snapshot.agents, () =>
         scheduleService.resumeRestoredRuns(),
       );
     },
-    finalize: () => agentManager.finalizeRestartRestoration(),
+    finalize: async () => {
+      await agentManager.finalizeRestartRestoration();
+      workspaceServiceRestoration.finalize();
+    },
     open: () => {
       agentManager.openRestartAdmissions();
       retryPendingFinishNotifications(agentManager);
@@ -1588,26 +1654,7 @@ export async function createPaseoDaemon(
       await emitWorkspaceUpdatesExternal([workspace.workspaceId]);
       return workspace;
     },
-    workspaceScripts: createWorkspaceScriptsService({
-      serviceProxy,
-      scriptRuntimeStore,
-      terminalManager,
-      workspaceRegistry,
-      projectRegistry,
-      workspaceGitService,
-      getDaemonTcpPort: () => (boundListenTarget?.type === "tcp" ? boundListenTarget.port : null),
-      getDaemonTcpHost: () => (boundListenTarget?.type === "tcp" ? boundListenTarget.host : null),
-      serviceProxyPublicBaseUrl,
-      resolveScriptHealth: (hostname) => scriptHealthMonitor.getHealthForHostname(hostname),
-      logger,
-      // MCP operations do not belong to one WebSocket session, so lifecycle
-      // status updates fan out to every connected client.
-      emit: (message) => wsServer?.broadcast(wrapSessionMessage(message)),
-      spawnWorkspaceScript,
-      assertAutomationAllowed: (workspaceId) =>
-        assertWorkspaceAutomationAllowedForWorkspace(workspaceRegistry, workspaceId),
-      globalServicePorts: loadPersistedConfig(config.paseoHome).worktrees?.servicePorts,
-    }),
+    workspaceScripts: restartWorkspaceScripts,
     markWorkspaceArchiving: markWorkspaceArchivingExternal,
     clearWorkspaceArchiving: clearWorkspaceArchivingExternal,
     ensureWorkspaceForCreate: createAgentCommandDependencies.ensureWorkspaceForCreate,

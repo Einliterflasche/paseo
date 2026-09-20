@@ -53,6 +53,10 @@ function prepareClient(overrides: Partial<DeployPrepareClient> = {}): DeployPrep
             }
           : { features: { restartRecovery: true } }),
     listTerminals: async () => ({ terminals: [] }),
+    fetchWorkspaces: async () => ({
+      entries: [],
+      pageInfo: { nextCursor: null, hasMore: false },
+    }),
     prepareRestart: async (reason) => {
       const result = await prepareRestartImpl(reason);
       if (result.generationId) preparedGeneration = result.generationId;
@@ -60,6 +64,23 @@ function prepareClient(overrides: Partial<DeployPrepareClient> = {}): DeployPrep
     },
     close: async () => {},
     ...rest,
+  };
+}
+
+function runningServiceWorkspacePage(terminalId: string) {
+  return {
+    entries: [
+      {
+        scripts: [
+          {
+            type: "service" as const,
+            lifecycle: "running" as const,
+            terminalId,
+          },
+        ],
+      },
+    ],
+    pageInfo: { nextCursor: null, hasMore: false },
   };
 }
 
@@ -520,6 +541,109 @@ describe("runDeployCommand", () => {
   // a swallowed server-side enumeration failure. That gap is root's to close server-side;
   // these tests only cover what the CLI does with the client-level outcomes it is given.
   describe("terminal/managed-service continuity veto", () => {
+    it("allows running service terminals when checkpoint format 4 preserves them", async () => {
+      const fetchWorkspaces = vi
+        .fn<DeployPrepareClient["fetchWorkspaces"]>()
+        .mockResolvedValue(runningServiceWorkspacePage("service-terminal"));
+      let generation: string | undefined;
+      const { deps, calls } = makeDeps({
+        targetFormats: async () => [1, 2, 3, 4],
+        connectPrepare: async () =>
+          prepareClient({
+            getLastServerInfoMessage: () => ({
+              features: { restartRecovery: true },
+              restartCheckpointFormat: 4,
+              ...(generation
+                ? {
+                    restartRecoveryState: "paused",
+                    restartRecoveryStage: "ready",
+                    restartRecoveryGeneration: generation,
+                  }
+                : {}),
+            }),
+            listTerminals: async () => ({
+              terminals: [{ id: "service-terminal", name: "web" }],
+            }),
+            fetchWorkspaces,
+            prepareRestart: async () => {
+              generation = "gen-1";
+              return { generationId: generation };
+            },
+          }),
+      });
+
+      await expect(
+        runDeployCommand(
+          ["sudo", "switch"],
+          { targetCli: "/nix/store/target/bin/paseo" },
+          {} as never,
+          deps,
+        ),
+      ).resolves.toMatchObject({ data: { action: "deployed" } });
+      expect(fetchWorkspaces).toHaveBeenCalledTimes(2);
+      expect(calls.spawnActivation).toEqual([["sudo", "switch"]]);
+    });
+
+    it("still refuses an ordinary terminal alongside a restorable service", async () => {
+      const { deps, calls } = makeDeps({
+        targetFormats: async () => [1, 2, 3, 4],
+        connectPrepare: async () =>
+          prepareClient({
+            getLastServerInfoMessage: () => ({
+              features: { restartRecovery: true },
+              restartCheckpointFormat: 4,
+            }),
+            listTerminals: async () => ({
+              terminals: [
+                { id: "service-terminal", name: "web" },
+                { id: "shell-terminal", name: "shell" },
+              ],
+            }),
+            fetchWorkspaces: async () => runningServiceWorkspacePage("service-terminal"),
+          }),
+      });
+
+      await expect(
+        runDeployCommand(
+          ["sudo", "switch"],
+          { targetCli: "/nix/store/target/bin/paseo" },
+          {} as never,
+          deps,
+        ),
+      ).rejects.toMatchObject({
+        code: "DEPLOY_TERMINALS_ACTIVE",
+        details: "shell (shell-terminal)",
+      });
+      expect(calls.spawnActivation).toEqual([]);
+    });
+
+    it("refuses service terminals when the running daemon cannot checkpoint them", async () => {
+      const fetchWorkspaces = vi.fn();
+      const { deps } = makeDeps({
+        connectPrepare: async () =>
+          prepareClient({
+            getLastServerInfoMessage: () => ({
+              features: { restartRecovery: true },
+              restartCheckpointFormat: 3,
+            }),
+            listTerminals: async () => ({
+              terminals: [{ id: "service-terminal", name: "web" }],
+            }),
+            fetchWorkspaces,
+          }),
+      });
+
+      await expect(
+        runDeployCommand(
+          ["sudo", "switch"],
+          { targetCli: "/nix/store/target/bin/paseo" },
+          {} as never,
+          deps,
+        ),
+      ).rejects.toMatchObject({ code: "DEPLOY_TERMINALS_ACTIVE" });
+      expect(fetchWorkspaces).not.toHaveBeenCalled();
+    });
+
     it("refuses immediately when terminals are already active, before preparing or activating", async () => {
       const prepareRestart = vi.fn();
       const { deps, calls } = makeDeps({
