@@ -1735,6 +1735,7 @@ function WorkspaceScreenContent({
     query: terminalsQuery,
     queryKey: terminalsQueryKey,
     removeTerminalFromCache,
+    scriptTerminalIds,
     standaloneTerminalIds,
   } = useWorkspaceTerminals({
     client,
@@ -2528,6 +2529,17 @@ function WorkspaceScreenContent({
     async (input: { tabId: string; terminalId: string }) => {
       const { tabId, terminalId } = input;
       await closeTab(tabId, async () => {
+        if (scriptTerminalIds.has(terminalId)) {
+          setHoveredCloseTabKey((current) => (current === tabId ? null : current));
+          if (persistenceKey) {
+            closeWorkspaceTabWithCleanup({
+              tabId,
+              target: { kind: "terminal", terminalId },
+            });
+          }
+          return;
+        }
+
         const confirmed = await confirmDialog({
           title: t("workspace.tabs.confirmations.closeTerminalTitle"),
           message: t("workspace.tabs.confirmations.closeTerminalMessage"),
@@ -2558,6 +2570,7 @@ function WorkspaceScreenContent({
       killTerminalAsync,
       persistenceKey,
       removeTerminalFromCache,
+      scriptTerminalIds,
       t,
     ],
   );

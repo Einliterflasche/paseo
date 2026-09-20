@@ -416,12 +416,7 @@ const ServiceCard = memo(function ServiceCard({
           <Text style={styles.caption}>
             {entry.port === null ? t("services.noPort") : t("services.port", { port: entry.port })}
           </Text>
-          {running ? (
-            <StatusBadge
-              variant={!stale && entry.health === "healthy" ? "success" : "muted"}
-              label={t(healthLabel(entry, stale))}
-            />
-          ) : null}
+          {running ? <StatusBadge variant="muted" label={t(healthLabel(entry, stale))} /> : null}
           <ServiceCardActions
             serverId={serverId}
             entry={entry}
