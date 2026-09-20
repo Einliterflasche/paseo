@@ -24,7 +24,7 @@ import { useToast } from "@/contexts/toast-context";
 import { useTranslation } from "react-i18next";
 
 type PreviewRuntime = ReturnType<typeof createPreviewRuntime>;
-const PreviewRuntimeContext = createContext<PreviewRuntime | null>(null);
+export const PreviewRuntimeContext = createContext<PreviewRuntime | null>(null);
 
 function ResidentHost({ children }: { children: ReactNode }) {
   const toast = useToast();

@@ -23,6 +23,7 @@ import { ExternalServiceCard } from "./external-card";
 import { BrowserPreviewActions, ServiceLifecycleActions } from "./browser-preview-actions";
 import type { ServicesViewMode } from "./preferences";
 import { confirmDialog } from "@/utils/confirm-dialog";
+import { ServiceThumbnail } from "./service-thumbnail";
 
 import type { Theme } from "@/styles/theme";
 const mutedColorMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
@@ -271,6 +272,7 @@ function serviceKey(entry: GalleryEntry) {
 }
 
 function ServicePreviewPlaceholder({
+  serverId,
   entry,
   canOpen,
   canManage,
@@ -278,6 +280,7 @@ function ServicePreviewPlaceholder({
   onOpen,
   onToggle,
 }: {
+  serverId: string;
   entry: ServiceCatalogEntry;
   canOpen: boolean;
   canManage: boolean;
@@ -288,6 +291,7 @@ function ServicePreviewPlaceholder({
   const { t } = useTranslation();
   const enabled = Boolean(entry.previewServiceId && canOpen);
   const running = entry.lifecycle === "running";
+  const thumbnail = running && entry.health === "healthy" && entry.previewServiceId;
   const toggle = useCallback(
     (event: GestureResponderEvent) => {
       event.stopPropagation();
@@ -318,10 +322,16 @@ function ServicePreviewPlaceholder({
           <ThemedPlay size={17} uniProps={mutedColorMapping} />
         )}
       </Pressable>
-      <ThemedGlobe size={32} uniProps={mutedColorMapping} />
-      <Text style={styles.caption}>
-        {t(enabled ? "services.previewReady" : "services.previewUnavailable")}
-      </Text>
+      {thumbnail ? (
+        <ServiceThumbnail serverId={serverId} serviceId={thumbnail} />
+      ) : (
+        <>
+          <ThemedGlobe size={32} uniProps={mutedColorMapping} />
+          <Text style={styles.caption}>
+            {t(enabled ? "services.previewReady" : "services.previewUnavailable")}
+          </Text>
+        </>
+      )}
     </Pressable>
   );
 }
@@ -438,6 +448,7 @@ const ServiceCard = memo(function ServiceCard({
     <View style={styles.card} testID={`service-card-${entry.workspaceId}-${entry.scriptName}`}>
       {!compact ? (
         <ServicePreviewPlaceholder
+          serverId={serverId}
           entry={entry}
           canOpen={Boolean(onOpen) && online && !stale && !busy}
           canManage={online && canManage}
