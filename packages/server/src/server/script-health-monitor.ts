@@ -12,6 +12,7 @@ export interface ScriptHealthEntry {
 
 interface RouteHealthState {
   workspaceId: string;
+  port: number;
   health: ScriptHealthState;
   consecutiveFailures: number;
   registeredAt: number;
@@ -76,6 +77,10 @@ export class ScriptHealthMonitor {
   }
 
   invalidateWorkspace(workspaceId: string): void {
+    const now = Date.now();
+    for (const route of this.serviceProxy.getWorkspaceHealthTargets(workspaceId)) {
+      this.getOrCreateState(route, now);
+    }
     const scripts = this.buildWorkspaceScriptList(workspaceId);
     const snapshot = JSON.stringify(scripts);
     if (snapshot === this.lastEmittedSnapshots.get(workspaceId)) {
@@ -142,16 +147,17 @@ export class ScriptHealthMonitor {
   }
 
   private getOrCreateState(
-    route: Pick<ServiceProxyHealthTarget, "hostname" | "workspaceId">,
+    route: Pick<ServiceProxyHealthTarget, "hostname" | "workspaceId" | "port">,
     registeredAt: number,
   ): RouteHealthState {
     const existing = this.routeStates.get(route.hostname);
-    if (existing) {
+    if (existing && existing.workspaceId === route.workspaceId && existing.port === route.port) {
       return existing;
     }
 
     const state: RouteHealthState = {
       workspaceId: route.workspaceId,
+      port: route.port,
       health: "pending",
       consecutiveFailures: 0,
       registeredAt,

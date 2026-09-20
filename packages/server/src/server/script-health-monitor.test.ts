@@ -275,6 +275,48 @@ describe("ScriptHealthMonitor", () => {
     expect(onChange).toHaveBeenCalledTimes(1);
   });
 
+  it("resets cached health when the same service hostname moves to a new port", async () => {
+    vi.useFakeTimers();
+    const first = await startTcpServer();
+    const second = await startTcpServer();
+    servers.add(first.server);
+    servers.add(second.server);
+    const routeStore = new ScriptRouteStore();
+    const route = {
+      hostname: "route-b.example.localhost",
+      workspaceId: "workspace-a",
+      projectSlug: "repo",
+      scriptName: "api",
+    };
+    routeStore.registerRoute({ ...route, port: first.port });
+    const onChange = vi.fn<(workspaceId: string, services: ScriptHealthEntry[]) => void>();
+    const monitor = new ScriptHealthMonitor({
+      serviceProxy: routeStore,
+      onChange,
+      pollIntervalMs: 1_000,
+      probeTimeoutMs: 100,
+      graceMs: 0,
+    });
+
+    monitor.start();
+    await advancePoll(1_000);
+    expect(monitor.getHealthForHostname(route.hostname)).toBe("healthy");
+
+    routeStore.registerRoute({ ...route, port: second.port });
+    monitor.invalidateWorkspace(route.workspaceId);
+    expect(monitor.getHealthForHostname(route.hostname)).toBe("pending");
+    expect(onChange).toHaveBeenLastCalledWith(route.workspaceId, [
+      { scriptName: "api", hostname: route.hostname, port: second.port, health: "pending" },
+    ]);
+
+    await advancePoll(1_000);
+    monitor.stop();
+    expect(monitor.getHealthForHostname(route.hostname)).toBe("healthy");
+    expect(onChange).toHaveBeenLastCalledWith(route.workspaceId, [
+      { scriptName: "api", hostname: route.hostname, port: second.port, health: "healthy" },
+    ]);
+  });
+
   it("requires 2 consecutive failures before marking a previously healthy service unhealthy", async () => {
     vi.useFakeTimers();
 
