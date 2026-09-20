@@ -2,8 +2,8 @@ import { spawn } from "node:child_process";
 import http from "node:http";
 import net from "node:net";
 import path from "node:path";
-import { Transform } from "node:stream";
 import { fileURLToPath } from "node:url";
+import { DevelopmentPrefixTransform } from "./prefix-expo-transform.mjs";
 
 const listenPort = Number.parseInt(process.env.PASEO_PORT ?? "", 10);
 const baseUrl = (process.env.PASEO_DEV_BASE_URL ?? "").trim().replace(/\/+$/, "");
@@ -28,38 +28,6 @@ const expo = spawn(
   { cwd: appRoot, env: process.env, stdio: "inherit" },
 );
 
-const developmentBaseGuard = Buffer.from("if (process.env.NODE_ENV !== 'development') {");
-
-class DevelopmentBaseUrlTransform extends Transform {
-  #pending = "";
-
-  _transform(chunk, _encoding, callback) {
-    this.#pending += chunk.toString("utf8");
-    this.#drain(false);
-    callback();
-  }
-
-  _flush(callback) {
-    this.#drain(true);
-    callback();
-  }
-
-  #drain(flush) {
-    const needle = developmentBaseGuard.toString("utf8");
-    while (true) {
-      const match = this.#pending.indexOf(needle);
-      if (match < 0) break;
-      this.push(this.#pending.slice(0, match));
-      this.push("if (true) {");
-      this.#pending = this.#pending.slice(match + needle.length);
-    }
-    const readyLength = flush ? this.#pending.length : this.#pending.length - needle.length + 1;
-    if (readyLength > 0) {
-      this.push(this.#pending.slice(0, readyLength));
-      this.#pending = this.#pending.slice(readyLength);
-    }
-  }
-}
 expo.once("error", (error) => {
   console.error(error);
   server.close(() => {
@@ -89,7 +57,7 @@ function proxyRequest(req, res) {
         const headers = { ...upstreamResponse.headers };
         delete headers["content-length"];
         res.writeHead(upstreamResponse.statusCode ?? 200, headers);
-        upstreamResponse.pipe(new DevelopmentBaseUrlTransform()).pipe(res);
+        upstreamResponse.pipe(new DevelopmentPrefixTransform(baseUrl)).pipe(res);
         return;
       }
       if (!contentType.includes("text/html")) {
@@ -104,7 +72,11 @@ function proxyRequest(req, res) {
         const html = Buffer.concat(chunks)
           .toString("utf8")
           .replaceAll('src="/', `src="${baseUrl}/`)
-          .replaceAll('href="/', `href="${baseUrl}/`);
+          .replaceAll('href="/', `href="${baseUrl}/`)
+          // Expo's generated web shell disables Metro HMR by default. This
+          // wrapper exists specifically for the live Paseo development
+          // preview, so opt its bundle into Fast Refresh.
+          .replaceAll("hot=false", "hot=true");
         const headers = { ...upstreamResponse.headers };
         delete headers["content-length"];
         res.writeHead(upstreamResponse.statusCode ?? 200, headers);
