@@ -74,6 +74,7 @@ test("a running workspace service is relaunched by controlled restart recovery",
   };
 
   const first = await launch();
+  expect(first.client.getLastServerInfoMessage()?.restartCheckpointFormat).toBe(4);
   const started = await first.client.startWorkspaceScriptWithStatus(workspaceId, "demo");
   expect(started.error).toBeNull();
   expect(started.script?.terminalId).toBeTruthy();
