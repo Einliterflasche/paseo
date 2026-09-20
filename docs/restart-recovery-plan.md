@@ -161,11 +161,18 @@ timelines, unsettled inputs, notification obligations, and schedule ownership.
 A single file keeps the commit boundary small. Existing Zod schemas validate the
 whole generation before it can replace live state; incompatible versions fail closed.
 
-Checkpoint format 3 preserves owned text backings and range references, including
-rolling logs and edits within imported text. Formats 1 (inline strings) and 2
-(shared leaves) retain their original readers. Older binaries must reject newer
-formats rather than restore empty placeholders. The deployment preflight and
-rollback requirements belong in [fork maintenance](fork-maintenance.md).
+Checkpoint format 4 also records the stable workspace/script identity of every
+running managed service. A successor validates those identities and relaunches the
+services before reopening mutation admission. If one launch fails, it stops only
+the service terminals created by that recovery attempt and retains the desired set
+for an explicit retry. Ordinary terminals and one-shot scripts are never inferred as
+restartable work.
+
+Format 3 preserves owned text backings and range references, including rolling logs
+and edits within imported text. Formats 1 (inline strings) and 2 (shared leaves)
+retain their original readers. Older binaries must reject newer formats rather than
+restore empty placeholders. The deployment preflight and rollback requirements
+belong in [fork maintenance](fork-maintenance.md).
 
 Image bytes and inline attachments are part of the snapshot. Completed file uploads
 already live under `PASEO_HOME/uploads` without expiry; checkpoint creation verifies

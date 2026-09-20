@@ -75,6 +75,10 @@ export class WorkspaceScriptRuntimeStore {
     return entries;
   }
 
+  listAll(): ScriptRuntimeEntry[] {
+    return [...this.entries.values()].map((entry) => Object.assign({}, entry));
+  }
+
   removeForWorkspace(workspaceId: string): void {
     for (const entry of this.listForWorkspace(workspaceId)) {
       this.entries.delete(this.toEntryKey(entry));

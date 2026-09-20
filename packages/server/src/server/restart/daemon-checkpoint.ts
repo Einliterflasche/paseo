@@ -2,8 +2,9 @@ import { z } from "zod";
 import { AgentCheckpointSchema } from "./agent-checkpoint.js";
 import { FinishNotificationWatchRecordsSchema } from "../agent/agent-prompt.js";
 import { ScheduleRestartSnapshotSchema } from "../schedule/service.js";
+import { WorkspaceServiceRestartSnapshotSchema } from "./workspace-service-checkpoint.js";
 
-export const READABLE_CHECKPOINT_FORMATS = [1, 2, 3] as const;
+export const READABLE_CHECKPOINT_FORMATS = [1, 2, 3, 4] as const;
 
 export const DaemonCheckpointSchema = z
   .object({
@@ -13,9 +14,13 @@ export const DaemonCheckpointSchema = z
     agents: AgentCheckpointSchema,
     notifications: FinishNotificationWatchRecordsSchema,
     schedules: ScheduleRestartSnapshotSchema,
+    services: WorkspaceServiceRestartSnapshotSchema.optional(),
   })
   .superRefine((checkpoint, ctx) => {
-    if (checkpoint.version === 3) return;
+    if (checkpoint.version === 4 && checkpoint.services === undefined) {
+      ctx.addIssue({ code: "custom", message: "Checkpoint version 4 requires service state" });
+    }
+    if (checkpoint.version === 3 || checkpoint.version === 4) return;
     if (checkpoint.schedules.archives?.length)
       ctx.addIssue({
         code: "custom",

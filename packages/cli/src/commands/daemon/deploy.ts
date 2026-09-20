@@ -45,6 +45,16 @@ export interface DeployPrepareClient {
     restartRecoveryGeneration?: string;
   } | null;
   listTerminals(): Promise<{ terminals: readonly { id: string; name: string }[] }>;
+  fetchWorkspaces(options: { page: { limit: number; cursor?: string } }): Promise<{
+    entries: readonly {
+      scripts: readonly {
+        type: "script" | "service";
+        lifecycle: "running" | "stopped";
+        terminalId?: string | null;
+      }[];
+    }[];
+    pageInfo: { nextCursor: string | null; hasMore: boolean };
+  }>;
   prepareRestart(reason?: string): Promise<{ generationId?: string }>;
   close(): Promise<void>;
 }
@@ -235,7 +245,29 @@ function toCommandError(err: unknown, fallbackCode: string, fallbackPrefix: stri
   return { code: fallbackCode, message: `${fallbackPrefix}: ${message}` };
 }
 
-async function requireNoTerminals(client: DeployPrepareClient): Promise<void> {
+async function listRestorableServiceTerminalIds(client: DeployPrepareClient): Promise<Set<string>> {
+  const ids = new Set<string>();
+  let cursor: string | undefined;
+  do {
+    const page = await client.fetchWorkspaces({
+      page: { limit: 200, ...(cursor ? { cursor } : {}) },
+    });
+    for (const workspace of page.entries) {
+      for (const script of workspace.scripts) {
+        if (script.type === "service" && script.lifecycle === "running" && script.terminalId) {
+          ids.add(script.terminalId);
+        }
+      }
+    }
+    cursor = page.pageInfo.hasMore ? (page.pageInfo.nextCursor ?? undefined) : undefined;
+    if (page.pageInfo.hasMore && !cursor) {
+      throw new Error("Workspace inventory ended without its next cursor");
+    }
+  } while (cursor);
+  return ids;
+}
+
+async function requireRestorableTerminals(client: DeployPrepareClient): Promise<void> {
   let inventory: Awaited<ReturnType<DeployPrepareClient["listTerminals"]>>;
   try {
     // No cwd means every workspace, including managed script terminals.
@@ -247,11 +279,26 @@ async function requireNoTerminals(client: DeployPrepareClient): Promise<void> {
       "Cannot establish terminal continuity; activation was not run",
     );
   }
-  if (inventory.terminals.length) {
+  if (!inventory.terminals.length) return;
+
+  let restorable = new Set<string>();
+  if ((client.getLastServerInfoMessage()?.restartCheckpointFormat ?? 0) >= 4) {
+    try {
+      restorable = await listRestorableServiceTerminalIds(client);
+    } catch (error) {
+      throw toCommandError(
+        error,
+        "DEPLOY_SERVICE_INSPECTION_FAILED",
+        "Cannot establish managed-service continuity; activation was not run",
+      );
+    }
+  }
+  const unprotected = inventory.terminals.filter(({ id }) => !restorable.has(id));
+  if (unprotected.length) {
     throw {
       code: "DEPLOY_TERMINALS_ACTIVE",
-      message: "Deployment would stop live terminals or managed services; activation was not run.",
-      details: inventory.terminals.map(({ id, name }) => `${name} (${id})`).join(", "),
+      message: "Deployment would stop live terminals; activation was not run.",
+      details: unprotected.map(({ id, name }) => `${name} (${id})`).join(", "),
     } satisfies CommandError;
   }
 }
@@ -316,7 +363,7 @@ async function prepareGeneration(
     }
     // Refuse known live work before interrupting agents. Repeat after Prepare:
     // its frozen mutation admission and drained scheduler close the start race.
-    await requireNoTerminals(client);
+    await requireRestorableTerminals(client);
     const result = await client.prepareRestart(reason);
     if (!result.generationId) {
       const error: CommandError = {
@@ -328,7 +375,7 @@ async function prepareGeneration(
     }
     await deps.validateTarget(targetCli, state.home, result.generationId);
     requirePreparedGeneration(client, result.generationId);
-    await requireNoTerminals(client);
+    await requireRestorableTerminals(client);
     requirePreparedGeneration(client, result.generationId);
     return result.generationId;
   } finally {
