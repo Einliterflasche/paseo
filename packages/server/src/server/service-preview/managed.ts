@@ -203,7 +203,10 @@ export class ManagedPreviewRoutes {
       }
       const unchanged =
         record.binding?.port === binding.port && record.binding.terminalId === binding.terminalId;
-      if (unchanged) continue;
+      // The service port is assigned before the child necessarily begins
+      // listening. A later runtime/endpoint transition may therefore be the
+      // first point at which HTTP can be observed for this same binding.
+      if (unchanged && (record.registered || record.qualification)) continue;
       this.qualify(record, binding);
     }
   }
