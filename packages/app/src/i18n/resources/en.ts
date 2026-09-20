@@ -64,6 +64,7 @@ export const en = {
     noMatches: "No matching services.",
     empty: "No services configured. Add a service to a workspace’s Paseo configuration.",
     previewUnavailable: "Preview unavailable",
+    noWebPreview: "No web preview",
     started: "Started",
     stopped: "Stopped",
     noPort: "No port assigned",

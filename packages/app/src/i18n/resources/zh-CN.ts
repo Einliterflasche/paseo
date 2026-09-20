@@ -65,6 +65,7 @@ export const zhCN: TranslationResources = {
     noMatches: "没有匹配的服务。",
     empty: "尚未配置服务。请在工作区的 Paseo 配置中添加服务。",
     previewUnavailable: "预览不可用",
+    noWebPreview: "无网页预览",
     started: "已启动",
     stopped: "已停止",
     noPort: "未分配端口",

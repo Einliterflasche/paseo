@@ -74,6 +74,7 @@ export const fr: TranslationResources = {
     empty:
       "Aucun service configuré. Ajoutez un service à la configuration Paseo d’un espace de travail.",
     previewUnavailable: "Aperçu indisponible",
+    noWebPreview: "Aucun aperçu web",
     started: "Démarré",
     stopped: "Arrêté",
     noPort: "Aucun port attribué",

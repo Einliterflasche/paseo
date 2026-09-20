@@ -70,6 +70,7 @@ export const ru: TranslationResources = {
     noMatches: "Подходящих сервисов нет.",
     empty: "Сервисы не настроены. Добавьте сервис в конфигурацию Paseo рабочего пространства.",
     previewUnavailable: "Предпросмотр недоступен",
+    noWebPreview: "Нет веб-предпросмотра",
     started: "Запущен",
     stopped: "Остановлен",
     noPort: "Порт не назначен",

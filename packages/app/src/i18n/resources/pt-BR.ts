@@ -71,6 +71,7 @@ export const ptBR: TranslationResources = {
     empty:
       "Nenhum serviço configurado. Adicione um serviço à configuração do Paseo de um espaço de trabalho.",
     previewUnavailable: "Prévia indisponível",
+    noWebPreview: "Sem prévia da web",
     started: "Iniciado",
     stopped: "Parado",
     noPort: "Nenhuma porta atribuída",

@@ -60,6 +60,7 @@ async function fixture(
     runtime,
     endpoints,
     routes,
+    qualifyHttp: () => true,
     onFailure(error) {
       managedFailures.push(error);
     },
@@ -245,7 +246,13 @@ describe("managed preview enrollment persistence", () => {
     const runtime = new WorkspaceScriptRuntimeStore();
     const endpoints = createServiceProxySubsystem({ logger: pino({ level: "silent" }) });
     const routes = new PreviewRoutes({ excludedPorts: [] });
-    const managed = new ManagedPreviewRoutes({ runtime, endpoints, routes, onFailure() {} });
+    const managed = new ManagedPreviewRoutes({
+      runtime,
+      endpoints,
+      routes,
+      qualifyHttp: () => true,
+      onFailure() {},
+    });
     const blocked = new Set<string>([declaration.workspaceId]);
     const services = await ManagedPreviewServices.open({
       paseoHome,
@@ -323,7 +330,13 @@ describe("managed preview enrollment persistence", () => {
     const runtime = new WorkspaceScriptRuntimeStore();
     const endpoints = createServiceProxySubsystem({ logger: pino({ level: "silent" }) });
     const routes = new PreviewRoutes({ excludedPorts: [] });
-    const managed = new ManagedPreviewRoutes({ runtime, endpoints, routes, onFailure() {} });
+    const managed = new ManagedPreviewRoutes({
+      runtime,
+      endpoints,
+      routes,
+      qualifyHttp: () => true,
+      onFailure() {},
+    });
     await expect(
       ManagedPreviewServices.open({
         paseoHome,

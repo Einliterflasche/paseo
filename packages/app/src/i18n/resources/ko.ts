@@ -67,6 +67,7 @@ export const ko: TranslationResources = {
     noMatches: "일치하는 서비스가 없습니다.",
     empty: "구성된 서비스가 없습니다. 작업 공간의 Paseo 설정에 서비스를 추가하세요.",
     previewUnavailable: "미리보기 사용 불가",
+    noWebPreview: "웹 미리보기 없음",
     started: "시작됨",
     stopped: "중지됨",
     noPort: "할당된 포트 없음",

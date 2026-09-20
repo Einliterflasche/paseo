@@ -65,6 +65,7 @@ export const ar: TranslationResources = {
     noMatches: "لا توجد خدمات مطابقة.",
     empty: "لا توجد خدمات مهيأة. أضف خدمة إلى إعدادات Paseo لمساحة العمل.",
     previewUnavailable: "المعاينة غير متاحة",
+    noWebPreview: "لا توجد معاينة ويب",
     started: "بدأ التشغيل",
     stopped: "متوقف",
     noPort: "لم يُعيّن منفذ",

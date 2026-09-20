@@ -73,6 +73,7 @@ export const es: TranslationResources = {
     empty:
       "No hay servicios configurados. Añade un servicio a la configuración de Paseo de un espacio de trabajo.",
     previewUnavailable: "Vista previa no disponible",
+    noWebPreview: "Sin vista previa web",
     started: "Iniciado",
     stopped: "Detenido",
     noPort: "Sin puerto asignado",

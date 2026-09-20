@@ -68,6 +68,7 @@ export const ja: TranslationResources = {
     noMatches: "一致するサービスがありません。",
     empty: "サービスが設定されていません。ワークスペースのPaseo設定にサービスを追加してください。",
     previewUnavailable: "プレビューは利用できません",
+    noWebPreview: "Web プレビューなし",
     started: "起動済み",
     stopped: "停止中",
     noPort: "ポート未割り当て",
