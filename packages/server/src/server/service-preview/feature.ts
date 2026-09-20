@@ -12,6 +12,7 @@ import { PreviewRegistrationStore } from "./registrations.js";
 import { PreviewRoutes } from "./routes.js";
 import { PreviewSources } from "./sources.js";
 import { startPreviewGatewayWorker } from "./worker.js";
+import { probeHttpCapability } from "./http-capability.js";
 
 interface PreviewFeatureOptions {
   policy: PreviewFeaturePolicy;
@@ -56,6 +57,7 @@ export async function openPreviewFeature(options: PreviewFeatureOptions) {
     routes,
     runtime: options.runtime,
     endpoints: options.endpoints,
+    qualifyHttp: probeHttpCapability,
     onFailure,
   });
   let managedServices: ManagedPreviewServices;

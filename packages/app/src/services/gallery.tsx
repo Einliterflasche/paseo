@@ -291,6 +291,13 @@ function ServicePreviewPlaceholder({
   const enabled = Boolean(entry.previewServiceId && canOpen);
   const running = entry.lifecycle === "running";
   const thumbnail = running && entry.health === "healthy" && entry.previewServiceId;
+  const noWebPreview = running && entry.health === "healthy" && !entry.previewServiceId;
+  let previewLabel:
+    | "services.previewUnavailable"
+    | "services.previewReady"
+    | "services.noWebPreview" = "services.previewUnavailable";
+  if (enabled) previewLabel = "services.previewReady";
+  else if (noWebPreview) previewLabel = "services.noWebPreview";
   return (
     <View style={styles.preview}>
       <Pressable
@@ -306,9 +313,7 @@ function ServicePreviewPlaceholder({
         ) : (
           <>
             <ThemedGlobe size={32} uniProps={mutedColorMapping} />
-            <Text style={styles.caption}>
-              {t(enabled ? "services.previewReady" : "services.previewUnavailable")}
-            </Text>
+            <Text style={styles.caption}>{t(previewLabel)}</Text>
           </>
         )}
       </Pressable>

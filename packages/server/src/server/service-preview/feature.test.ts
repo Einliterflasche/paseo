@@ -407,14 +407,15 @@ describe("optional preview feature composition", () => {
     expect(f.runtime.listForWorkspace(enrollment.workspaceId)).toEqual([]);
     expect(f.upstreamContacts()).toBe(0);
     f.markRunning();
-    expect(feature.broker.describe().services).toMatchObject([
-      { serviceId, available: true, port: f.upstreamPort },
-    ]);
+    await expect
+      .poll(() => feature.broker.describe().services)
+      .toMatchObject([{ serviceId, available: true, port: f.upstreamPort }]);
+    expect(f.upstreamContacts()).toBe(1);
     const { cookie } = await open(feature);
     expect(
       await wire(feature.socketPath, prefix, { headers: requestHeaders(cookie) }),
     ).toMatchObject({ status: 200, body: page });
-    expect(f.upstreamContacts()).toBe(1);
+    expect(f.upstreamContacts()).toBe(2);
   });
 
   it.each(["archived", "absent"] as const)(
@@ -433,14 +434,15 @@ describe("optional preview feature composition", () => {
       await f.workspaces.upsert(f.record);
       expect(feature.broker.describe().services).toEqual([]);
       f.markRunning();
-      expect(feature.broker.describe().services).toMatchObject([
-        { serviceId, available: true, port: f.upstreamPort },
-      ]);
+      await expect
+        .poll(() => feature.broker.describe().services)
+        .toMatchObject([{ serviceId, available: true, port: f.upstreamPort }]);
+      expect(f.upstreamContacts()).toBe(1);
       const { cookie } = await open(feature);
       expect(
         await wire(feature.socketPath, prefix, { headers: requestHeaders(cookie) }),
       ).toMatchObject({ status: 200, body: page });
-      expect(f.upstreamContacts()).toBe(1);
+      expect(f.upstreamContacts()).toBe(2);
     },
   );
 

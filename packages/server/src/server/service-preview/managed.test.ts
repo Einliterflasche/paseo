@@ -58,6 +58,7 @@ function fixture(report: (error: unknown) => void | Promise<void> = () => {}) {
   const managed = new ManagedPreviewRoutes({
     runtime,
     endpoints,
+    qualifyHttp: () => true,
     routes,
     onFailure(error) {
       failures.push(error);
@@ -122,6 +123,42 @@ it("enables a running managed service by default with a stripped mount", () => {
   );
 });
 
+it("keeps a reachable custom TCP service running without advertising a web route", async () => {
+  const runtime = new WorkspaceScriptRuntimeStore();
+  const endpoints = createServiceProxySubsystem({ logger: pino({ level: "silent" }) });
+  const routes = new PreviewRoutes({ excludedPorts: [] });
+  const checked: number[] = [];
+  const managed = new ManagedPreviewRoutes({
+    runtime,
+    endpoints,
+    routes,
+    qualifyHttp(port) {
+      checked.push(port);
+      return Promise.resolve(false);
+    },
+    onFailure() {},
+  });
+  endpoints.registerWorkspaceService({
+    workspaceId: enrollment.workspaceId,
+    projectSlug: "custom-protocol",
+    branchName: "main",
+    scriptName: enrollment.scriptName,
+    port: 7132,
+  });
+  runtime.set(runtimeEntry());
+  managed.restoreDefault(enrollment.workspaceId, enrollment.scriptName);
+  await Promise.resolve();
+
+  expect(runtime.get(enrollment)?.lifecycle).toBe("running");
+  expect(endpoints.getWorkspaceHealthTargets(enrollment.workspaceId)).toHaveLength(1);
+  expect(routes.capture(managedPreviewServiceId(enrollment))).toBeNull();
+  expect(checked).toEqual([7132]);
+
+  runtime.set(runtimeEntry());
+  expect(checked).toEqual([7132]);
+  managed.close();
+});
+
 function start(f: Fixture) {
   f.endpoint();
   f.runtime.set(runtimeEntry());
@@ -162,6 +199,7 @@ it("invalidates managed preview metadata synchronously on registry port removal"
   const managed = new ManagedPreviewRoutes({
     runtime,
     endpoints,
+    qualifyHttp: () => true,
     routes,
     onFailure: (error) => {
       failures.push(error);

@@ -17,6 +17,7 @@ interface ManagedPreviewRecord {
   enabled: boolean;
   binding: { port: number; terminalId: string } | null;
   registered: boolean;
+  qualification: AbortController | null;
 }
 
 interface ManagedPreviewOptions {
@@ -26,6 +27,7 @@ interface ManagedPreviewOptions {
     ServiceProxySubsystem,
     "getWorkspaceHealthTargets" | "subscribeWorkspaceServices"
   >;
+  qualifyHttp(port: number, signal: AbortSignal): boolean | Promise<boolean>;
   onFailure(error: unknown): void | Promise<void>;
 }
 
@@ -127,11 +129,12 @@ export class ManagedPreviewRoutes {
       enabled: true,
       binding: null,
       registered: false,
+      qualification: null,
     };
     this.records.set(enrollment.serviceId, record);
     if (!binding) return;
     try {
-      this.activate(record, binding);
+      this.qualify(record, binding);
     } catch (error) {
       this.fail(error);
       throw error;
@@ -201,7 +204,7 @@ export class ManagedPreviewRoutes {
       const unchanged =
         record.binding?.port === binding.port && record.binding.terminalId === binding.terminalId;
       if (unchanged) continue;
-      this.activate(record, binding);
+      this.qualify(record, binding);
     }
   }
 
@@ -214,8 +217,51 @@ export class ManagedPreviewRoutes {
   }
 
   private invalidate(record: ManagedPreviewRecord): void {
+    record.qualification?.abort();
+    record.qualification = null;
     record.binding = null;
     if (record.registered) this.options.routes.markUnavailable(record.enrollment.serviceId);
+  }
+
+  private qualify(
+    record: ManagedPreviewRecord,
+    binding: { port: number; terminalId: string },
+  ): void {
+    this.invalidate(record);
+    record.binding = binding;
+    const qualification = new AbortController();
+    record.qualification = qualification;
+    const result = this.options.qualifyHttp(binding.port, qualification.signal);
+    if (typeof result === "boolean") {
+      record.qualification = null;
+      if (result) this.activate(record, binding);
+      return;
+    }
+    void result.then(
+      (supported) => {
+        if (
+          this.closed ||
+          qualification.signal.aborted ||
+          record.qualification !== qualification ||
+          record.binding?.port !== binding.port ||
+          record.binding.terminalId !== binding.terminalId
+        )
+          return undefined;
+        record.qualification = null;
+        if (!supported) return undefined;
+        try {
+          this.activate(record, binding);
+        } catch (error) {
+          this.fail(error);
+        }
+        return undefined;
+      },
+      (error) => {
+        if (qualification.signal.aborted) return undefined;
+        this.fail(error);
+        return undefined;
+      },
+    );
   }
 
   private activate(

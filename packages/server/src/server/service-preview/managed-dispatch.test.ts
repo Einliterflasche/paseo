@@ -52,7 +52,13 @@ async function fixture(
   const routes = new PreviewRoutes({ excludedPorts: [] });
   const sources = new PreviewSources("https://control.test");
   const brokerFailures: unknown[] = [];
-  const managed = new ManagedPreviewRoutes({ runtime, endpoints, routes, onFailure() {} });
+  const managed = new ManagedPreviewRoutes({
+    runtime,
+    endpoints,
+    routes,
+    qualifyHttp: () => true,
+    onFailure() {},
+  });
   const services = await ManagedPreviewServices.open({
     paseoHome,
     policy: [],
