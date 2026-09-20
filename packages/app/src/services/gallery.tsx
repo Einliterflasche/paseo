@@ -422,20 +422,20 @@ const ServiceCard = memo(function ServiceCard({
               label={t(healthLabel(entry, stale))}
             />
           ) : null}
+          <ServiceCardActions
+            serverId={serverId}
+            entry={entry}
+            compact={compact && Boolean(onOpen)}
+            online={online}
+            stale={stale}
+            canManage={canManage}
+            busy={busy}
+            pending={pending}
+            onToggle={toggle}
+            onLogs={logs}
+            onOpen={open}
+          />
         </View>
-        <ServiceCardActions
-          serverId={serverId}
-          entry={entry}
-          compact={compact && Boolean(onOpen)}
-          online={online}
-          stale={stale}
-          canManage={canManage}
-          busy={busy}
-          pending={pending}
-          onToggle={toggle}
-          onLogs={logs}
-          onOpen={open}
-        />
         {!canManage ? <Text style={styles.caption}>{t("services.readOnly")}</Text> : null}
       </View>
     </View>
