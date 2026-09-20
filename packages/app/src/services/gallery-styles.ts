@@ -57,6 +57,12 @@ export const serviceGalleryStyles = StyleSheet.create((theme) => ({
   },
   caption: { color: theme.colors.foregroundMuted, fontSize: theme.fontSize.sm },
   metadata: { flexDirection: "row", alignItems: "center", gap: theme.spacing[2] },
-  actions: { flexDirection: "row", flexWrap: "wrap", gap: theme.spacing[2] },
+  actions: {
+    marginLeft: "auto",
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: theme.spacing[2],
+  },
   empty: { padding: theme.spacing[6], color: theme.colors.foregroundMuted, textAlign: "center" },
 }));
