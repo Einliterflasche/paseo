@@ -74,7 +74,14 @@ function proxyRequest(req, res) {
       port: upstreamPort,
       method: req.method,
       path: req.url,
-      headers: { ...req.headers, host: `127.0.0.1:${upstreamPort}` },
+      // The response body is rewritten while streaming. Asking Metro for its
+      // identity representation avoids corrupting a compressed stream and
+      // keeps the proxy bounded without buffering a full development bundle.
+      headers: {
+        ...req.headers,
+        host: `127.0.0.1:${upstreamPort}`,
+        "accept-encoding": "identity",
+      },
     },
     (upstreamResponse) => {
       const contentType = String(upstreamResponse.headers["content-type"] ?? "");
