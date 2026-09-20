@@ -124,6 +124,12 @@ returns after submission; follow the printed unit with `journalctl -fu <unit>`
 until deployment reports the restored generation. Submission is not deployment success.
 The worker waits for an explicit handoff after `sudo systemd-run` returns, so no
 privileged waiting client remains in the provider tree when checkpointing begins.
+A process that changed user inside an agent's tree (for example `sudo journalctl -f`
+or `sudo nixos-rebuild build` started from a session) cannot be signaled by the
+daemon at all. Teardown certification skips such foreign-owned processes: the
+daemon stops everything it owns, including owned descendants beneath the foreign
+process, and the foreign process itself is left running as an orphan. It cannot
+write into the provider pipe the daemon owns, so it cannot alter recorded history.
 This does not change service OOM preferences or the activation command's privileges. Readiness has no
 default deadline; `--wait-timeout` adds one explicitly and never kills a process.
 
