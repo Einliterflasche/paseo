@@ -152,7 +152,7 @@ export function createPreviewRuntime({ document, onCloseFailure }: PreviewRuntim
           submitPreviewForm({ document, prepared, target: "_blank" });
           return;
         }
-        if (!record || !frame) throw new Error("Missing embedded preview document");
+        if (!frame) throw new Error("Missing embedded preview document");
         openPreviewDocument({
           ...options,
           document,
