@@ -27,6 +27,7 @@ export const serviceGalleryStyles = StyleSheet.create((theme) => ({
     backgroundColor: theme.colors.surface1,
   },
   preview: {
+    position: "relative",
     height: 140,
     backgroundColor: theme.colors.surface2,
     alignItems: "center",
@@ -34,6 +35,20 @@ export const serviceGalleryStyles = StyleSheet.create((theme) => ({
     gap: theme.spacing[3],
     borderBottomWidth: 1,
     borderColor: theme.colors.border,
+  },
+  previewControl: {
+    position: "absolute",
+    top: theme.spacing[3],
+    left: theme.spacing[3],
+    zIndex: 1,
+    width: 34,
+    height: 34,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 17,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: theme.colors.surface1,
   },
   menuTrigger: {
     width: 34,

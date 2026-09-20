@@ -5,10 +5,11 @@ import {
   Pressable,
   Text,
   View,
+  type GestureResponderEvent,
   type ViewStyle,
   type LayoutChangeEvent,
 } from "react-native";
-import { Globe, LayoutGrid, List } from "lucide-react-native";
+import { Globe, LayoutGrid, List, Play, Square } from "lucide-react-native";
 import { withUnistyles } from "react-native-unistyles";
 import { useTranslation } from "react-i18next";
 import { Alert } from "@/components/ui/alert";
@@ -21,11 +22,14 @@ import type { ExternalCatalogEntry } from "./external-catalog";
 import { ExternalServiceCard } from "./external-card";
 import { BrowserPreviewActions, ServiceLifecycleActions } from "./browser-preview-actions";
 import type { ServicesViewMode } from "./preferences";
+import { confirmDialog } from "@/utils/confirm-dialog";
 
 import type { Theme } from "@/styles/theme";
 const mutedColorMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
 
 const ThemedGlobe = withUnistyles(Globe);
+const ThemedPlay = withUnistyles(Play);
+const ThemedSquare = withUnistyles(Square);
 function renderGridIcon(props: { color: string; size: number }) {
   return <LayoutGrid {...props} />;
 }
@@ -269,14 +273,28 @@ function serviceKey(entry: GalleryEntry) {
 function ServicePreviewPlaceholder({
   entry,
   canOpen,
+  canManage,
+  busy,
   onOpen,
+  onToggle,
 }: {
   entry: ServiceCatalogEntry;
   canOpen: boolean;
+  canManage: boolean;
+  busy: boolean;
   onOpen: () => void;
+  onToggle: () => void;
 }) {
   const { t } = useTranslation();
   const enabled = Boolean(entry.previewServiceId && canOpen);
+  const running = entry.lifecycle === "running";
+  const toggle = useCallback(
+    (event: GestureResponderEvent) => {
+      event.stopPropagation();
+      onToggle();
+    },
+    [onToggle],
+  );
   return (
     <Pressable
       style={styles.preview}
@@ -286,6 +304,20 @@ function ServicePreviewPlaceholder({
       accessibilityLabel={`${t("services.openPreview")}: ${entry.scriptName}`}
       testID={`service-preview-${entry.scriptName}`}
     >
+      <Pressable
+        style={styles.previewControl}
+        disabled={!canManage || busy}
+        onPress={toggle}
+        accessibilityRole="button"
+        accessibilityLabel={t(running ? "services.stop" : "services.start")}
+        testID={`service-preview-${running ? "stop" : "start"}-${entry.scriptName}`}
+      >
+        {running ? (
+          <ThemedSquare size={16} uniProps={mutedColorMapping} />
+        ) : (
+          <ThemedPlay size={17} uniProps={mutedColorMapping} />
+        )}
+      </Pressable>
       <ThemedGlobe size={32} uniProps={mutedColorMapping} />
       <Text style={styles.caption}>
         {t(enabled ? "services.previewReady" : "services.previewUnavailable")}
@@ -387,10 +419,19 @@ const ServiceCard = memo(function ServiceCard({
 }) {
   const { t } = useTranslation();
   const running = entry.lifecycle === "running";
-  const toggle = useCallback(
-    () => onAction(entry, running ? "stop" : "start"),
-    [entry, running, onAction],
-  );
+  const toggle = useCallback(async () => {
+    if (running) {
+      const confirmed = await confirmDialog({
+        title: t("services.stop"),
+        message: t("workspace.tabs.confirmations.closeTerminalMessage"),
+        confirmLabel: t("services.stop"),
+        cancelLabel: t("workspace.tabs.confirmations.cancel"),
+        destructive: true,
+      });
+      if (!confirmed) return;
+    }
+    onAction(entry, running ? "stop" : "start");
+  }, [entry, running, onAction, t]);
   const logs = useCallback(() => onLogs(entry), [entry, onLogs]);
   const open = useCallback(() => onOpen?.(entry), [entry, onOpen]);
   return (
@@ -399,7 +440,10 @@ const ServiceCard = memo(function ServiceCard({
         <ServicePreviewPlaceholder
           entry={entry}
           canOpen={Boolean(onOpen) && online && !stale && !busy}
+          canManage={online && canManage}
+          busy={busy}
           onOpen={open}
+          onToggle={toggle}
         />
       ) : null}
       <View style={styles.cardBody}>
