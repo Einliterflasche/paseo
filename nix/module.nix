@@ -62,6 +62,19 @@ in
       description = "Whether to open the firewall for the Paseo daemon port.";
     };
 
+    shutdownCheckpointTimeout = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 120;
+      description = ''
+        Seconds a running daemon may spend committing a restart checkpoint when
+        the service stops (`systemctl stop` or `restart`, a VM or host shutdown).
+        The next start restores that checkpoint instead of pausing recovery.
+        Sets `PASEO_SHUTDOWN_CHECKPOINT_TIMEOUT_MS` and sizes the unit's
+        `TimeoutStopSec`, which adds the daemon's stop grace on top. A host that
+        stops the VM must wait at least that long.
+      '';
+    };
+
     previews = {
       enable = lib.mkEnableOption "the independent same-address service preview front";
 
@@ -309,6 +322,7 @@ in
       environment = {
         PASEO_HOME = cfg.dataDir;
         PASEO_LISTEN = "${cfg.listenAddress}:${toString (if cfg.previews.enable then cfg.previews.daemonPort else cfg.port)}";
+        PASEO_SHUTDOWN_CHECKPOINT_TIMEOUT_MS = toString (cfg.shutdownCheckpointTimeout * 1000);
       } // lib.optionalAttrs cfg.previews.enable {
         PASEO_SERVICES_FRONT_PORT = toString cfg.port;
         PASEO_SERVICES_GATEWAY_SOCKET = previewSocket;
@@ -364,9 +378,14 @@ in
         # one must not make systemd stop the supervisor and every active agent.
         OOMPolicy = "continue";
 
-        # Graceful shutdown (server handles SIGTERM with a 10s timeout)
+        # Only the supervisor receives SIGTERM. It asks the worker to commit a
+        # restart checkpoint and to quiesce its agents itself; signaling every
+        # provider process at once would kill the agents before that capture.
+        # systemd SIGKILLs whatever remains once the main process has exited.
+        KillMode = "mixed";
         KillSignal = "SIGTERM";
-        TimeoutStopSec = 15;
+        # Checkpoint budget, then the supervisor's stop grace and tree kill.
+        TimeoutStopSec = cfg.shutdownCheckpointTimeout + 60;
       };
     };
 

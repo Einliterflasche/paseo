@@ -22,6 +22,7 @@ function isProcessRunning(pid: number): boolean {
 async function runSupervisorFixture(options: {
   workerSource: string;
   restartOnCrash?: boolean;
+  gracefulExitTimeoutMs?: number;
   timeoutMs?: number;
 }): Promise<{
   code: number | null;
@@ -50,6 +51,7 @@ async function runSupervisorFixture(options: {
         workerEnv: process.env,
         workerExecArgv: [],
         restartOnCrash: ${JSON.stringify(options.restartOnCrash ?? false)},
+        ${options.gracefulExitTimeoutMs === undefined ? "" : `gracefulExitTimeoutMs: ${options.gracefulExitTimeoutMs},`}
         logFile: {
           path: ${JSON.stringify(logPath)},
           rotate: { maxSize: "1m", maxFiles: 2 },
@@ -288,6 +290,34 @@ describe("supervisor durable logging", () => {
       '"msg":"Worker did not exit after graceful shutdown request; forcing process tree kill"',
     );
   }, 20_000);
+
+  test("waits for a slow cooperative exit only as long as gracefulExitTimeoutMs allows", async () => {
+    const workerSource = `
+        process.send?.({ type: "paseo:shutdown", reason: "slow_graceful_exit" });
+        process.on("message", (message) => {
+          if (message?.type === "paseo:graceful-shutdown") setTimeout(() => process.exit(0), 2_500);
+        });
+        setInterval(() => {}, 1_000);
+      `;
+    const forcing =
+      '"msg":"Worker did not exit after graceful shutdown request; forcing process tree kill"';
+
+    const patient = await runSupervisorFixture({
+      timeoutMs: 20_000,
+      workerSource,
+      gracefulExitTimeoutMs: 8_000,
+    });
+    expect(patient.code).toBe(0);
+    expect(patient.log).not.toContain(forcing);
+
+    const impatient = await runSupervisorFixture({
+      timeoutMs: 20_000,
+      workerSource,
+      gracefulExitTimeoutMs: 500,
+    });
+    expect(impatient.code).toBe(0);
+    expect(impatient.log).toContain(forcing);
+  }, 45_000);
 
   test.skipIf(isPlatform("win32"))(
     "restarts after worker exit while a descendant retains the worker stdio",

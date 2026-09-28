@@ -6,8 +6,15 @@ import { resolvePaseoHome } from "./paseo-home.js";
 import { createRootLogger } from "./logger.js";
 import type { DaemonLifecycleIntent } from "./bootstrap.js";
 import { getProcessDiagnostics } from "./process-diagnostics.js";
+import {
+  resolveShutdownCheckpointTimeoutMs,
+  stopWithShutdownCheckpoint,
+} from "./shutdown-checkpoint.js";
 
 process.title = "Paseo Daemon";
+
+/** Time the daemon's stop may take after the checkpoint phase before the worker force-exits. */
+const WORKER_STOP_FORCE_EXIT_MS = 10_000;
 
 type SupervisorLifecycleMessage =
   | {
@@ -134,6 +141,8 @@ async function main() {
   let exitHookInstalled = false;
 
   applyCliFlagOverrides(config);
+  // Resolve at boot, not at shutdown, so a malformed budget fails visibly.
+  const shutdownCheckpointTimeoutMs = resolveShutdownCheckpointTimeoutMs();
 
   const installExitHook = () => {
     if (exitHookInstalled || !shutdownPromise) {
@@ -163,10 +172,10 @@ async function main() {
         const forceExit = setTimeout(() => {
           logger.warn(
             { signal, reason, ...getProcessDiagnostics() },
-            "Forcing shutdown - HTTP server didn't close in time",
+            "Forcing shutdown - daemon did not stop in time",
           );
           process.exit(1);
-        }, 10000);
+        }, shutdownCheckpointTimeoutMs + WORKER_STOP_FORCE_EXIT_MS);
 
         try {
           if (!daemon) {
@@ -174,7 +183,13 @@ async function main() {
             clearTimeout(forceExit);
             return 1;
           }
-          await daemon.stop();
+          // A running daemon checkpoints first so the next start restores this
+          // work instead of pausing recovery.
+          await stopWithShutdownCheckpoint(daemon, {
+            logger,
+            reason,
+            timeoutMs: shutdownCheckpointTimeoutMs,
+          });
           clearTimeout(forceExit);
           logger.info("Server closed");
           return options?.successExitCode ?? 0;

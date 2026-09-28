@@ -55,6 +55,8 @@ interface SupervisorOptions {
   } | null;
   onWorkerReady?: (message: { listen: string }) => Promise<void> | void;
   restartOnCrash?: boolean;
+  /** Wait for a cooperative exit after the graceful request; the worker may checkpoint first. */
+  gracefulExitTimeoutMs?: number;
   onSupervisorExit?: () => Promise<void> | void;
   logFile?: SupervisorLogFileOptions;
 }
@@ -127,6 +129,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
   const workerEnv = options.workerEnv ?? process.env;
   const workerExecArgv = options.workerExecArgv ?? ["--import", "tsx"];
   const resolveWorkerSpawnSpec = options.resolveWorkerSpawnSpec;
+  const gracefulExitTimeoutMs = options.gracefulExitTimeoutMs ?? WORKER_TERMINATION_GRACE_MS;
 
   let child: ChildProcess | null = null;
   let restarting = false;
@@ -198,13 +201,14 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
       const waiting = new AbortController();
       try {
         const exited = once(currentChild, "exit", { signal: waiting.signal });
-        const expired = delay(WORKER_TERMINATION_GRACE_MS, "timeout", { signal: waiting.signal });
+        const expired = delay(gracefulExitTimeoutMs, "timeout", { signal: waiting.signal });
         requestWorkerShutdown(currentChild, reason);
         if ((await Promise.race([exited, expired])) === "timeout") {
           writeLifecycleLog(
             "Worker did not exit after graceful shutdown request; forcing process tree kill",
             {
               reason,
+              gracefulExitTimeoutMs,
               supervisorPid: process.pid,
               workerPid: currentChild.pid ?? null,
             },

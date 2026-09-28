@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import pino from "pino";
 import { createPaseoDaemon } from "../bootstrap.js";
+import { stopWithShutdownCheckpoint } from "../shutdown-checkpoint.js";
 import { createCheckpointAgentClient } from "./checkpoint-agent-client.js";
 
 const [home, port = "0", behavior] = process.argv.slice(2);
@@ -42,4 +43,17 @@ if (target?.type !== "tcp") throw new Error("Test daemon did not listen on TCP")
 process.send?.({ port: target.port });
 process.on("message", (message) => {
   if (message === "stop") void daemon.stop().then(() => process.exit(0));
+});
+// Mirror the production worker: a SIGTERM stop checkpoints a running daemon first.
+process.on("SIGTERM", () => {
+  void stopWithShutdownCheckpoint(daemon, {
+    logger: pino({ level: "silent" }),
+    reason: "test_sigterm",
+  }).then(
+    () => process.exit(0),
+    (error) => {
+      console.error(error);
+      process.exit(1);
+    },
+  );
 });
