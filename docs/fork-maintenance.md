@@ -169,8 +169,14 @@ understand which generation is running before retrying or considering rollback.
 
 Success means the expected checkpoint generation is restored, agents continue their
 work, and the updated web UI reconnects. A process or open port alone is insufficient.
-The guarantee covers controlled restarts, not power loss, arbitrary crashes, or
-harness-native loops. Keep prior packages and state available for an inspected,
+The guarantee covers controlled restarts and graceful stops of a running daemon:
+`systemctl stop` or `restart`, and VM or host shutdowns that wait for the unit.
+The configured checkpoint deadline reports failure without killing the daemon.
+The unit uses `SendSIGKILL=false` and waits for certified graceful exit; a failed
+stop can remain pending while you investigate. The VM host's own shutdown limit
+can still terminate it, so prepare through the deployment path before host work.
+The guarantee does not cover SIGKILL, power loss, arbitrary crashes,
+or harness-native loops. Keep prior packages and state available for an inspected,
 compatible rollback. A package must support the offline `daemon checkpoint-check`
 command and read the prepared checkpoint's format before it can be activated.
 The preflight checks advertised formats before preparation, then validates the exact

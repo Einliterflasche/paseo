@@ -13,6 +13,7 @@ import { daemonLogPath } from "../src/server/daemon-instance.js";
 import { PRIVATE_FILE_MODE } from "../src/server/private-files.js";
 import { loadPersistedConfig } from "../src/server/persisted-config.js";
 import { runSupervisor } from "./supervisor.js";
+import { resolveWorkerGracefulExitMs } from "../src/server/shutdown-checkpoint.js";
 import { resolveSupervisorLogFile } from "./supervisor-log-config.js";
 import { applySherpaLoaderEnv } from "../src/server/speech/providers/local/sherpa/sherpa-runtime-env.js";
 import { resolveDaemonHeapArgs } from "./daemon-heap.js";
@@ -105,6 +106,8 @@ async function main(): Promise<void> {
   const config = parseConfig(process.argv.slice(2));
   const workerEntry = config.devMode ? resolveDevWorkerEntry() : resolveWorkerEntry();
   const workerExecArgv = resolveWorkerExecArgv(workerEntry, config.devMode);
+  // Resolve before the PID lock so a malformed shutdown budget fails the start visibly.
+  const gracefulExitTimeoutMs = resolveWorkerGracefulExitMs(process.env);
   const workerEnv: NodeJS.ProcessEnv = { ...process.env };
   delete workerEnv.PASEO_DAEMON_HEAP_MB;
   const packagedNodeEntrypointRunner =
@@ -176,6 +179,7 @@ async function main(): Promise<void> {
         })
       : undefined,
     restartOnCrash: true,
+    gracefulExitTimeoutMs,
     logFile: supervisorLogFile,
     onWorkerReady: async ({ listen, serverId }) => {
       await updatePidLock(paseoHome, { listen, serverId }, { ownerPid: process.pid });

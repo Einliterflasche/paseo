@@ -6,6 +6,10 @@ import { resolvePaseoHome } from "./paseo-home.js";
 import { createRootLogger } from "./logger.js";
 import type { DaemonLifecycleIntent } from "./bootstrap.js";
 import { getProcessDiagnostics } from "./process-diagnostics.js";
+import {
+  resolveShutdownCheckpointTimeoutMs,
+  stopWithShutdownCheckpoint,
+} from "./shutdown-checkpoint.js";
 
 process.title = "Paseo Daemon";
 
@@ -131,20 +135,11 @@ function applyCliFlagOverrides(config: ReturnType<typeof loadConfig>): void {
 async function main() {
   const { paseoHome, logger, config } = bootstrapFromEnvironment();
   let daemon: Awaited<ReturnType<typeof createPaseoDaemon>> | null = null;
-  let shutdownPromise: Promise<number> | null = null;
-  let exitHookInstalled = false;
+  let shutdownPromise: Promise<number | null> | null = null;
 
   applyCliFlagOverrides(config);
-
-  const installExitHook = () => {
-    if (exitHookInstalled || !shutdownPromise) {
-      return;
-    }
-    exitHookInstalled = true;
-    void shutdownPromise.then((exitCode) => {
-      process.exit(exitCode);
-    });
-  };
+  // Resolve at boot, not at shutdown, so a malformed budget fails visibly.
+  const shutdownCheckpointTimeoutMs = resolveShutdownCheckpointTimeoutMs();
 
   const beginShutdown = (
     signal: string,
@@ -161,38 +156,37 @@ async function main() {
       );
 
       shutdownPromise = (async () => {
-        const forceExit = setTimeout(() => {
-          logger.warn(
-            { signal, reason, ...getProcessDiagnostics() },
-            "Forcing shutdown - HTTP server didn't close in time",
-          );
-          process.exit(1);
-        }, 10000);
-
         try {
           if (!daemon) {
             logger.error("Shutdown requested before daemon initialization completed");
-            clearTimeout(forceExit);
             return 1;
           }
-          await daemon.stop();
-          clearTimeout(forceExit);
+          // A running daemon checkpoints first so the next start restores this
+          // work instead of pausing recovery.
+          const outcome = await stopWithShutdownCheckpoint(daemon, {
+            logger,
+            reason,
+            timeoutMs: shutdownCheckpointTimeoutMs,
+          });
+          if (outcome.checkpoint === "failed") return null;
           logger.info("Server closed");
           return options?.successExitCode ?? 0;
         } catch (err) {
-          clearTimeout(forceExit);
-          logger.error({ err }, "Shutdown failed");
-          return 1;
+          logger.error({ err }, "Shutdown failed; execution ownership remains retained");
+          return null;
         }
       })();
+      void shutdownPromise.then((exitCode) => {
+        if (exitCode === null) shutdownPromise = null;
+        else process.exit(exitCode);
+        return undefined;
+      });
     } else {
       logger.info(
         { signal, reason, ...getProcessDiagnostics() },
         `${signal} received while shutdown is already in progress`,
       );
     }
-
-    installExitHook();
   };
 
   const sendSupervisorLifecycleMessage = (message: SupervisorLifecycleMessage): boolean => {

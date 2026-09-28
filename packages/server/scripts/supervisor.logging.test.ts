@@ -22,6 +22,7 @@ function isProcessRunning(pid: number): boolean {
 async function runSupervisorFixture(options: {
   workerSource: string;
   restartOnCrash?: boolean;
+  gracefulExitTimeoutMs?: number;
   timeoutMs?: number;
   /** POSIX RLIMIT_FSIZE for the supervisor, in 512-byte blocks: writes past it fail like a full disk. */
   fileSizeLimitBlocks?: number;
@@ -60,6 +61,7 @@ async function runSupervisorFixture(options: {
         workerEnv: process.env,
         workerExecArgv: [],
         restartOnCrash: ${JSON.stringify(options.restartOnCrash ?? false)},
+        ${options.gracefulExitTimeoutMs === undefined ? "" : `gracefulExitTimeoutMs: ${options.gracefulExitTimeoutMs},`}
         logFile: {
           path: ${JSON.stringify(logPath)},
           rotate: { maxSize: "1m", maxFiles: 2 },
@@ -293,22 +295,44 @@ describe("supervisor durable logging", () => {
     expect(result.log).not.toContain('"msg":"Worker heartbeat timed out; restarting worker"');
   }, 25_000);
 
-  test("forces shutdown when a worker ignores the graceful shutdown request", async () => {
+  test("retains a worker after a graceful timeout and certifies a later retry", async () => {
     const result = await runSupervisorFixture({
-      timeoutMs: 15_000,
+      timeoutMs: 10_000,
+      gracefulExitTimeoutMs: 300,
       workerSource: `
-          process.send?.({ type: "paseo:shutdown", reason: "stalled_worker_shutdown" });
-          setInterval(() => {}, 1_000);
-        `,
+        let requests=0;
+        process.on("message", message => {
+          if(message?.type!=="paseo:graceful-shutdown") return;
+          if(++requests===2) process.exit(0);
+          setTimeout(()=>{
+            console.log("WORKER_ALIVE_AFTER_TIMEOUT");
+            process.send?.({type:"paseo:shutdown",reason:"retry_after_timeout"});
+          },800);
+        });
+        process.send?.({type:"paseo:shutdown",reason:"stalled_worker_shutdown"});
+        setInterval(()=>{},1000);
+      `,
     });
-
     expect(result.code).toBe(0);
-    expect(result.signal).toBeNull();
-    expect(result.log).toContain('"reason":"stalled_worker_shutdown"');
-    expect(result.log).toContain(
-      '"msg":"Worker did not exit after graceful shutdown request; forcing process tree kill"',
-    );
-  }, 20_000);
+    expect(result.stdout).toContain("WORKER_ALIVE_AFTER_TIMEOUT");
+    expect(result.log).toContain("replacement remains blocked");
+    expect(result.log).toContain('"reason":"retry_after_timeout"');
+    expect(result.log).not.toContain("forcing process tree kill");
+  }, 15_000);
+
+  test("waits for a slow cooperative worker without signaling it prematurely", async () => {
+    const result = await runSupervisorFixture({
+      timeoutMs: 10_000,
+      gracefulExitTimeoutMs: 8000,
+      workerSource: `
+        process.send?.({type:"paseo:shutdown",reason:"slow_graceful_exit"});
+        process.on("message",message=>{if(message?.type==="paseo:graceful-shutdown") setTimeout(()=>process.exit(0),2500);});
+        setInterval(()=>{},1000);
+      `,
+    });
+    expect(result.code).toBe(0);
+    expect(result.log).not.toContain("replacement remains blocked");
+  }, 15_000);
 
   test.skipIf(isPlatform("win32"))(
     "restarts after worker exit while a descendant retains the worker stdio",

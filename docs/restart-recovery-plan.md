@@ -20,8 +20,14 @@ background process, database, continuous transcript writes, or persistent client
 outbox. Native files supply the model's execution context; checkpoints preserve
 Paseo's displayed history and continuation intent.
 
-Unexpected crashes, forced termination before checkpoint completion, and client
-process death/reload are outside the guarantee. Updates must keep clients alive
+A graceful stop of a running daemon (SIGTERM to the supervisor, `systemctl stop`
+or `restart`, or a host shutdown that waits for the unit) commits a checkpoint
+first. A paused daemon may stop only when its prepared generation is ready.
+Failed checkpoints, checkpoint timeouts, and blocked or restoring recovery retain
+the daemon and block replacement. The supervisor and NixOS unit do not force-kill
+it after a deadline. Inspect the retained state and retry the checkpointed path.
+Unexpected crashes, SIGKILL, power loss, and client process death/reload are outside
+the guarantee. Updates must keep clients alive
 while they own unsent messages. Preparation depends on history size and provider
 shutdown; measure it rather than promise a fixed downtime.
 
@@ -294,8 +300,9 @@ Run the finite deployment command outside `paseo.service`'s process group using
 the VM's existing detached `systemd-run` convention. This is not a resident process.
 Systemd/Nix stop timers then run after the checkpoint is secure. Increasing
 `TimeoutStopSec`, or failing an `ExecStop`, cannot alone abort a systemd restart.
-Raw signals, `systemctl restart`, and uncoordinated `nixos-rebuild switch` therefore
-are not the safe deployment entrypoint. The command owns preparation plus activation;
+Raw signals, `systemctl restart`, and uncoordinated `nixos-rebuild switch` checkpoint
+a running daemon at stop, but they skip target validation and this ordering, so they
+are not the deployment entrypoint. The command owns preparation plus activation;
 the user never performs a two-command handoff.
 
 The initial handover from upstream is complete. Subsequent updates use the running
