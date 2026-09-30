@@ -45,10 +45,11 @@ function makeWorkspace(
 function makeProject(
   workspaces: SidebarWorkspacePlacement[],
   viewKey = "project",
+  projectName = "Project",
 ): SidebarProjectEntry {
   return {
     viewKey,
-    projectName: "Project",
+    projectName,
     projectKind: "git",
     iconWorkingDir: `/repo/${viewKey}`,
     hosts: [
@@ -107,6 +108,38 @@ function twoProjectInput(groupMode: "project" | "status") {
       ["project", "Project"],
       ["other-project", "Other project"],
     ]),
+  };
+}
+
+function rankedProjectInput(
+  groups: { name: string; statuses: SidebarWorkspaceEntry["statusBucket"][] }[],
+) {
+  const entries = groups.map((group, index) => {
+    const viewKey = `project-${index}`;
+    const workspaces = group.statuses.map((status, workspaceIndex) =>
+      makeWorkspace(`${viewKey}-${workspaceIndex}`, status, [], viewKey),
+    );
+    return {
+      project: makeProject(
+        workspaces.map(({ placement }) => placement),
+        viewKey,
+        group.name,
+      ),
+      workspaces,
+    };
+  });
+  return {
+    ...projectionInput(),
+    projects: entries.map(({ project }) => project),
+    pinnedKeys: { pinnedWorkspaceKeys: [] as string[], pinnedAtByKey: {} },
+    workspaceEntriesByKey: new Map(
+      entries.flatMap(({ workspaces }) =>
+        workspaces.map(({ entry }) => [entry.workspaceKey, entry] as const),
+      ),
+    ),
+    projectNamesByViewKey: new Map(
+      entries.map(({ project }) => [project.viewKey, project.projectName]),
+    ),
   };
 }
 
@@ -171,6 +204,134 @@ describe("buildSidebarProjection", () => {
 
     expect(projection.shortcutModel.shortcutTargets).toEqual([
       { serverId: "srv", workspaceId: "unpinned" },
+    ]);
+  });
+
+  it("ranks ready-to-review projects before working and idle projects without mutating input", () => {
+    const input = rankedProjectInput([
+      { name: "Alpha idle", statuses: ["done"] },
+      { name: "Beta working", statuses: ["running"] },
+      { name: "Zulu review", statuses: ["attention"] },
+    ]);
+    const projection = buildSidebarProjection(input);
+
+    expect(projection.pinnedGroups.unpinnedProjects.map((project) => project.projectName)).toEqual([
+      "Zulu review",
+      "Beta working",
+      "Alpha idle",
+    ]);
+    expect(input.projects.map((project) => project.projectName)).toEqual([
+      "Alpha idle",
+      "Beta working",
+      "Zulu review",
+    ]);
+    expect(projection.shortcutModel.shortcutTargets.map((target) => target.workspaceId)).toEqual([
+      "project-2-0",
+      "project-1-0",
+      "project-0-0",
+    ]);
+  });
+
+  it("gives a mixed green and blue project the ready-to-review priority", () => {
+    const input = rankedProjectInput([
+      { name: "Alpha working", statuses: ["running", "done"] },
+      { name: "Zulu mixed", statuses: ["running", "attention", "done"] },
+    ]);
+
+    expect(
+      buildSidebarProjection(input).pinnedGroups.unpinnedProjects.map(
+        (project) => project.projectName,
+      ),
+    ).toEqual(["Zulu mixed", "Alpha working"]);
+  });
+
+  it("sorts project names alphabetically within each workspace priority", () => {
+    const input = rankedProjectInput([
+      { name: "Zulu idle", statuses: ["done"] },
+      { name: "Zulu working", statuses: ["running"] },
+      { name: "Zulu review", statuses: ["attention"] },
+      { name: "Alpha idle", statuses: ["done"] },
+      { name: "Alpha working", statuses: ["running"] },
+      { name: "Alpha review", statuses: ["attention"] },
+    ]);
+
+    expect(
+      buildSidebarProjection(input).pinnedGroups.unpinnedProjects.map(
+        (project) => project.projectName,
+      ),
+    ).toEqual([
+      "Alpha review",
+      "Zulu review",
+      "Alpha working",
+      "Zulu working",
+      "Alpha idle",
+      "Zulu idle",
+    ]);
+  });
+
+  it("counts a pinned green workspace and preserves the explicit pinned workspace order", () => {
+    const input = rankedProjectInput([
+      { name: "Alpha working", statuses: ["running", "running"] },
+      { name: "Zulu review", statuses: ["attention", "done"] },
+    ]);
+    const greenKey = "srv:project-1-0";
+    const blueKey = "srv:project-0-0";
+    const projection = buildSidebarProjection({
+      ...input,
+      pinnedKeys: { pinnedWorkspaceKeys: [greenKey, blueKey], pinnedAtByKey: {} },
+      pinnedWorkspaceOrder: [blueKey, greenKey],
+    });
+
+    expect(projection.pinnedGroups.pinnedChats.map((workspace) => workspace.workspaceKey)).toEqual([
+      blueKey,
+      greenKey,
+    ]);
+    expect(projection.pinnedGroups.unpinnedProjects.map((project) => project.projectName)).toEqual([
+      "Zulu review",
+      "Alpha working",
+    ]);
+    expect(projection.shortcutModel.shortcutTargets.map((target) => target.workspaceId)).toEqual([
+      "project-0-0",
+      "project-1-0",
+      "project-1-1",
+      "project-0-1",
+    ]);
+  });
+
+  it("uses the filtered project cohort without resurrecting a hidden green workspace", () => {
+    const input = rankedProjectInput([
+      { name: "Zulu filtered", statuses: ["attention", "running"] },
+      { name: "Alpha working", statuses: ["running"] },
+    ]);
+    input.projects[0] = {
+      ...input.projects[0]!,
+      workspaces: input.projects[0]!.workspaces.slice(1),
+    };
+    const projection = buildSidebarProjection(input);
+
+    expect(projection.pinnedGroups.unpinnedProjects.map((project) => project.projectName)).toEqual([
+      "Alpha working",
+      "Zulu filtered",
+    ]);
+    expect(projection.shortcutModel.shortcutTargets.map((target) => target.workspaceId)).toEqual([
+      "project-1-0",
+      "project-0-1",
+    ]);
+  });
+
+  it("keeps the existing project input and status group order in status mode", () => {
+    const input = rankedProjectInput([
+      { name: "Alpha idle", statuses: ["done"] },
+      { name: "Zulu review", statuses: ["attention"] },
+      { name: "Beta working", statuses: ["running"] },
+    ]);
+    const projection = buildSidebarProjection({ ...input, groupMode: "status" });
+
+    expect(projection.pinnedGroups.unpinnedProjects).toBe(input.projects);
+    expect(projection.workspaceGroups.map((group) => group.key)).toEqual([
+      "attention",
+      "running",
+      "done",
     ]);
   });
 });

@@ -49,7 +49,10 @@ export interface SidebarProjectionInput {
 
 export function buildSidebarProjection(input: SidebarProjectionInput): SidebarProjection {
   const pinnedGroups = splitPinnedSidebarGroups({
-    projects: input.projects,
+    projects:
+      input.groupMode === "project"
+        ? sortProjectsByWorkspaceStatus(input.projects, input.workspaceEntriesByKey)
+        : input.projects,
     keys: input.pinnedKeys,
     pinnedWorkspaceOrder: input.pinnedWorkspaceOrder,
   });
@@ -88,6 +91,31 @@ export function buildSidebarProjection(input: SidebarProjectionInput): SidebarPr
     projectIconTargets: resolveSidebarProjectIconTargets(input.projects),
     shortcutModel: buildSidebarShortcutSections({ sections }),
   };
+}
+
+function sortProjectsByWorkspaceStatus(
+  projects: SidebarProjectEntry[],
+  workspaceEntriesByKey: ReadonlyMap<string, SidebarWorkspaceEntry>,
+): SidebarProjectEntry[] {
+  return projects
+    .map((project) => {
+      let rank = 2;
+      // Use the same filtered workspace indicators as the rows, including pinned workspaces.
+      for (const workspace of project.workspaces) {
+        const bucket = workspaceEntriesByKey.get(workspace.workspaceKey)?.statusBucket;
+        if (bucket === "attention") {
+          rank = 0;
+          break;
+        }
+        if (bucket === "running") rank = 1;
+      }
+      return { project, rank };
+    })
+    .sort(
+      (left, right) =>
+        left.rank - right.rank || left.project.projectName.localeCompare(right.project.projectName),
+    )
+    .map(({ project }) => project);
 }
 
 /** Project mode keeps its project headers and groups nothing; status mode groups the rows. */
