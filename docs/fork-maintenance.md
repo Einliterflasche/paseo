@@ -86,6 +86,17 @@ from its environment; agent subprocesses keep their own defaults. Do not use
 service-wide `NODE_OPTIONS` for this adjustment. The heap limit is an allowance,
 not reserved RAM, and excludes native buffers and other processes.
 
+This VM uses `parakeet-tdt-0.6b-v3-int8` for dictation and voice input.
+Set both `PASEO_DICTATION_LOCAL_STT_MODEL` and `PASEO_VOICE_LOCAL_STT_MODEL`
+through `services.paseo.environment`. English and German recognition needs these
+overrides because the default v2 model supports only English. Live audio tests
+passed after the checkpointed deployment on 2026-09-30.
+
+Switching languages within one recording remains unreliable. Keep the current
+auto-commit behavior until a pause-based improvement passes audio-preservation
+and lifecycle tests. The deployment and continuity evidence is retained in
+`/home/agent/paseo-deployments/voice-bilingual-activation-20260930/`.
+
 The VM has run this fork with restart recovery since 2026-09-16. The initial
 handover is complete; its backups and verification are retained in
 `/home/agent/paseo-deployments/20260916T112552Z`. Do not reuse its one-time

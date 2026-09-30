@@ -162,11 +162,10 @@ Keep their owners while adopting upstream composer, form, shortcut, and editor c
 Source Find and Replace complements file previews. Preserve both workflows and grant
 invalidation after reconnect.
 
-The read-only speech audit identifies English-only local Parakeet v2 as the German
-recognition constraint. Deployed code already accepts multilingual Parakeet v3.
-That change needs separate model files and speech configuration; a rebase alone does
-not enable German. Preserve shared dictation and keep untested speech model changes
-outside the rebase. The detailed language audit is retained in `voice/report.md`.
+The subsequent bilingual speech deployment is complete. Preserve the
+[host speech configuration](fork-maintenance.md#deployment-baseline) and shared
+dictation during the rebase. Keep untested recognition changes outside the rebase.
+The earlier read-only language audit remains in `voice/report.md`.
 
 ## Preserve older working copies
 
@@ -256,5 +255,5 @@ proposed configuration, with redacted evidence and vendor references.
 Earlier activation and service recovery evidence remains in
 `/home/agent/paseo-deployments/20260919-services/`,
 `/home/agent/paseo-deployments/20260920-service-recovery/`, and the latest model/Fast
-deployment directories. The current audit performs no restart, service lifecycle
+deployment directories. The upstream audit made no restart, service lifecycle
 mutation, model prompt, or speech configuration change.
