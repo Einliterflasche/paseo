@@ -7,7 +7,7 @@ import { mergeProviderPreferences, useFormPreferences } from "./use-form-prefere
 import {
   applyFeatureValues,
   pruneFeatureValues,
-  resolveFeatureValues,
+  resolveDraftFeatureValues,
 } from "./feature-preferences";
 
 type DraftFeatureConfig = Pick<
@@ -82,7 +82,7 @@ export function useDraftAgentFeatures(input: {
   const availableFeatures = useMemo(() => availableFeaturesRaw ?? [], [availableFeaturesRaw]);
   const featureValues = useMemo(
     () =>
-      resolveFeatureValues({
+      resolveDraftFeatureValues({
         features: availableFeatures,
         persistedFeatureValues,
         localFeatureValues,

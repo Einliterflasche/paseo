@@ -39,11 +39,13 @@ export function applyFeatureValues(
   });
 }
 
-export function resolveFeatureValues(args: {
+interface FeaturePreferencesInput {
   features: AgentFeature[];
   persistedFeatureValues: Record<string, unknown>;
   localFeatureValues: Record<string, unknown>;
-}): Record<string, unknown> {
+}
+
+export function resolveFeatureValues(args: FeaturePreferencesInput): Record<string, unknown> {
   const next: Record<string, unknown> = {};
 
   for (const feature of args.features) {
@@ -56,5 +58,16 @@ export function resolveFeatureValues(args: {
     }
   }
 
+  return next;
+}
+
+export function resolveDraftFeatureValues(args: FeaturePreferencesInput): Record<string, unknown> {
+  const next = resolveFeatureValues(args);
+  // New drafts start at Normal unless this draft explicitly selects a speed.
+  for (const feature of args.features) {
+    if (Object.prototype.hasOwnProperty.call(args.localFeatureValues, feature.id)) continue;
+    if (feature.id === "fast_mode") next[feature.id] = false;
+    if (feature.id === "service_tier") next[feature.id] = "default";
+  }
   return next;
 }
