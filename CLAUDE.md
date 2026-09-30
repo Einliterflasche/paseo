@@ -28,6 +28,7 @@ At the start of non-trivial work, list `docs/` and skim anything relevant to the
 | Doc                                                                  | What's in it                                                                                                                   |
 | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | [docs/fork-maintenance.md](docs/fork-maintenance.md)                 | Fork branches, commit prefix, rebasing, and deployment baseline                                                                |
+| [docs/fork-rebase-plan.md](docs/fork-rebase-plan.md)                 | Frozen rebase target, retained patch decisions, qualification evidence, and release gates                                      |
 | [docs/fork-requirements.md](docs/fork-requirements.md)               | Raphael's requirements for the move from Slack to Paseo                                                                        |
 | [docs/services-catalog.md](docs/services-catalog.md)                 | Services development slice, compatibility boundaries and remaining rollout gates                                               |
 | [docs/restart-recovery-plan.md](docs/restart-recovery-plan.md)       | Controlled restart checkpoints, automatic continuation, and accepted crash limitation                                          |
