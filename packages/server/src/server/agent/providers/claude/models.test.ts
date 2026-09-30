@@ -74,8 +74,25 @@ describe("getClaudeModels", () => {
     const models = getClaudeModels();
     const defaults = models.filter((m) => m.isDefault);
     expect(defaults).toHaveLength(1);
-    expect(defaults[0].id).toBe("claude-opus-5-5");
+    expect(defaults[0].id).toBe("claude-opus-5");
+    expect(defaults[0].defaultThinkingOptionId).toBe("high");
   });
+
+  it.each(["2.1.280", "2.1.284"])(
+    "keeps Opus 5 and High as defaults with Claude Code %s",
+    (version) => {
+      const defaultModel = getClaudeModels(version).find((model) => model.isDefault);
+      expect(defaultModel).toMatchObject({ id: "claude-opus-5", defaultThinkingOptionId: "high" });
+      expect(
+        defaultModel?.thinkingOptions
+          ?.filter((option) => option.isDefault)
+          .map((option) => option.id),
+      ).toEqual(["high"]);
+      expect(
+        getClaudeModels(version).find((model) => model.id === "claude-opus-5-5"),
+      ).toMatchObject({ defaultThinkingOptionId: "medium" });
+    },
+  );
 
   it("defines context window sizes in the catalog", () => {
     const contextWindows = new Map(
@@ -117,7 +134,7 @@ describe("getClaudeModels", () => {
     expect(getClaudeModels("2.1.279").map((model) => model.id)).not.toContain("claude-opus-5-5");
     expect(getClaudeModels("2.1.279").find((model) => model.isDefault)?.id).toBe("claude-opus-5");
     expect(getClaudeModels("2.1.280").map((model) => model.id)).toContain("claude-opus-5-5");
-    expect(getClaudeModels("2.1.280").find((model) => model.isDefault)?.id).toBe("claude-opus-5-5");
+    expect(getClaudeModels("2.1.280").find((model) => model.isDefault)?.id).toBe("claude-opus-5");
 
     expect(getClaudeModels("2.1.283").map((model) => model.id)).not.toContain("claude-sonnet-5-5");
     expect(getClaudeModels("2.1.284").map((model) => model.id)).toContain("claude-sonnet-5-5");
