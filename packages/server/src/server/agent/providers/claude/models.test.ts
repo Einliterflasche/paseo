@@ -39,7 +39,7 @@ async function createClaudeConfigDirWithRawSettings(settings: string): Promise<s
   return configDir;
 }
 
-function createCatalogClient(claudeCodeVersion = "2.1.219"): ClaudeAgentClient {
+function createCatalogClient(claudeCodeVersion = "2.1.280"): ClaudeAgentClient {
   return new ClaudeAgentClient({
     logger: createTestLogger(),
     resolveVersion: async () => claudeCodeVersion,
@@ -50,6 +50,7 @@ describe("getClaudeModels", () => {
   it("returns all claude models", () => {
     const models = getClaudeModels();
     expect(models.map((m) => m.id)).toEqual([
+      "claude-opus-5-5",
       "claude-opus-5",
       "claude-fable-5-1",
       "claude-fable-5",
@@ -82,6 +83,7 @@ describe("getClaudeModels", () => {
 
     expect(contextWindows).toEqual(
       new Map([
+        ["claude-opus-5-5", 1_000_000],
         ["claude-opus-5", 1_000_000],
         ["claude-fable-5-1", 1_000_000],
         ["claude-fable-5", 1_000_000],
@@ -102,6 +104,9 @@ describe("getClaudeModels", () => {
   });
 
   it("filters models by their minimum Claude Code version", () => {
+    expect(getClaudeModels("2.1.279").map((model) => model.id)).not.toContain("claude-opus-5-5");
+    expect(getClaudeModels("2.1.280").map((model) => model.id)).toContain("claude-opus-5-5");
+
     const oldVersionModels = getClaudeModels("2.1.218");
     expect(oldVersionModels.map((model) => model.id)).not.toContain("claude-opus-5");
     expect(oldVersionModels.find((model) => model.isDefault)?.id).toBe("claude-opus-4-8");
@@ -109,6 +114,25 @@ describe("getClaudeModels", () => {
 
     expect(getClaudeModels("2.1.168").map((model) => model.id)).not.toContain("claude-fable-5");
     expect(getClaudeModels("2.1.169").map((model) => model.id)).toContain("claude-fable-5");
+  });
+
+  it("exposes Opus 5.5 capabilities without disabled thinking", () => {
+    const models = new Map(getClaudeModels().map((model) => [model.id, model]));
+
+    expect(models.get("claude-opus-5-5")?.thinkingOptions?.map((option) => option.id)).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      CLAUDE_ULTRACODE_THINKING_OPTION_ID,
+    ]);
+    expect(resolveClaudeDisabledThinkingForModel("claude-opus-5-5")).toEqual({
+      supported: false,
+      fallbackThinkingOptionId: "high",
+    });
+    expect(claudeManifestModelSupportsFastMode("claude-opus-5-5")).toBe(true);
+    expect(normalizeClaudeRuntimeModelId("claude-opus-5-5[1m]")).toBe("claude-opus-5-5");
   });
 
   it("derives thinking options from model effort capabilities", () => {
@@ -436,12 +460,13 @@ describe("findClaudeModel", () => {
 });
 
 describe("Claude Opus 5 catalog", () => {
-  it("offers a single Opus 5 entry with a 1M context window", () => {
+  it("offers one entry per Opus 5 release with a 1M context window", () => {
     const opus5Models = getClaudeModels()
       .filter((model) => model.id.startsWith("claude-opus-5"))
       .map(({ id, label, contextWindowMaxTokens }) => ({ id, label, contextWindowMaxTokens }));
 
     expect(opus5Models).toEqual([
+      { id: "claude-opus-5-5", label: "Opus 5.5", contextWindowMaxTokens: 1_000_000 },
       { id: "claude-opus-5", label: "Opus 5", contextWindowMaxTokens: 1_000_000 },
     ]);
   });
