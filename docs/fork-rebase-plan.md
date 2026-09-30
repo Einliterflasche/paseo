@@ -46,6 +46,7 @@ was introduced.
 | Codex `3ceb1c966`                                       | Static list replaced       | Upstream native Speed migration retains saved true/false; new drafts/tasks use Normal                                                        |
 | Fork policy/audit and bilingual host documentation      | Retained/integrated        | Archival publication rules, completed qualification and unchanged host speech configuration                                                  |
 | New project ranking                                     | Separate focused patch     | Green ready-to-review projects first, blue working next, gray idle last, alphabetical ties; green wins mixed projects                        |
+| New web build resource limit                            | Separate build patch       | Reproducible daemon/Nix web export with a build-only heap allowance and one Metro worker; runtime heap policy unchanged                      |
 
 The replaced model implementations keep their logical patch boundaries and equivalent
 behavior tests. They are not whole memory/lifecycle patch deletions. Schedules still
@@ -109,6 +110,11 @@ client, plugin, server, CLI and native-audio declarations were rebuilt before ty
 checks. Full workspace typecheck, lint and formatting checks passed after integration.
 Focused affected files were run separately under the shared validation lock; the full
 local suite was not run. Specialist green results were trusted without duplicate runs.
+
+Metro's transform of the generated protocol validator exhausted Node's default
+heap in both local and immutable Nix exports. The shared daemon-web export now
+owns a build-only 6144 MiB allowance and one Metro worker. Nix uses that same
+entry point; the installed wrappers and runtime worker heap scope stay unchanged.
 
 Focused evidence covers queue/reconnect/authentication, projected/canonical timeline
 history, shared backing memory, exact snapshots, checkpoint-owned replay, input receipt

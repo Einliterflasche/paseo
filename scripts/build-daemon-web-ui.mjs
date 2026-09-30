@@ -37,8 +37,14 @@ function run(command, args, options) {
 
 async function exportBrowserWebApp() {
   console.log("Exporting browser web app...");
-  await run("npm", ["run", "build:web", "--workspace=@getpaseo/app"], {
+  await run("npm", ["run", "build:web", "--workspace=@getpaseo/app", "--", "--max-workers", "1"], {
     cwd: REPO_ROOT,
+    env: {
+      ...process.env,
+      // Metro's generated protocol validator exceeds Node's default heap. Keep
+      // the allowance inside this build subprocess, including its one worker.
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --max-old-space-size=6144`.trim(),
+    },
   });
 }
 
