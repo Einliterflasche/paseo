@@ -1060,13 +1060,15 @@ describe("browser MCP tools", () => {
       expect(toolNames).not.toContain("list_agents");
       expect(toolNames).not.toContain("browser_list_tabs");
       expect(toolNames).toEqual(expect.arrayContaining(["create_agent", "browser_snapshot"]));
-      await expect(client.callTool({ name: "list_agents", arguments: {} })).resolves.toEqual({
-        content: [{ type: "text", text: "MCP error -32602: Tool list_agents not found" }],
-        isError: true,
+      await expect(client.callTool({ name: "list_agents", arguments: {} })).rejects.toMatchObject({
+        code: -32602,
+        message: "MCP error -32602: Tool list_agents not found",
       });
-      await expect(client.callTool({ name: "browser_list_tabs", arguments: {} })).resolves.toEqual({
-        content: [{ type: "text", text: "MCP error -32602: Tool browser_list_tabs not found" }],
-        isError: true,
+      await expect(
+        client.callTool({ name: "browser_list_tabs", arguments: {} }),
+      ).rejects.toMatchObject({
+        code: -32602,
+        message: "MCP error -32602: Tool browser_list_tabs not found",
       });
       expect(broker.calls).toEqual([]);
     } finally {

@@ -91,6 +91,7 @@ async function createMcpClient(url: string, authToken?: string): Promise<McpClie
 
 interface OfflineMcpDaemon {
   client: McpClient;
+  url: string;
   stop: () => Promise<void>;
 }
 
@@ -124,6 +125,7 @@ async function startOfflineMcpDaemon(): Promise<OfflineMcpDaemon> {
     const client = await createMcpClient(`http://127.0.0.1:${port}/mcp/agents`);
     return {
       client,
+      url: `http://127.0.0.1:${port}/mcp/agents`,
       stop: async () => {
         await client.close();
         await daemon.stop();
@@ -234,6 +236,54 @@ async function assertAgentNotRunning(options: {
 }
 
 describe("agent MCP end-to-end (offline)", () => {
+  test("serves July 2026 requests and legacy clients on the same endpoint", async () => {
+    const daemon = await startOfflineMcpDaemon();
+    try {
+      const modernRequest = async (method: string, params: Record<string, unknown> = {}) => {
+        const response = await fetch(daemon.url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+            "MCP-Protocol-Version": "2026-07-28",
+            "Mcp-Method": method,
+            ...(typeof params.name === "string" ? { "Mcp-Name": params.name } : {}),
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method,
+            params: {
+              ...params,
+              _meta: {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": { name: "test", version: "1.0" },
+                "io.modelcontextprotocol/clientCapabilities": {},
+              },
+            },
+          }),
+        });
+        expect(response.status).toBe(200);
+        const result = await response.json();
+        expect(result.error).toBeUndefined();
+        return result.result;
+      };
+      const discovery = await modernRequest("server/discover");
+      expect(discovery.supportedVersions).toContain("2026-07-28");
+      expect(discovery._meta["io.modelcontextprotocol/serverInfo"].name).toBe("agent-mcp");
+      const listed = await modernRequest("tools/list");
+      expect(listed.tools).toEqual(
+        expect.arrayContaining([expect.objectContaining({ name: "list_agents" })]),
+      );
+      const called = await modernRequest("tools/call", { name: "list_agents", arguments: {} });
+      expect(called.isError).not.toBe(true);
+      const legacyResult = await daemon.client.callTool({ name: "list_agents", args: {} });
+      expect(legacyResult.isError).not.toBe(true);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
   test("create_agent runs initial prompt and affects filesystem", async () => {
     const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
     const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
