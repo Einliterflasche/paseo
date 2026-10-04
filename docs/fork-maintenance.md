@@ -13,9 +13,15 @@ series reviewable is the constraint.
 - `main`: working branch of our Paseo repository. It tracks `origin/main`.
 - `upstream-base`: upstream commit underneath the current patch series.
 
-Use `/home/agent/code/paseo` as the primary checkout. The repository name is
-`paseo`. The former working branch `fork` is now `main`.
+Use `/home/agent/code/paseo-project` as the project container. It is not a Git repository.
+The primary checkout is `/home/agent/code/paseo-project/main`.
+Keep additional worktrees under `/home/agent/code/paseo-project/worktrees/`.
+The repository name is `paseo`. The former working branch `fork` is now `main`.
 The upstream source remains available through `upstream/main`.
+
+The old path `/home/agent/code/paseo` links to the primary checkout.
+The laboratory's original managed path links to `worktrees/ideenlabor` in the project container.
+Keep these links while existing workspaces, agents and services use the old paths.
 
 The initial upstream base is v0.8.0 revision,
 `b8e24677e12b226c7c38c1c3a40649daa9f1152f`. Fetching newer upstream code does
@@ -28,7 +34,7 @@ He also authorized removal of the old archive, rebase, inspection and Services
 branches, both locally and on `origin`, and the remaining backup manifest.
 These historical snapshots are no longer retained as branches.
 
-The separate `Paseo Ideenlabor` workspace uses a managed worktree for experiments.
+The separate `Paseo Ideenlabor` workspace uses `worktrees/ideenlabor` for experiments.
 Its agent develops one prototype per six-hour scheduled turn and retains demo evidence.
 Raphael selects experiments for implementation. Keep experiments separate from `main`.
 
