@@ -25,10 +25,11 @@ to push to this repository was given on 2026-09-18.
 
 The worktree consolidation on 2026-10-04 preserved unfinished source changes on
 `archive/worktree-*` branches. These snapshots are unvalidated work, not release candidates.
-The original directories, including generated files, are retained under
-`/home/agent/paseo-worktree-backups/20261004T122555Z/`.
-Its `manifest.json` maps each previous path and branch to its snapshot.
-Keep these backups and archive branches available for recovery.
+Raphael requested deletion of the original directories to reclaim disk space.
+The directories and their generated files were deleted on 2026-10-04.
+Only `/home/agent/paseo-worktree-backups/20261004T122555Z/manifest.json` remains.
+It maps each previous path and branch to its snapshot.
+Keep this manifest and the archive branches available for recovery.
 
 ## Update upstream
 
