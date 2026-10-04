@@ -13,7 +13,7 @@ series reviewable is the constraint.
 - `main`: working branch of our Paseo repository. It tracks `origin/main`.
 - `upstream-base`: upstream commit underneath the current patch series.
 
-Use `/home/agent/code/paseo` as the sole active worktree. The repository name is
+Use `/home/agent/code/paseo` as the primary checkout. The repository name is
 `paseo`. The former working branch `fork` is now `main`.
 The upstream source remains available through `upstream/main`.
 
@@ -23,13 +23,14 @@ not upgrade the running daemon. Commit and push completed changes to `origin/mai
 unless Raphael explicitly requests local-only work. His standing authorization
 to push to this repository was given on 2026-09-18.
 
-The worktree consolidation on 2026-10-04 preserved unfinished source changes on
-`archive/worktree-*` branches. These snapshots are unvalidated work, not release candidates.
-Raphael requested deletion of the original directories to reclaim disk space.
-The directories and their generated files were deleted on 2026-10-04.
-Only `/home/agent/paseo-worktree-backups/20261004T122555Z/manifest.json` remains.
-It maps each previous path and branch to its snapshot.
-Keep this manifest and the archive branches available for recovery.
+Raphael requested deletion of the old worktrees and their generated files on 2026-10-04.
+He also authorized removal of the old archive, rebase, inspection and Services
+branches, both locally and on `origin`, and the remaining backup manifest.
+These historical snapshots are no longer retained as branches.
+
+The separate `Paseo Ideenlabor` workspace uses a managed worktree for experiments.
+Its agent develops one prototype per six-hour scheduled turn and retains demo evidence.
+Raphael selects experiments for implementation. Keep experiments separate from `main`.
 
 ## Update upstream
 

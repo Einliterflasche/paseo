@@ -22,9 +22,11 @@ Antigravity stays removed. Upstream Find and Replace, plugin installation and up
 pane and route ownership, native speeds, provider additions, and newer usage behavior
 remain in the integrated tree.
 
-The original series is retained at `archive/fork-20260930T201631Z`. The isolated
-candidate is `rebase/fork-20260930T201631Z`; the replay mapping and reviewed range-diff
-are retained in the run evidence below. All surviving fork subjects use `fork patch:`.
+Qualification used `archive/fork-20260930T201631Z` for the original series and
+`rebase/fork-20260930T201631Z` for the isolated candidate.
+Raphael authorized deletion of these branches and their old worktrees on 2026-10-04.
+The replay mapping and reviewed range-diff remain in the run evidence below.
+All surviving fork subjects use `fork patch:`.
 The 17 old unprefixed subjects were renamed. No upstream merge or unrelated squash
 was introduced.
 
@@ -101,9 +103,10 @@ limit; prepare before host maintenance.
 
 Evidence is retained at `/home/agent/paseo-rebase-runs/20260930T201631Z/`.
 `baseline.json`, `old-patches.txt`, `target-delta.txt`, `rewritten-list.txt` and the
-final mapping/range-diff preserve the inputs and history review. The separate working
-copies and earlier audit evidence under `/home/agent/paseo-rebase-audits/20260930/`
-remain available; no diagnostic tree was copied over the fork.
+final mapping/range-diff preserve the inputs and history review.
+The earlier audit evidence under `/home/agent/paseo-rebase-audits/20260930/`
+remains available. The old working copies were deleted at Raphael's request.
+No diagnostic tree was copied over the fork.
 
 Candidate dependencies were installed in the isolated worktree. Owning protocol,
 client, plugin, server, CLI and native-audio declarations were rebuilt before type
