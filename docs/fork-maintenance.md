@@ -7,56 +7,66 @@ series reviewable is the constraint.
 
 ## Branches
 
-- `upstream`: fetch remote for `https://github.com/getpaseo/paseo.git`.
-- `origin`: publishing remote for `https://github.com/Einliterflasche/paseo.git`;
+- `origin`: publishing remote for `https://github.com/Einliterflasche/paseo.git`.
   `klaus-botty` has push access.
-- `main`: unmodified mirror of `upstream/main`.
+- `upstream`: fetch remote for `https://github.com/getpaseo/paseo.git`.
+- `main`: working branch of our Paseo repository. It tracks `origin/main`.
 - `upstream-base`: upstream commit underneath the current patch series.
-- `fork`: working branch; all commits after `upstream-base` are fork patches.
 
-The checkout is `/home/agent/code/paseo`. The initial upstream base is v0.8.0 revision,
+Use `/home/agent/code/paseo` as the sole active worktree. The repository name is
+`paseo`. The former working branch `fork` is now `main`.
+The upstream source remains available through `upstream/main`.
+
+The initial upstream base is v0.8.0 revision,
 `b8e24677e12b226c7c38c1c3a40649daa9f1152f`. Fetching newer upstream code does
-not upgrade the running daemon. Commit and push completed changes to `origin/fork`
+not upgrade the running daemon. Commit and push completed changes to `origin/main`
 unless Raphael explicitly requests local-only work. His standing authorization
-to push to this fork was given on 2026-09-18.
+to push to this repository was given on 2026-09-18.
+
+The worktree consolidation on 2026-10-04 preserved unfinished source changes on
+`archive/worktree-*` branches. These snapshots are unvalidated work, not release candidates.
+The original directories, including generated files, are retained under
+`/home/agent/paseo-worktree-backups/20261004T122555Z/`.
+Its `manifest.json` maps each previous path and branch to its snapshot.
+Keep these backups and archive branches available for recovery.
 
 ## Update upstream
 
 The current [rebase plan](fork-rebase-plan.md) records deployed behavior, upstream
 overlap, patch decisions, and qualification gates. Read it before rewriting the series.
 
-Fork patches must always be the newest commits, directly on top of the selected
-upstream revision. Rebase the entire series on every upstream update. Never merge
-upstream into `fork`, interleave local patches with upstream commits, or squash
-unrelated customizations into one patch.
+Keep all fork patches directly above the selected upstream revision.
+Rebase the entire series on every upstream update. Never merge upstream into
+`main`, interleave local patches with upstream commits, or squash unrelated
+customizations into one patch.
 
-Start with a clean working tree. Fetch upstream, preserve the current fork under
-a new archival branch name, then rebase. For an update to upstream's main branch:
+Start with a clean working tree. Fetch upstream, preserve the current main under
+an archival branch name, then rebase. For an update to upstream's main branch:
 
 ```sh
 git fetch upstream
 git switch main
-git merge --ff-only upstream/main
-git switch fork
-git branch "archive/fork-$(date -u +%Y%m%dT%H%M%SZ)"
-git rebase --onto main upstream-base fork
+git branch "archive/main-$(date -u +%Y%m%dT%H%M%SZ)"
+git rebase --onto upstream/main upstream-base main
 ```
 
-Resolve conflicts within the affected patch. If upstream has adopted a patch,
-verify the behavior before dropping its duplicate; the archival branch retains
-the previous series. Keep the `fork patch: ` subjects on surviving commits.
+Resolve conflicts within the affected patch. If upstream adopts a patch,
+make sure that the behavior works before dropping its duplicate.
+The archival branch retains the previous series.
+Keep the `fork patch: ` subjects on surviving commits.
 
-Run the checks required by the changed code and inspect `git range-diff
-upstream-base..<archival-branch> main..fork` before advancing the base marker:
+Run the checks required by the changed code. Inspect
+`git range-diff upstream-base..<archival-branch> upstream/main..main`
+before advancing the base marker:
 
 ```sh
-git branch -f upstream-base main
-git log --reverse --format='%h %s' upstream-base..fork
-git rev-list --merges upstream-base..fork
+git branch -f upstream-base upstream/main
+git log --reverse --format='%h %s' upstream-base..main
+git rev-list --merges upstream-base..main
 ```
 
 The final command must produce no commits. Every subject in the patch range must
-start with `fork patch: `. Publish rebased history to `origin/fork` with
+start with `fork patch: `. Publish rebased history to `origin/main` with
 `--force-with-lease`, preserving collaborators' unexpected changes.
 Never push our patches to the upstream remote.
 
@@ -108,7 +118,7 @@ Update the `paseoSrc` archive URL and unpacked hash in
 `/etc/nixos/configuration.nix`, preserving the packaging overrides above. Keep the
 previous archive and host configuration. A checkout edit or a history-only squash
 does not update the running package; a squash with the same Git tree needs no
-service restart. Push the committed revision to `origin/fork` before deployment.
+service restart. Push the committed revision to `origin/main` before deployment.
 
 What the CLI now owns is the activation step after that pin update: `paseo daemon
 deploy --target-cli <replacement-paseo> -- <activation argv>` prepares a checkpoint on the _running_ daemon, runs the
