@@ -367,6 +367,7 @@ test.describe("Sidebar project grouping", () => {
       const pathHeaders = group.locator('[data-testid^="sidebar-workspace-path-"]');
       await expect(pathHeaders).toHaveCount(2);
       await expect(pathHeaders.nth(0)).toHaveAttribute("aria-label", seeded.repoPath);
+      await expect(pathHeaders.nth(0)).toHaveText(seeded.repoPath);
       const rows = group.locator('[data-testid^="sidebar-workspace-row-"]');
       await expect(rows.nth(0)).toHaveAttribute("data-testid", `sidebar-workspace-row-${firstKey}`);
       await expect(rows.nth(1)).toHaveAttribute(

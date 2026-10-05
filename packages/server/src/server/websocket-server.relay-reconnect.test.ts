@@ -1,6 +1,7 @@
 import { SessionDelivery } from "./session/owned-subscriptions/index.js";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { Server as HTTPServer } from "http";
+import { homedir } from "node:os";
 import type pino from "pino";
 import type { AgentManager } from "./agent/agent-manager.js";
 import type { AgentStorage } from "./agent/agent-storage.js";
@@ -1149,6 +1150,7 @@ describe("relay external socket reconnect behavior", () => {
     expect(serverInfo.features?.["terminal-size-ownership"]).toBe(true);
     expect(serverInfo.features?.agentTurnIdentity).toBeUndefined();
     expect(serverInfo.permissions).toEqual(DAEMON_PERMISSIONS);
+    expect(serverInfo.homeDirectory).toBe(homedir());
     await server.close();
   });
 

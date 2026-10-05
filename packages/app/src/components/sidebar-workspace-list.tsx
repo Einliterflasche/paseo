@@ -23,6 +23,8 @@ import {
   type PropsWithChildren,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { useShallow } from "zustand/shallow";
+import { useSessionStore } from "@/stores/session-store";
 import { router, usePathname, type Href } from "expo-router";
 import {
   navigateToWorkspace,
@@ -1562,6 +1564,7 @@ function ProjectBlock({
   dragGestureHostActive,
   creatingWorkspaceIds,
   activeWorkspaceSelection,
+  homeDirectoryByServerId,
   hostBadgeByServerId,
   supportsMultiplicityByServerId,
   supportsPinningByServerId,
@@ -1587,14 +1590,20 @@ function ProjectBlock({
   dragGestureHostActive?: boolean;
   creatingWorkspaceIds: ReadonlySet<string>;
   activeWorkspaceSelection: ActiveWorkspaceSelection | null;
+  homeDirectoryByServerId: ReadonlyMap<string, string | undefined>;
   hostBadgeByServerId: ReadonlyMap<string, HostBadgeModel>;
   supportsMultiplicityByServerId: ReadonlyMap<string, boolean>;
   supportsPinningByServerId: ReadonlyMap<string, boolean>;
   onToggleWorkspacePin: ToggleSidebarWorkspacePin;
 }) {
   const pathGroups = useMemo(
-    () => groupSidebarWorkspacesByPath(project.workspaces, workspaceEntriesByKey),
-    [project.workspaces, workspaceEntriesByKey],
+    () =>
+      groupSidebarWorkspacesByPath(
+        project.workspaces,
+        workspaceEntriesByKey,
+        homeDirectoryByServerId,
+      ),
+    [project.workspaces, workspaceEntriesByKey, homeDirectoryByServerId],
   );
   const groupedWorkspaces = useMemo(
     () => pathGroups.flatMap((group) => group.workspaces),
@@ -1694,7 +1703,7 @@ function ProjectBlock({
                   <Text
                     style={styles.workspacePathLabel}
                     numberOfLines={1}
-                    ellipsizeMode="head"
+                    ellipsizeMode="tail"
                     accessibilityLabel={group.path}
                     testID={`sidebar-workspace-path-${item.workspaceKey}`}
                   >
@@ -1873,6 +1882,7 @@ function areProjectBlockPropsEqual(previous: ProjectBlockProps, next: ProjectBlo
     previous.showShortcutBadges === next.showShortcutBadges &&
     previous.shortcutIndexByWorkspaceKey === next.shortcutIndexByWorkspaceKey &&
     previous.hostBadgeByServerId === next.hostBadgeByServerId &&
+    previous.homeDirectoryByServerId === next.homeDirectoryByServerId &&
     previous.supportsMultiplicityByServerId === next.supportsMultiplicityByServerId &&
     previous.supportsPinningByServerId === next.supportsPinningByServerId &&
     previous.onToggleWorkspacePin === next.onToggleWorkspacePin &&
@@ -1952,6 +1962,15 @@ export function SidebarWorkspaceList({
     enabled: rowItems.host && shouldShowSidebarHostLabels(projects),
   });
   const serverIds = useMemo(() => hosts.map((host) => host.serverId), [hosts]);
+  const homeDirectories = useSessionStore(
+    useShallow((state) =>
+      serverIds.map((serverId) => state.sessions[serverId]?.serverInfo?.homeDirectory),
+    ),
+  );
+  const homeDirectoryByServerId = useMemo(
+    () => new Map(serverIds.map((serverId, index) => [serverId, homeDirectories[index]])),
+    [serverIds, homeDirectories],
+  );
   const supportsMultiplicityByServerId = useHostFeatureMap(serverIds, "workspaceMultiplicity");
   const supportsPinningByServerId = useHostFeatureMap(serverIds, "workspacePinning");
   const onToggleWorkspacePin = useSidebarWorkspacePinController();
@@ -2037,6 +2056,7 @@ export function SidebarWorkspaceList({
         parentGestureRef={parentGestureRef}
         dragGestureHostActive={dragGestureHostActive}
         pathname={pathname}
+        homeDirectoryByServerId={homeDirectoryByServerId}
         hostBadgeByServerId={hostBadgeByServerId}
         supportsMultiplicityByServerId={supportsMultiplicityByServerId}
         supportsPinningByServerId={supportsPinningByServerId}
@@ -2133,6 +2153,7 @@ function ProjectModeList({
   parentGestureRef,
   dragGestureHostActive,
   pathname,
+  homeDirectoryByServerId,
   hostBadgeByServerId,
   supportsMultiplicityByServerId,
   supportsPinningByServerId,
@@ -2151,6 +2172,7 @@ function ProjectModeList({
   sidebarFilterEmpty: boolean;
   projectIconByProjectViewKey: ReadonlyMap<string, string | null>;
   pathname: string;
+  homeDirectoryByServerId: ReadonlyMap<string, string | undefined>;
   hostBadgeByServerId: ReadonlyMap<string, HostBadgeModel>;
   supportsMultiplicityByServerId: ReadonlyMap<string, boolean>;
   supportsPinningByServerId: ReadonlyMap<string, boolean>;
@@ -2351,6 +2373,7 @@ function ProjectModeList({
           dragGestureHostActive={dragGestureHostActive}
           creatingWorkspaceIds={creatingWorkspaceIds}
           activeWorkspaceSelection={activeWorkspaceSelection}
+          homeDirectoryByServerId={homeDirectoryByServerId}
           hostBadgeByServerId={hostBadgeByServerId}
           supportsMultiplicityByServerId={supportsMultiplicityByServerId}
           supportsPinningByServerId={supportsPinningByServerId}
@@ -2364,6 +2387,7 @@ function ProjectModeList({
       handleWorktreeCreated,
       handleWorkspaceReorder,
       hostBadgeByServerId,
+      homeDirectoryByServerId,
       supportsMultiplicityByServerId,
       supportsPinningByServerId,
       onToggleWorkspacePin,

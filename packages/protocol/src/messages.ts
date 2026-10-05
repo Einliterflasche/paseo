@@ -3670,6 +3670,7 @@ export const ServerInfoStatusPayloadSchema = z
     restartCheckpointFormat: z.number().int().positive().optional(),
     serverId: z.string().trim().min(1),
     hostname: ServerInfoHostnameSchema.optional(),
+    homeDirectory: z.string().optional(),
     version: ServerInfoVersionSchema.optional(),
     // COMPAT(sessionPermissions): optional while clients support older daemons.
     permissions: z.array(DaemonPermissionSchema).optional(),

@@ -67,6 +67,15 @@ const LegacyAgentSnapshotPayloadSchema = AgentSnapshotPayloadSchema.extend({
 });
 
 describe("wire schema compatibility", () => {
+  test("host home directory stays optional for older peers", () => {
+    const legacy = { status: "server_info", serverId: "host" };
+    const current = { ...legacy, homeDirectory: "/srv/users/raphael" };
+    expect(ServerInfoStatusPayloadSchema.parse(legacy).homeDirectory).toBeUndefined();
+    expect(ServerInfoStatusPayloadSchema.parse(current).homeDirectory).toBe(current.homeDirectory);
+    const legacySchema = z.object({ status: z.literal("server_info"), serverId: z.string() });
+    expect(legacySchema.parse(current)).toEqual(legacySchema.parse(legacy));
+  });
+
   test("hello parses with and without the project update capability", () => {
     const legacy = WSHelloMessageSchema.parse({
       type: "hello",

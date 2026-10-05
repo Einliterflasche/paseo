@@ -9,21 +9,25 @@ export interface SidebarWorkspacePathGroup {
   workspaces: SidebarWorkspacePlacement[];
 }
 
-function compactPathLabel(path: string, projectRoot: string): string {
+function homePathLabel(path: string, homeDirectory: string | undefined): string {
+  // COMPAT(hostHomeDirectory): added in fork v0.10.0, remove after 2027-04-05.
+  if (!homeDirectory) return path;
   const normalizedPath = path.replace(/\\/g, "/");
-  const root = projectRoot.replace(/\\/g, "/").replace(/\/$/, "");
-  if (root && normalizedPath.startsWith(`${root}/`)) {
-    return normalizedPath.slice(root.length + 1);
+  const home = homeDirectory.replace(/\\/g, "/").replace(/\/+$/, "");
+  const windowsHome = /^[a-zA-Z]:\//.test(home);
+  const comparablePath = windowsHome ? normalizedPath.toLowerCase() : normalizedPath;
+  const comparableHome = windowsHome ? home.toLowerCase() : home;
+  if (comparablePath.replace(/\/+$/, "") === comparableHome) return "~";
+  if (comparablePath.startsWith(`${comparableHome}/`)) {
+    return `~/${normalizedPath.slice(home.length + 1)}`;
   }
-  if (normalizedPath === root) {
-    return normalizedPath.split("/").pop() || normalizedPath;
-  }
-  return normalizedPath.split("/").slice(-2).join("/");
+  return path;
 }
 
 export function groupSidebarWorkspacesByPath(
   workspaces: readonly SidebarWorkspacePlacement[],
   entries: ReadonlyMap<string, SidebarWorkspaceEntry>,
+  homeDirectoryByServerId?: ReadonlyMap<string, string | undefined>,
 ): SidebarWorkspacePathGroup[] {
   const groups = new Map<string, SidebarWorkspacePathGroup>();
   for (const workspace of workspaces) {
@@ -33,36 +37,11 @@ export function groupSidebarWorkspacesByPath(
     const key = path === null ? `workspace:${workspace.workspaceKey}` : `path:${path}`;
     let group = groups.get(key);
     if (!group) {
-      const label = compactPathLabel(
-        path ?? "",
-        entry?.projectRootPath ?? workspace.projectRootPath ?? "",
-      );
+      const label = homePathLabel(path ?? "", homeDirectoryByServerId?.get(workspace.serverId));
       group = { path, label, workspaces: [] };
       groups.set(key, group);
     }
     group.workspaces.push(workspace);
   }
-  const result = Array.from(groups.values());
-  const labels = result.map((group) => group.label);
-  for (const group of result) {
-    if (!group.path || labels.filter((label) => label === group.label).length < 2) {
-      continue;
-    }
-    // Keep enough of the suffix to distinguish paths with the same folder name.
-    const parts = group.path.replace(/\\/g, "/").split("/");
-    let depth = 2;
-    while (
-      depth < parts.length &&
-      result.some(
-        (other) =>
-          other !== group &&
-          other.path?.replace(/\\/g, "/").split("/").slice(-depth).join("/") ===
-            parts.slice(-depth).join("/"),
-      )
-    ) {
-      depth += 1;
-    }
-    group.label = depth === parts.length ? group.path : parts.slice(-depth).join("/");
-  }
-  return result;
+  return Array.from(groups.values());
 }

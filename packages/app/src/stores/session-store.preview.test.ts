@@ -51,7 +51,29 @@ afterEach(async () => {
   await Promise.all(clients.splice(0).map((client) => client.close()));
 });
 
-describe("session preview metadata", () => {
+describe("session host metadata", () => {
+  it("retains the host home and publishes home-only changes", () => {
+    initialize(hostA);
+    const store = useSessionStore.getState();
+    const first = { ...info(hostA), homeDirectory: "/srv/users/first" };
+    store.updateSessionServerInfo(hostA, first);
+    expect(store.getSession(hostA)?.serverInfo?.homeDirectory).toBe(first.homeDirectory);
+    const second = toDaemonServerInfo({
+      status: "server_info",
+      serverId: hostA,
+      hostname: "fixture",
+      version: "1.2.3",
+      homeDirectory: "/srv/users/second",
+    });
+    store.updateSessionServerInfo(hostA, second);
+    expect(store.getSession(hostA)?.serverInfo?.homeDirectory).toBe(second.homeDirectory);
+    const before = store.getSession(hostA);
+    store.updateSessionServerInfo(hostA, second);
+    expect(store.getSession(hostA)).toBe(before);
+    store.updateSessionServerInfo(hostA, info(hostA));
+    expect(store.getSession(hostA)?.serverInfo?.homeDirectory).toBeUndefined();
+  });
+
   it("publishes metadata-only changes without requiring other server information to change", () => {
     initialize(hostA);
     const received: Array<ServerInfoStatusPayload["servicePreviews"]> = [];

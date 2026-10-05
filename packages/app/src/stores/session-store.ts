@@ -279,6 +279,7 @@ export interface AgentFileExplorerState {
 export interface DaemonServerInfo {
   serverId: string;
   hostname: string | null;
+  homeDirectory?: string;
   version: string | null;
   desktopManaged?: boolean;
   capabilities?: ServerCapabilities;
@@ -296,6 +297,7 @@ export function toDaemonServerInfo(serverInfo: ServerInfoStatusPayload): DaemonS
   return {
     serverId: serverInfo.serverId,
     hostname: serverInfo.hostname ?? null,
+    homeDirectory: serverInfo.homeDirectory,
     version: serverInfo.version ?? null,
     ...(serverInfo.desktopManaged !== undefined
       ? { desktopManaged: serverInfo.desktopManaged }
@@ -745,6 +747,7 @@ export function selectRecoveryFailedHostIds(state: Pick<SessionStore, "sessions"
 function isSessionServerInfoUnchanged(input: {
   currentServerInfo: SessionState["serverInfo"] | undefined;
   nextHostname: string | null;
+  nextHomeDirectory: string | undefined;
   nextVersion: string | null;
   nextDesktopManaged: boolean | undefined;
   nextCapabilities: ServerCapabilities | undefined;
@@ -776,6 +779,7 @@ function isSessionServerInfoUnchanged(input: {
   return (
     currentServerInfo?.serverId === input.nextServerId &&
     prevHostname === nextHostname &&
+    currentServerInfo?.homeDirectory === input.nextHomeDirectory &&
     prevVersion === nextVersion &&
     currentServerInfo?.desktopManaged === nextDesktopManaged &&
     areServerCapabilitiesEqual(currentServerInfo?.capabilities, nextCapabilities) &&
@@ -938,6 +942,7 @@ export const useSessionStore = create<SessionStore>()(
             isSessionServerInfoUnchanged({
               currentServerInfo: session.serverInfo,
               nextHostname,
+              nextHomeDirectory: info.homeDirectory,
               nextVersion,
               nextDesktopManaged,
               nextCapabilities,
@@ -963,6 +968,7 @@ export const useSessionStore = create<SessionStore>()(
                 serverInfo: {
                   serverId: info.serverId,
                   hostname: nextHostname,
+                  homeDirectory: info.homeDirectory,
                   version: nextVersion,
                   ...(nextDesktopManaged !== undefined
                     ? { desktopManaged: nextDesktopManaged }

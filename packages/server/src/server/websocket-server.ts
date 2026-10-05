@@ -6,7 +6,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import type { IncomingMessage, Server as HTTPServer } from "http";
 import type { Duplex } from "node:stream";
 import { join } from "path";
-import { hostname as getHostname } from "node:os";
+import { homedir, hostname as getHostname } from "node:os";
 import { randomUUID } from "node:crypto";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import type { AgentManager, AgentMetricsSnapshot } from "./agent/agent-manager.js";
@@ -1948,6 +1948,7 @@ export class VoiceAssistantWebSocketServer {
         : {}),
       serverId: this.serverId,
       hostname: getHostname(),
+      homeDirectory: homedir(),
       version: this.daemonVersion,
       permissions: session.getPermissions(),
       // COMPAT(desktopManaged): added in v0.1.X, remove optional parsing after 2027-01-16.

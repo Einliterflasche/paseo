@@ -62,8 +62,12 @@ describe("workspace path groups", () => {
       new Map(items.map((item) => [item.entry.workspaceKey, item.entry])),
     );
     expect(groups).toEqual([
-      { path: "/repo", label: "repo", workspaces: [items[0]!.placement, items[2]!.placement] },
-      { path: "/repo/packages/app", label: "packages/app", workspaces: [items[1]!.placement] },
+      { path: "/repo", label: "/repo", workspaces: [items[0]!.placement, items[2]!.placement] },
+      {
+        path: "/repo/packages/app",
+        label: "/repo/packages/app",
+        workspaces: [items[1]!.placement],
+      },
     ]);
     expect(groups[0]!.workspaces[1]).toBe(items[2]!.placement);
     expect(items.map((item) => item.placement.workspaceId)).toEqual(["first", "other", "second"]);
@@ -81,11 +85,58 @@ describe("workspace path groups", () => {
       new Map(items.map((item) => [item.entry.workspaceKey, item.entry])),
     );
     expect(groups.map((group) => group.label)).toEqual([
-      "first/worktrees/main",
-      "second/worktrees/main",
-      "repo-other/app",
-      "packages/app",
+      "/first/worktrees/main",
+      "/second/worktrees/main",
+      "/repo-other/app",
+      "C:\\repo\\packages\\app",
     ]);
+  });
+
+  it.each(["/home/raphael", "/Users/raphael", "/srv/users/raphael"])(
+    "uses the host home %s only for display",
+    (home) => {
+      const paths = [home, `${home}/code/paseo-project/main`, `${home}-other/app`, "/opt/app"];
+      const items = paths.map((path, index) => atPath(String(index), path));
+      const groups = groupSidebarWorkspacesByPath(
+        items.map((item) => item.placement),
+        new Map(items.map((item) => [item.entry.workspaceKey, item.entry])),
+        new Map([["srv", `${home}/`]]),
+      );
+      expect(groups.map((group) => group.label)).toEqual([
+        "~",
+        "~/code/paseo-project/main",
+        `${home}-other/app`,
+        "/opt/app",
+      ]);
+      expect(groups.map((group) => group.path)).toEqual(paths);
+    },
+  );
+
+  it("uses each host home without merging matching displayed paths", () => {
+    const items = [atPath("first", "/home/one/app"), atPath("second", "/home/two/app")];
+    items[1]!.placement.serverId = "other-host";
+    const groups = groupSidebarWorkspacesByPath(
+      items.map((item) => item.placement),
+      new Map(items.map((item) => [item.entry.workspaceKey, item.entry])),
+      new Map([
+        ["srv", "/home/one"],
+        ["other-host", "/home/two"],
+      ]),
+    );
+    expect(groups.map((group) => group.label)).toEqual(["~/app", "~/app"]);
+    expect(groups.map((group) => group.path)).toEqual(["/home/one/app", "/home/two/app"]);
+  });
+
+  it("handles Windows host home casing and keeps other users absolute", () => {
+    const paths = ["C:\\Users\\Raphael", "c:\\users\\raphael\\code\\app", "C:\\Users\\Other\\app"];
+    const items = paths.map((path, index) => atPath(String(index), path));
+    const groups = groupSidebarWorkspacesByPath(
+      items.map((item) => item.placement),
+      new Map(items.map((item) => [item.entry.workspaceKey, item.entry])),
+      new Map([["srv", "C:\\Users\\Raphael"]]),
+    );
+    expect(groups.map((group) => group.label)).toEqual(["~", "~/code/app", paths[2]]);
+    expect(groups.map((group) => group.path)).toEqual(paths);
   });
 
   it("keeps unloaded workspace paths separate", () => {
