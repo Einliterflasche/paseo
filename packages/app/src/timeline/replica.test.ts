@@ -82,6 +82,110 @@ function applySynced(agentId: string, seq: number): void {
 
 afterEach(() => useSessionStore.getState().clearSession(SERVER_ID));
 
+it("replaces cached historical rows in the same epoch without replaying arrivals", () => {
+  useSessionStore.getState().initializeSession(SERVER_ID, null);
+  const report: StreamItem = {
+    kind: "user_message",
+    id: "accepted-report",
+    text: "Original report",
+    timestamp: new Date("2026-10-05T20:11:01.479Z"),
+    timelineCursor: { epoch: "epoch-1", seq: 5938 },
+  };
+  const human: StreamItem = {
+    ...report,
+    id: "human",
+    text: "Human input",
+    sender: { kind: "human" },
+    timelineCursor: { epoch: "epoch-1", seq: 5940 },
+  };
+  useSessionStore.getState().applyAgentTimelineResponseState(SERVER_ID, AGENT_ID, {
+    items: [human],
+    head: [report],
+    range: { epoch: "epoch-1", startSeq: 5938, endSeq: 5940 },
+    older: "available",
+    newer: false,
+    synchronized: true,
+    acknowledgedClientMessageIds: [],
+  });
+  const owner = createOwner({
+    readTimeline: async () => undefined,
+    commitTimeline: () => undefined,
+  });
+  owner.replaceTimelineEpoch(AGENT_ID, "epoch-1");
+  owner.applyTimelineResponse({
+    requestId: "repair",
+    agentId: AGENT_ID,
+    agent: null,
+    epoch: "epoch-1",
+    direction: "tail",
+    projection: "projected",
+    reset: false,
+    staleCursor: false,
+    gap: false,
+    hasOlder: false,
+    hasNewer: false,
+    error: null,
+    window: { minSeq: 5938, maxSeq: 5940, nextSeq: 5941 },
+    startCursor: { epoch: "epoch-1", seq: 5938 },
+    endCursor: { epoch: "epoch-1", seq: 5940 },
+    entries: [
+      {
+        provider: "mock",
+        seqStart: 5938,
+        seqEnd: 5938,
+        sourceSeqRanges: [{ startSeq: 5938, endSeq: 5938 }],
+        collapsed: [],
+        timestamp: report.timestamp.toISOString(),
+        item: {
+          type: "user_message",
+          text: report.text,
+          messageId: report.id,
+          clientMessageId: report.id,
+          sender: { kind: "agent", agentId: "reviewer" },
+        },
+      },
+      {
+        provider: "mock",
+        seqStart: 5940,
+        seqEnd: 5940,
+        sourceSeqRanges: [{ startSeq: 5940, endSeq: 5940 }],
+        collapsed: [],
+        timestamp: human.timestamp.toISOString(),
+        item: {
+          type: "user_message",
+          text: human.text,
+          messageId: human.id,
+          clientMessageId: human.id,
+          sender: { kind: "human" },
+        },
+      },
+    ],
+  });
+  const session = useSessionStore.getState().sessions[SERVER_ID];
+  const rows = [
+    ...(session?.agentStreamHead.get(AGENT_ID) ?? []),
+    ...(session?.agentStreamTail.get(AGENT_ID) ?? []),
+  ];
+  expect(rows).toHaveLength(2);
+  expect(rows.find((row) => row.id === report.id)).toMatchObject({
+    text: report.text,
+    timestamp: report.timestamp,
+    sender: { kind: "agent", agentId: "reviewer" },
+    timelineCursor: { epoch: "epoch-1", seq: 5938 },
+  });
+  expect(rows.find((row) => row.id === human.id)).toMatchObject({
+    text: human.text,
+    sender: { kind: "human" },
+    timelineCursor: { epoch: "epoch-1", seq: 5940 },
+  });
+  expect(session?.agentStreamHead.get(AGENT_ID) ?? []).toEqual([]);
+  expect(selectAgentTimelineState(session, AGENT_ID)).toMatchObject({
+    status: "synced",
+    range: { epoch: "epoch-1", startSeq: 5938, endSeq: 5940 },
+  });
+  owner.dispose();
+});
+
 describe("viewed timeline persistence", () => {
   it("leaves initialization and painted history intact on a busy page response", () => {
     useSessionStore.getState().initializeSession(SERVER_ID, null);

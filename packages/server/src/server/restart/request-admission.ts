@@ -24,6 +24,7 @@ const COMMAND_ADMISSION = {
   "agent.skills.save_selection.request": "mutation",
   "agent.skills.uninstall.request": "mutation",
   "agent.timeline.list_prompts.request": "query",
+  "agent.timeline.attribute_senders.request": "mutation",
   "agent.timeline.append.request": "mutation",
   "session.events.set_subscription.request": "query",
   "agent.timeline.set_subscription.request": "query",

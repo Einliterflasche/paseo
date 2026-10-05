@@ -119,8 +119,13 @@ export function useChatOutline({
         .catch(() => undefined);
     };
     refresh();
+    const unsubscribe = client.subscribeRawMessages((message) => {
+      if (message.type === "agent.timeline.replacement" && message.payload.agentId === agentId)
+        refresh();
+    });
     return () => {
       active = false;
+      unsubscribe();
     };
   }, [agentId, enabled, serverId, timelineEpoch, latestPromptSeq]);
 

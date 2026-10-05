@@ -6,14 +6,23 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { StreamViewportHandle } from "../strategy";
 import type { StreamItem } from "@/types/stream";
 import { useChatOutline } from "./use-chat-outline";
+import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
 
-const runtime = vi.hoisted(() => ({
-  listAgentTimelinePrompts: vi.fn(),
-  fetchAgentTimeline: vi.fn(),
-  subscribeAgentTimeline: vi.fn(() => {
-    throw new Error("The outline must reuse the viewed timeline");
-  }),
-}));
+const runtime = vi.hoisted(() => {
+  const rawHandlers = new Set<(message: SessionOutboundMessage) => void>();
+  return {
+    rawHandlers,
+    subscribeRawMessages: vi.fn((handler: (message: SessionOutboundMessage) => void) => {
+      rawHandlers.add(handler);
+      return () => rawHandlers.delete(handler);
+    }),
+    listAgentTimelinePrompts: vi.fn(),
+    fetchAgentTimeline: vi.fn(),
+    subscribeAgentTimeline: vi.fn(() => {
+      throw new Error("The outline must reuse the viewed timeline");
+    }),
+  };
+});
 
 vi.mock("@/constants/platform", () => ({ isWeb: true }));
 vi.mock("@/runtime/host-runtime", () => ({
@@ -31,11 +40,71 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+function promptSeqs(prompts: readonly { seq: number }[]) {
+  return prompts.map((prompt) => prompt.seq);
+}
+
 describe("useChatOutline", () => {
   beforeEach(() => {
     runtime.listAgentTimelinePrompts.mockReset();
     runtime.fetchAgentTimeline.mockReset();
     runtime.subscribeAgentTimeline.mockClear();
+    runtime.rawHandlers.clear();
+  });
+
+  it("refreshes an unchanged epoch after historical attribution and rejects the old jump target", async () => {
+    runtime.listAgentTimelinePrompts.mockResolvedValue({
+      epoch: "epoch-1",
+      prompts: [
+        { seq: 5938, timestamp: "2026-10-05T20:11:01Z", preview: "Old report" },
+        { seq: 5940, timestamp: "2026-10-05T20:12:00Z", preview: "Human input" },
+      ],
+    });
+    const scrollToMessage = vi.fn();
+    const tail: StreamItem[] = [
+      {
+        kind: "user_message",
+        id: "human",
+        text: "Human input",
+        timestamp: new Date(),
+        sender: { kind: "human" },
+        timelineCursor: { epoch: "epoch-1", seq: 5940 },
+      },
+    ];
+    const { result, unmount } = renderHook(() =>
+      useChatOutline({
+        agentId: "agent-1",
+        serverId: "host",
+        timelineEpoch: "epoch-1",
+        tail,
+        head: [],
+        enabled: true,
+        viewportRef: { current: { scrollToMessage } } as unknown as ReturnType<
+          typeof createRef<StreamViewportHandle>
+        >,
+        onJumpError: vi.fn(),
+      }),
+    );
+    await waitFor(() => expect(promptSeqs(result.current.prompts)).toEqual([5938, 5940]));
+    runtime.listAgentTimelinePrompts.mockResolvedValue({
+      epoch: "epoch-1",
+      prompts: [{ seq: 5940, timestamp: "2026-10-05T20:12:00Z", preview: "Human input" }],
+    });
+    act(() => {
+      for (const handler of runtime.rawHandlers)
+        handler({
+          type: "agent.timeline.replacement",
+          payload: { agentId: "agent-1", epoch: "epoch-1" },
+        });
+    });
+    await waitFor(() => expect(promptSeqs(result.current.prompts)).toEqual([5940]));
+    act(() => result.current.jumpToPrompt(5938));
+    expect(runtime.fetchAgentTimeline).not.toHaveBeenCalled();
+    expect(scrollToMessage).not.toHaveBeenCalled();
+    act(() => result.current.jumpToPrompt(5940));
+    expect(scrollToMessage).toHaveBeenCalledWith("human");
+    unmount();
+    expect(runtime.rawHandlers.size).toBe(0);
   });
 
   it("removes proven internal rows from a retained index and rejects their jump targets", async () => {

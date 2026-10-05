@@ -375,6 +375,11 @@ export function createViewedTimelineOwner(input: {
   const forcedTailReplacements = new Set<string>();
   const sync = createViewedTimelineSync({
     ...input.ports,
+    fetchPage: (agentId, request) =>
+      input.ports.fetchPage(
+        agentId,
+        forcedTailReplacements.has(agentId) ? planTimelineTailFetch() : request,
+      ),
     fetchLatestTail: async (agentId) => {
       forcedTailReplacements.add(agentId);
       try {
@@ -398,6 +403,10 @@ export function createViewedTimelineOwner(input: {
   });
   return {
     ...sync,
+    replaceTimelineEpoch(agentId, epoch) {
+      forcedTailReplacements.add(agentId);
+      sync.replaceTimelineEpoch(agentId, epoch);
+    },
     applyTimelineResponse(receivedPayload) {
       const payload = consumeForcedTimelineTailReplacement(receivedPayload, forcedTailReplacements);
       const accepted = applyAuthoritativeTimelineResponse({

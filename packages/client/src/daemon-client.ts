@@ -3425,6 +3425,25 @@ export class DaemonClient {
     return payload;
   }
 
+  async attributeHistoricalSenders(input: {
+    agentId: string;
+    epoch: string;
+    dryRun: boolean;
+    evidence: import("@getpaseo/protocol/messages").HistoricalSenderAttribution[];
+  }) {
+    // COMPAT(historicalSenderAttribution): added in v0.10.0, remove gate after 2027-10-05.
+    if (this.lastServerInfoMessage?.features?.historicalSenderAttribution !== true)
+      throw new Error("Update the host to repair historical sender attribution");
+    const requestId = this.createRequestId();
+    const payload = await this.sendCorrelatedSessionRequest({
+      requestId,
+      message: { type: "agent.timeline.attribute_senders.request", requestId, ...input },
+      responseType: "agent.timeline.attribute_senders.response",
+    });
+    if (payload.error) throw new Error(payload.error);
+    return payload;
+  }
+
   async listProviderSubagents(
     parentAgentId: string,
     options: { requestId?: string; timeout?: number } = {},

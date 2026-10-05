@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import {
@@ -14,10 +14,15 @@ import {
   type ManagedAgent,
 } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
-import { reconcileSubmittedHistory, type SubmittedMessage } from "./submitted-messages.js";
+import {
+  prepareHistoricalSenderAttribution,
+  reconcileSubmittedHistory,
+  type SubmittedMessage,
+} from "./submitted-messages.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { toAgentPayload } from "./agent-projections.js";
 import { projectTimelineRows } from "./timeline-projection.js";
+import { buildTimelinePromptIndex } from "./timeline-prompt-index.js";
 import { getOpenAgentTabLabel, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { formatSystemNotificationPrompt, startAgentRun } from "./agent-prompt.js";
 import { StaleProviderSessionError } from "./stale-provider-session-error.js";
@@ -11295,6 +11300,310 @@ test("native replay preserves two identical submissions and inserts a missing re
     history[3]!.item,
   ]);
   expect(reconcileSubmittedHistory(restored, messages, "codex")).toEqual(restored);
+});
+
+function historicalAttributionFixture() {
+  const text = "Final source83d5a4f72221a8dcfc672dc550f0d37369e52db2\n\nOriginal report";
+  const row: AgentTimelineRow = {
+    seq: 5938,
+    timestamp: "2026-10-05T20:11:01.479Z",
+    item: {
+      type: "user_message",
+      messageId: "609a198a-5633-4a0d-805c-e90e9edcbd91",
+      clientMessageId: "609a198a-5633-4a0d-805c-e90e9edcbd91",
+      text,
+    },
+    providerMessageId: "01a10db0-ee45-7411-8cfd-c11625964ab9",
+    turnId: "codex-turn-49",
+  };
+  const call: AgentTimelineRow = {
+    seq: 2777,
+    timestamp: "2026-10-05T20:11:01.532Z",
+    item: {
+      type: "tool_call",
+      callId: "exec-7c584cac-2f4a-4d53-bc43-63bec0de0f32",
+      name: "paseo.send_agent_prompt",
+      status: "completed",
+      detail: {
+        type: "unknown",
+        input: { agentId: "manager", prompt: text },
+        output: { structuredContent: { success: true } },
+      },
+    },
+  };
+  const evidence = [
+    {
+      seq: row.seq,
+      timestamp: row.timestamp,
+      messageId: "609a198a-5633-4a0d-805c-e90e9edcbd91",
+      clientMessageId: "609a198a-5633-4a0d-805c-e90e9edcbd91",
+      providerMessageId: row.providerMessageId!,
+      textSha256: createHash("sha256").update(text).digest("hex"),
+      sourceAgentId: "reviewer",
+      sourceCallId: "exec-7c584cac-2f4a-4d53-bc43-63bec0de0f32",
+    },
+  ];
+  return { agentId: "manager", rows: [row], sources: new Map([["reviewer", [call]]]), evidence };
+}
+
+test("historical attribution requires canonical accepted identities and a successful sender call", () => {
+  const fixture = historicalAttributionFixture();
+  const original = structuredClone(fixture.rows);
+  const repaired = prepareHistoricalSenderAttribution(fixture);
+  expect(repaired).toEqual([
+    {
+      ...original[0],
+      item: { ...original[0]!.item, sender: { kind: "agent", agentId: "reviewer" } },
+    },
+  ]);
+  expect(fixture.rows).toEqual(original);
+  expect(prepareHistoricalSenderAttribution({ ...fixture, rows: repaired })).toEqual(repaired);
+});
+
+test.each([
+  "body",
+  "timestamp",
+  "accepted-id",
+  "provider-id",
+  "sequence",
+  "human",
+  "duplicate-input",
+  "duplicate-call",
+  "failed-call",
+  "recipient",
+  "late-call",
+  "missing-source",
+])("historical attribution rejects unsafe evidence: %s", (variation) => {
+  const fixture = historicalAttributionFixture();
+  const row = fixture.rows[0]!;
+  const call = fixture.sources.get("reviewer")![0]!;
+  if (row.item.type !== "user_message" || call.item.type !== "tool_call")
+    throw new Error("fixture");
+  if (variation === "body") row.item.text += " edited";
+  if (variation === "timestamp") row.timestamp = "2026-10-05T20:11:01.500Z";
+  if (variation === "accepted-id") row.item.clientMessageId = "different";
+  if (variation === "provider-id") fixture.evidence[0]!.providerMessageId = "different";
+  if (variation === "sequence") fixture.evidence[0]!.seq++;
+  if (variation === "human") row.item.sender = { kind: "human" };
+  if (variation === "duplicate-input")
+    fixture.rows.push({
+      ...row,
+      seq: 5940,
+      item: { ...row.item, messageId: "other", clientMessageId: "other" },
+    });
+  if (variation === "duplicate-call")
+    fixture.sources
+      .get("reviewer")!
+      .push({ ...call, seq: 2778, item: { ...call.item, callId: "other" } });
+  if (variation === "failed-call")
+    call.item.detail = {
+      type: "unknown",
+      input: { agentId: "manager", prompt: row.item.text },
+      output: { structuredContent: { success: false } },
+    };
+  if (variation === "recipient")
+    call.item.detail = {
+      type: "unknown",
+      input: { agentId: "someone-else", prompt: row.item.text },
+      output: { structuredContent: { success: true } },
+    };
+  if (variation === "late-call") call.timestamp = "2026-10-05T20:11:03.532Z";
+  if (variation === "missing-source") fixture.sources.clear();
+  expect(() => prepareHistoricalSenderAttribution(fixture)).toThrow();
+});
+
+test("historical attribution accepts a completed tool update only once", () => {
+  const fixture = historicalAttributionFixture();
+  const call = fixture.sources.get("reviewer")![0]!;
+  if (call.item.type !== "tool_call") throw new Error("fixture");
+  fixture.sources
+    .get("reviewer")!
+    .unshift({ ...call, seq: 2776, item: { ...call.item, status: "running" } });
+  expect(prepareHistoricalSenderAttribution(fixture)).toHaveLength(1);
+  fixture.evidence.push(fixture.evidence[0]!);
+  expect(() => prepareHistoricalSenderAttribution(fixture)).toThrow();
+});
+
+async function historicalRepairManager() {
+  const workdir = mkdtempSync(join(tmpdir(), "historical-sender-repair-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const seed = new AgentManager({
+    clients: { codex: fakeCodexEmitting({}) },
+    registry: storage,
+    logger,
+  });
+  const target = await seed.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  const source = await seed.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  const checkpoint = await seed.quiesceForRestart();
+  const fixture = historicalAttributionFixture();
+  const call = fixture.sources.get("reviewer")![0]!;
+  if (call.item.type !== "tool_call" || call.item.detail.type !== "unknown")
+    throw new Error("fixture");
+  call.item.detail.input = {
+    agentId: target.id,
+    prompt: fixture.rows[0]!.item.type === "user_message" ? fixture.rows[0]!.item.text : "",
+  };
+  checkpoint.timelines[target.id] = {
+    epoch: "retained-epoch",
+    nextSeq: 5941,
+    rows: [
+      ...fixture.rows,
+      {
+        seq: 5940,
+        timestamp: "2026-10-05T20:12:00.000Z",
+        providerMessageId: "native-human",
+        item: {
+          type: "user_message",
+          text: "Keep this human input",
+          messageId: "human",
+          clientMessageId: "human",
+          sender: { kind: "human" },
+        },
+      },
+    ],
+  };
+  checkpoint.timelines[source.id] = { epoch: "source-epoch", nextSeq: 2778, rows: [call] };
+  const attention = vi.fn();
+  const manager = new AgentManager({
+    clients: { codex: fakeCodexEmitting({}) },
+    registry: storage,
+    logger,
+    onAgentAttention: attention,
+  });
+  await manager.installRestartCheckpoint(checkpoint);
+  await manager.resumeRestartCheckpoint(checkpoint);
+  return {
+    manager,
+    storage,
+    checkpoint,
+    attention,
+    workdir,
+    request: {
+      agentId: target.id,
+      epoch: "retained-epoch",
+      dryRun: false,
+      evidence: fixture.evidence.map((entry) =>
+        Object.assign({}, entry, { sourceAgentId: source.id }),
+      ),
+    },
+  };
+}
+
+test("historical repair saves metadata in place, invalidates the index, and survives restart without arrival replay", async () => {
+  const context = await historicalRepairManager();
+  const { manager, storage, request, workdir, attention } = context;
+  const events: AgentManagerEvent[] = [];
+  const unsubscribe = manager.subscribe((event) => events.push(event), { replayState: false });
+  try {
+    const before = await manager.getCanonicalTimelineRows(request.agentId);
+    expect(await manager.attributeHistoricalSenders({ ...request, dryRun: true })).toMatchObject({
+      epoch: "retained-epoch",
+      changed: 1,
+    });
+    expect(await manager.getCanonicalTimelineRows(request.agentId)).toEqual(before);
+    expect((await storage.get(request.agentId))?.submittedMessages ?? []).toEqual([]);
+    expect(events).toEqual([]);
+    expect(await manager.attributeHistoricalSenders(request)).toMatchObject({
+      epoch: "retained-epoch",
+      changed: 1,
+    });
+    const repaired = await manager.getCanonicalTimelineRows(request.agentId);
+    expect(repaired[0]).toEqual({
+      ...before[0],
+      item: {
+        ...before[0]!.item,
+        sender: { kind: "agent", agentId: request.evidence[0]!.sourceAgentId },
+      },
+    });
+    expect(repaired[1]).toEqual(before[1]);
+    expect(buildTimelinePromptIndex(request.epoch, repaired).prompts.map((row) => row.seq)).toEqual(
+      [5940],
+    );
+    expect(events.map((event) => event.type)).toEqual(["timeline_replacement"]);
+    expect(attention).not.toHaveBeenCalled();
+    expect(
+      (await new AgentStorage(join(workdir, "agents"), logger).get(request.agentId))
+        ?.submittedMessages,
+    ).toEqual([
+      {
+        item: repaired[0]!.item,
+        timestamp: before[0]!.timestamp,
+        turnId: "codex-turn-49",
+        providerMessageId: before[0]!.providerMessageId,
+      },
+    ]);
+    expect(await manager.attributeHistoricalSenders(request)).toMatchObject({
+      epoch: request.epoch,
+      changed: 0,
+    });
+    expect(events).toHaveLength(1);
+    const restart = await manager.quiesceForRestart();
+    expect(restart.timelines[request.agentId]).toEqual({
+      epoch: request.epoch,
+      nextSeq: 5941,
+      rows: repaired,
+    });
+    const recovered = new AgentManager({
+      clients: { codex: fakeCodexEmitting({}) },
+      registry: storage,
+      logger,
+    });
+    await recovered.installRestartCheckpoint(restart);
+    await recovered.resumeRestartCheckpoint(restart);
+    expect(await recovered.attributeHistoricalSenders(request)).toMatchObject({ changed: 0 });
+    expect(await recovered.getCanonicalTimelineRows(request.agentId)).toEqual(repaired);
+    const saved = (await storage.get(request.agentId))!.submittedMessages!;
+    expect(
+      reconcileSubmittedHistory(
+        [
+          {
+            type: "timeline",
+            provider: "codex",
+            item: {
+              type: "user_message",
+              text: "normalized",
+              messageId: before[0]!.providerMessageId,
+            },
+          },
+        ],
+        saved,
+        "codex",
+      )[0],
+    ).toMatchObject({
+      item: repaired[0]!.item,
+      timestamp: before[0]!.timestamp,
+      providerMessageId: before[0]!.providerMessageId,
+    });
+    await recovered.closeAgentsForShutdown();
+  } finally {
+    unsubscribe();
+    await manager.closeAgentsForShutdown();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("historical repair rejects a stale epoch and failed save without publishing metadata", async () => {
+  const { manager, storage, request, workdir } = await historicalRepairManager();
+  try {
+    const original = await manager.getCanonicalTimelineRows(request.agentId);
+    await expect(
+      manager.attributeHistoricalSenders({ ...request, epoch: "stale" }),
+    ).rejects.toThrow("epoch changed");
+    const failure = vi
+      .spyOn(storage, "setSubmittedMessages")
+      .mockRejectedValueOnce(new Error("disk failure"));
+    await expect(manager.attributeHistoricalSenders(request)).rejects.toThrow("disk failure");
+    expect(await manager.getCanonicalTimelineRows(request.agentId)).toEqual(original);
+    failure.mockRestore();
+    expect(await manager.attributeHistoricalSenders(request)).toMatchObject({ changed: 1 });
+  } finally {
+    await manager.closeAgentsForShutdown();
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 test("commandMayHaveChangedExternalState matches remote-state commands", () => {

@@ -157,6 +157,17 @@ export class AgentStorage {
     await this.queueRecordWrite(record);
   }
 
+  async setSubmittedMessages(
+    agentId: string,
+    submittedMessages: SubmittedMessage[],
+  ): Promise<void> {
+    await this.load();
+    await this.queueRecordMutation(agentId, (record) => {
+      if (!record) throw new Error(`Agent ${agentId} not found`);
+      return { ...record, submittedMessages };
+    });
+  }
+
   private queueRecordWrite(record: StoredAgentRecord): Promise<void> {
     return this.queueRecordMutation(record.id, () => record);
   }

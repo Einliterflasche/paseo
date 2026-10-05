@@ -1878,6 +1878,27 @@ export const AgentTimelineListPromptsRequestMessageSchema = z.object({
   requestId: z.string(),
 });
 
+export const HistoricalSenderAttributionSchema = z.object({
+  seq: z.number().int().nonnegative(),
+  timestamp: z.string().min(1),
+  messageId: z.string().min(1),
+  clientMessageId: z.string().min(1),
+  providerMessageId: z.string().min(1),
+  textSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  sourceAgentId: z.string().min(1),
+  sourceCallId: z.string().min(1),
+});
+export type HistoricalSenderAttribution = z.infer<typeof HistoricalSenderAttributionSchema>;
+
+export const AgentTimelineAttributeSendersRequestMessageSchema = z.object({
+  type: z.literal("agent.timeline.attribute_senders.request"),
+  agentId: z.string(),
+  requestId: z.string(),
+  epoch: z.string(),
+  dryRun: z.boolean(),
+  evidence: z.array(HistoricalSenderAttributionSchema).min(1).max(1000),
+});
+
 export const ProviderSubagentListRequestMessageSchema = z.object({
   type: z.literal("agent.provider_subagents.list.request"),
   parentAgentId: z.string(),
@@ -3335,6 +3356,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   FetchAgentTimelineRequestMessageSchema,
   AgentTimelineSearchRequestMessageSchema,
   AgentTimelineListPromptsRequestMessageSchema,
+  AgentTimelineAttributeSendersRequestMessageSchema,
   ProviderSubagentListRequestMessageSchema,
   ProviderSubagentTimelineRequestMessageSchema,
   SetAgentTimelineSubscriptionRequestMessageSchema,
@@ -3762,6 +3784,8 @@ export const ServerInfoStatusPayloadSchema = z
         rewind: z.boolean().optional(),
         // COMPAT(agentTimelinePromptIndex): added in v0.2.X, drop the gate when floor >= v0.2.X.
         agentTimelinePromptIndex: z.boolean().optional(),
+        // COMPAT(historicalSenderAttribution): added in v0.10.0, remove gate after 2027-10-05.
+        historicalSenderAttribution: z.boolean().optional(),
         // COMPAT(agentHistorySearch): added in v0.3.0, remove gate after 2027-02-07.
         agentHistorySearch: z.boolean().optional(),
         // COMPAT(checkoutRefresh): added in v0.1.86, remove gate after 2026-11-29.
@@ -4891,6 +4915,18 @@ export const AgentTimelineListPromptsResponseMessageSchema = z.object({
         preview: z.string(),
       }),
     ),
+    error: z.string().nullable(),
+  }),
+});
+
+export const AgentTimelineAttributeSendersResponseMessageSchema = z.object({
+  type: z.literal("agent.timeline.attribute_senders.response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    epoch: z.string(),
+    messageIds: z.array(z.string()),
+    changed: z.number().int().nonnegative(),
     error: z.string().nullable(),
   }),
 });
@@ -7111,6 +7147,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   AgentTimelineReplacementMessageSchema,
   AgentTimelineSearchResponseMessageSchema,
   AgentTimelineListPromptsResponseMessageSchema,
+  AgentTimelineAttributeSendersResponseMessageSchema,
   ProviderSubagentListResponseMessageSchema,
   ProviderSubagentTimelineResponseMessageSchema,
   ProviderSubagentUpdateMessageSchema,

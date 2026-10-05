@@ -2759,6 +2759,8 @@ export class Session {
         return this.handleAgentTimelineSearchRequest(msg, source);
       case "agent.timeline.list_prompts.request":
         return this.handleAgentTimelineListPromptsRequest(msg, source);
+      case "agent.timeline.attribute_senders.request":
+        return this.handleHistoricalSenderAttribution(msg, source);
       case "agent.provider_subagents.list.request":
         return this.handleProviderSubagentListRequest(msg);
       case "agent.provider_subagents.timeline.get.request":
@@ -4864,13 +4866,14 @@ export class Session {
 
   private deliverTimelineReplacement(agentId: string, initiatingSource?: object): void {
     const agent = this.agentManager.getAgent(agentId);
-    if (!agent) return;
+    const provider = agent?.provider ?? this.agentManager.getRetainedAgentRecord(agentId)?.provider;
+    if (!provider) return;
     const timeline = this.agentManager.fetchTimeline(agentId, { limit: 0 });
     const epoch = timeline.epoch;
 
     if (this.clientSources.size === 0 || !this.onMessageToSource) {
       if (!this.supports(CLIENT_CAPS.timelineReplacementInvalidation)) {
-        this.emitReconstructedTimelineRows(agentId, agent.provider, timeline.rows, epoch);
+        this.emitReconstructedTimelineRows(agentId, provider, timeline.rows, epoch);
       }
       return;
     }
@@ -4896,7 +4899,7 @@ export class Session {
         !this.delivery.isModern(source) &&
         !capabilities.has(CLIENT_CAPS.timelineReplacementInvalidation)
       ) {
-        this.emitReconstructedTimelineRows(agentId, agent.provider, timeline.rows, epoch, source);
+        this.emitReconstructedTimelineRows(agentId, provider, timeline.rows, epoch, source);
       }
     }
   }
@@ -8066,6 +8069,32 @@ export class Session {
         source,
       );
     }
+  }
+
+  private async handleHistoricalSenderAttribution(
+    msg: Extract<SessionInboundMessage, { type: "agent.timeline.attribute_senders.request" }>,
+    source?: object,
+  ): Promise<void> {
+    let result = {
+      epoch: msg.epoch,
+      messageIds: [] as string[],
+      changed: 0,
+      error: null as string | null,
+    };
+    try {
+      if (!this.agentManager.hasInstalledHistory(msg.agentId))
+        throw new Error("Restore canonical history before historical attribution");
+      result = { ...(await this.agentManager.attributeHistoricalSenders(msg)), error: null };
+    } catch (error) {
+      result.error = error instanceof Error ? error.message : "Historical attribution failed";
+    }
+    this.emitForSource(
+      {
+        type: "agent.timeline.attribute_senders.response",
+        payload: { requestId: msg.requestId, agentId: msg.agentId, ...result },
+      },
+      source,
+    );
   }
 
   private async handleProviderSubagentListRequest(

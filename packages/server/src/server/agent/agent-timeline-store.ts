@@ -249,6 +249,24 @@ export class InMemoryAgentTimelineStore {
     return this.requireState(agentId).epoch;
   }
 
+  /** Metadata repair preserves canonical identity, ordering, epoch, and shared logs. */
+  attributeUserMessageSenders(agentId: string, updates: readonly AgentTimelineRow[]): void {
+    const state = this.requireState(agentId);
+    const senders = new Map(
+      updates.map((row) => [
+        row.seq,
+        row.item.type === "user_message" ? row.item.sender : undefined,
+      ]),
+    );
+    state.rows = state.rows.map((row) =>
+      row.item.type === "user_message" && senders.has(row.seq)
+        ? { ...row, item: { ...row.item, sender: senders.get(row.seq) } }
+        : row,
+    );
+    state.projection = new TimelineProjection();
+    for (const row of state.rows) state.projection.append(row);
+  }
+
   fetch(agentId: string, options?: AgentTimelineFetchOptions): AgentTimelineFetchResult {
     const state = this.requireState(agentId);
     const direction = options?.direction ?? "tail";

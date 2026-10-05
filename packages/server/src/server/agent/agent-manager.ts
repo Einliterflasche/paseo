@@ -1,4 +1,10 @@
-import { reconcileSubmittedHistory, type SubmittedMessage } from "./submitted-messages.js";
+import {
+  prepareHistoricalSenderAttribution,
+  mergeHistoricalSubmissions,
+  reconcileSubmittedHistory,
+  type SubmittedMessage,
+} from "./submitted-messages.js";
+import type { HistoricalSenderAttribution } from "@getpaseo/protocol/messages";
 import type { AgentMessageSender } from "@getpaseo/protocol/agent-message";
 import { SharedLogStore } from "./shared-log.js";
 import { projectTimelineRows } from "./timeline-projection.js";
@@ -1709,6 +1715,59 @@ export class AgentManager {
   fetchTimeline(id: string, options?: AgentTimelineFetchOptions): AgentTimelineFetchResult {
     this.requireRetainedAgent(id);
     return this.timelineStore.fetch(id, options);
+  }
+
+  async attributeHistoricalSenders(options: {
+    agentId: string;
+    epoch: string;
+    dryRun: boolean;
+    evidence: readonly HistoricalSenderAttribution[];
+  }): Promise<{ epoch: string; messageIds: string[]; changed: number }> {
+    return this.runLifecycleMutation(options.agentId, async () => {
+      const { agentId, epoch } = options;
+      this.requireRetainedAgent(agentId);
+      if (this.timelineStore.getEpoch(agentId) !== epoch)
+        throw new Error("Historical timeline epoch changed");
+      // This maintenance path requires the checkpointed canonical store, not an alternate writer.
+      if (this.durableTimelineStore)
+        throw new Error("Historical attribution requires the canonical checkpoint store");
+      const registry = this.requireRegistry();
+      await this.loadSubmittedMessages(agentId);
+      const sources = new Map<string, AgentTimelineRow[]>();
+      for (const sourceAgentId of new Set(options.evidence.map((entry) => entry.sourceAgentId)))
+        sources.set(sourceAgentId, await this.getCanonicalTimelineRows(sourceAgentId));
+      const rows = this.timelineStore.getRows(agentId);
+      const updates = prepareHistoricalSenderAttribution({ ...options, rows, sources });
+      const previous = this.submittedMessages.get(agentId) ?? [];
+      const messages = mergeHistoricalSubmissions(previous, updates);
+      const changed = updates.filter(
+        (update) => update.item !== rows.find((row) => row.seq === update.seq)?.item,
+      ).length;
+      const result = {
+        epoch,
+        messageIds: options.evidence.map((entry) => entry.messageId),
+        changed,
+      };
+      if (options.dryRun || (!changed && JSON.stringify(messages) === JSON.stringify(previous)))
+        return result;
+      this.submittedMessages.set(agentId, messages);
+      try {
+        await registry.setSubmittedMessages(agentId, messages);
+      } catch (error) {
+        const arrivals = messages.filter(
+          (message) =>
+            !updates.some((row) => row.item === message.item) && !previous.includes(message),
+        );
+        this.submittedMessages.set(agentId, [...previous, ...arrivals]);
+        throw error;
+      }
+      const retained = this.recoveryInventory.get(agentId);
+      if (retained) retained.record.submittedMessages = messages;
+      this.timelineStore.attributeUserMessageSenders(agentId, updates);
+      // No arrival, provider turn, state/attention replay, or lifecycle notification.
+      if (changed) this.dispatch({ type: "timeline_replacement", agentId, epoch });
+      return result;
+    });
   }
 
   listProviderSubagents(parentAgentId: string): ProviderSubagentDescriptor[] {

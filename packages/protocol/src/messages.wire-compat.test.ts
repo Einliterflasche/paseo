@@ -5,11 +5,66 @@ import {
   AgentTimelineItemPayloadSchema,
   ServerInfoStatusPayloadSchema,
   SessionOutboundMessageSchema,
+  SessionInboundMessageSchema,
   WSHelloMessageSchema,
   WorkspaceSetupSnapshotSchema,
   WorkspaceSetupProgressMessageSchema,
   AgentTimelineEntryPayloadSchema,
 } from "./messages.js";
+
+test("historical sender repair keeps the feature optional and requires an explicit dry run choice", () => {
+  const info = {
+    status: "server_info",
+    serverId: "host",
+    hostname: "host",
+    version: "0.10.0",
+    capabilities: [],
+    supportedProviders: [],
+  };
+  expect(
+    ServerInfoStatusPayloadSchema.parse(info).features?.historicalSenderAttribution,
+  ).toBeUndefined();
+  expect(
+    ServerInfoStatusPayloadSchema.parse({
+      ...info,
+      features: { historicalSenderAttribution: true },
+    }).features?.historicalSenderAttribution,
+  ).toBe(true);
+  const request = {
+    type: "agent.timeline.attribute_senders.request",
+    requestId: "repair",
+    agentId: "manager",
+    epoch: "retained-epoch",
+    dryRun: true,
+    evidence: [
+      {
+        seq: 5938,
+        timestamp: "2026-10-05T20:11:01.479Z",
+        messageId: "accepted",
+        clientMessageId: "accepted",
+        providerMessageId: "native",
+        textSha256: "a".repeat(64),
+        sourceAgentId: "reviewer",
+        sourceCallId: "call",
+      },
+    ],
+  };
+  expect(SessionInboundMessageSchema.parse(request)).toEqual(request);
+  const { dryRun: _dryRun, ...unsafe } = request;
+  expect(SessionInboundMessageSchema.safeParse(unsafe).success).toBe(false);
+  const response = {
+    type: "agent.timeline.attribute_senders.response",
+    payload: {
+      requestId: "repair",
+      agentId: "manager",
+      epoch: "retained-epoch",
+      messageIds: ["accepted"],
+      changed: 1,
+      error: null,
+    },
+  };
+  expect(SessionOutboundMessageSchema.parse(response)).toEqual(response);
+});
 
 test("terminal listings accept older rows and retain new per-terminal directories", () => {
   const response = {
