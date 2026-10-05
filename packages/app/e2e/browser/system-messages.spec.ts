@@ -10,6 +10,9 @@ test("tagged messages collapse, expand, and retain human attribution after reloa
   const agent = await seedMockAgentWorkspace({
     repoPrefix: "system-messages-",
     title: "System messages",
+    featureValues: {
+      mockAssistantResponse: "The agent reply stays beside the system message.",
+    },
   });
   const message =
     "<paseo-system>\nReview complete\n\n  Full report with spacing.  \n</paseo-system>";
@@ -30,6 +33,10 @@ test("tagged messages collapse, expand, and retain human attribution after reloa
     ).toMatch(/mono|menlo|courier/i);
     await expect(toggle).toHaveAttribute("aria-expanded", "false");
     await expect(content).toHaveCount(0);
+    await expect(page.getByTestId("assistant-message-bubble").last()).toBeVisible();
+    await expect(page.getByTestId("assistant-message-timestamp").last()).toHaveText(
+      /^(\d+[sm] ago|\d{2}:\d{2})$/,
+    );
     await page.screenshot({ path: test.info().outputPath("collapsed.png") });
     await toggle.click();
     await expect(toggle).toHaveAttribute("aria-expanded", "true");
@@ -44,6 +51,10 @@ test("tagged messages collapse, expand, and retain human attribution after reloa
     await expect(toggle).toHaveText("You · Review complete");
     await expect(row).toHaveCount(1);
     await expect(content).toHaveCount(0);
+    await expect(page.getByTestId("assistant-message-bubble").last()).toBeVisible();
+    await expect(page.getByTestId("assistant-message-timestamp").last()).toHaveText(
+      /^(\d+[sm] ago|\d{2}:\d{2})$/,
+    );
     await page.setViewportSize({ width: 390, height: 844 });
     await toggle.tap({ force: true });
     expect(await content.textContent()).toBe(message);
