@@ -19,6 +19,7 @@ import {
   type SidebarShortcutSection,
 } from "@/utils/sidebar-shortcuts";
 import { statusWorkspaceGroups, type SidebarWorkspaceGroup } from "./sidebar-labels";
+import { groupSidebarWorkspacesByPath } from "./sidebar-workspace-paths";
 
 export interface SidebarProjection {
   pinnedGroups: PinnedSidebarGroups;
@@ -72,7 +73,10 @@ export function buildSidebarProjection(input: SidebarProjectionInput): SidebarPr
   if (input.groupMode === "project") {
     sections.push(
       ...pinnedGroups.unpinnedProjects.map((project) => ({
-        workspaces: project.workspaces,
+        workspaces: groupSidebarWorkspacesByPath(
+          project.workspaces,
+          input.workspaceEntriesByKey,
+        ).flatMap((group) => group.workspaces),
         collapsed: input.collapsedProjectKeys.has(project.viewKey),
       })),
     );

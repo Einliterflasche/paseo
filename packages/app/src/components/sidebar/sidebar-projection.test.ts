@@ -5,6 +5,7 @@ import type {
   SidebarWorkspacePlacement,
 } from "@/hooks/use-sidebar-workspaces-list";
 import { buildSidebarProjection } from "./sidebar-projection";
+import { groupSidebarWorkspacesByPath } from "./sidebar-workspace-paths";
 
 function makeWorkspace(
   id: string,
@@ -41,6 +42,81 @@ function makeWorkspace(
   };
   return { placement, entry };
 }
+
+describe("workspace path groups", () => {
+  function atPath(id: string, path: string, root = "/repo") {
+    const workspace = makeWorkspace(id);
+    workspace.entry.workspaceDirectory = path;
+    workspace.entry.projectRootPath = root;
+    return workspace;
+  }
+
+  it("keeps shared paths together in first-seen order without changing workspace identity", () => {
+    const items = [
+      atPath("first", "/repo"),
+      atPath("other", "/repo/packages/app"),
+      atPath("second", "/repo"),
+    ];
+    const groups = groupSidebarWorkspacesByPath(
+      items.map((item) => item.placement),
+      new Map(items.map((item) => [item.entry.workspaceKey, item.entry])),
+    );
+    expect(groups).toEqual([
+      { path: "/repo", label: "repo", workspaces: [items[0]!.placement, items[2]!.placement] },
+      { path: "/repo/packages/app", label: "packages/app", workspaces: [items[1]!.placement] },
+    ]);
+    expect(groups[0]!.workspaces[1]).toBe(items[2]!.placement);
+    expect(items.map((item) => item.placement.workspaceId)).toEqual(["first", "other", "second"]);
+  });
+
+  it("distinguishes equal folder suffixes and project prefix lookalikes", () => {
+    const items = [
+      atPath("first", "/first/worktrees/main"),
+      atPath("second", "/second/worktrees/main"),
+      atPath("sibling", "/repo-other/app"),
+      atPath("windows", "C:\\repo\\packages\\app", "C:\\repo"),
+    ];
+    const groups = groupSidebarWorkspacesByPath(
+      items.map((item) => item.placement),
+      new Map(items.map((item) => [item.entry.workspaceKey, item.entry])),
+    );
+    expect(groups.map((group) => group.label)).toEqual([
+      "first/worktrees/main",
+      "second/worktrees/main",
+      "repo-other/app",
+      "packages/app",
+    ]);
+  });
+
+  it("keeps unloaded workspace paths separate", () => {
+    const items = [makeWorkspace("first").placement, makeWorkspace("second").placement];
+    expect(groupSidebarWorkspacesByPath(items, new Map())).toEqual([
+      { path: null, label: "", workspaces: [items[0]] },
+      { path: null, label: "", workspaces: [items[1]] },
+    ]);
+  });
+
+  it("assigns project shortcuts in the displayed path order", () => {
+    const items = [
+      atPath("first", "/repo"),
+      atPath("other", "/repo/app"),
+      atPath("second", "/repo"),
+    ];
+    const input = projectionInput();
+    input.projects = [makeProject(items.map((item) => item.placement))];
+    input.pinnedKeys.pinnedWorkspaceKeys = [];
+    input.workspaceEntriesByKey = new Map(
+      items.map((item) => [item.entry.workspaceKey, item.entry]),
+    );
+    expect(
+      buildSidebarProjection(input).shortcutModel.shortcutTargets.map(
+        (target) => target.workspaceId,
+      ),
+    ).toEqual(["first", "second", "other"]);
+    input.collapsedProjectKeys.add("project");
+    expect(buildSidebarProjection(input).shortcutModel.shortcutTargets).toEqual([]);
+  });
+});
 
 function makeProject(
   workspaces: SidebarWorkspacePlacement[],

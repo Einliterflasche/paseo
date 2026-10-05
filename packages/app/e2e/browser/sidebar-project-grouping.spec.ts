@@ -22,6 +22,8 @@ import {
 import { connectSeedClient, type SeedDaemonClient } from "../support/helpers/seed-client";
 import { getServerId } from "../support/helpers/server-id";
 import { createTempGitRepo } from "../support/helpers/workspace";
+import { expect } from "@playwright/test";
+import { seedWorkspace } from "../support/helpers/seed-client";
 
 const PRIMARY_HOST_LABEL = "Primary Host";
 const SECONDARY_HOST_LABEL = "Secondary Host";
@@ -331,6 +333,69 @@ async function openScenario(
 
 test.describe("Sidebar project grouping", () => {
   test.describe.configure({ timeout: 120_000 });
+
+  test("groups shared workspace paths and preserves selection and project collapse", async ({
+    page,
+  }) => {
+    const seeded = await seedWorkspace({
+      repoPrefix: "sidebar-paths-",
+      title: "A First workspace",
+    });
+    try {
+      const other = await seeded.client.createWorkspace({
+        source: {
+          kind: "worktree",
+          projectId: seeded.projectId,
+          baseBranch: "main",
+          worktreeSlug: "path-group-other",
+        },
+        title: "B Other path",
+      });
+      const second = await seeded.client.createWorkspace({
+        source: { kind: "directory", path: seeded.repoPath, projectId: seeded.projectId },
+        title: "C Shared path",
+      });
+      if (!other.workspace || !second.workspace)
+        throw new Error(other.error ?? second.error ?? "Workspace creation failed");
+      await openProjectDirectory(page);
+      const firstKey = `${getServerId()}:${seeded.workspaceId}`;
+      const otherKey = `${getServerId()}:${other.workspace.id}`;
+      const secondKey = `${getServerId()}:${second.workspace.id}`;
+      const group = page
+        .getByRole("group")
+        .filter({ has: page.getByTestId(`sidebar-workspace-row-${firstKey}`) });
+      const pathHeaders = group.locator('[data-testid^="sidebar-workspace-path-"]');
+      await expect(pathHeaders).toHaveCount(2);
+      await expect(pathHeaders.nth(0)).toHaveAttribute("aria-label", seeded.repoPath);
+      const rows = group.locator('[data-testid^="sidebar-workspace-row-"]');
+      await expect(rows.nth(0)).toHaveAttribute("data-testid", `sidebar-workspace-row-${firstKey}`);
+      await expect(rows.nth(1)).toHaveAttribute(
+        "data-testid",
+        `sidebar-workspace-row-${secondKey}`,
+      );
+      await expect(rows.nth(2)).toHaveAttribute("data-testid", `sidebar-workspace-row-${otherKey}`);
+      await page.getByTestId(`sidebar-workspace-row-${secondKey}`).click();
+      await expect(page).toHaveURL(new RegExp(second.workspace.id));
+      await page.getByTestId(`sidebar-workspace-row-${secondKey}`).click({ button: "right" });
+      await expect(
+        page.getByRole("menuitem", { name: "Rename workspace", exact: true }),
+      ).toBeVisible();
+      await page.keyboard.press("Escape");
+      const headerId = await group
+        .locator('[data-testid^="sidebar-project-row-"]')
+        .first()
+        .getAttribute("data-testid");
+      if (!headerId) throw new Error("Project header is missing its test ID");
+      const header = page.getByTestId(headerId);
+      await header.click();
+      await expect(pathHeaders).toHaveCount(0);
+      await header.click();
+      await expect(pathHeaders).toHaveCount(2);
+      await expect(rows).toHaveCount(3);
+    } finally {
+      await seeded.cleanup();
+    }
+  });
 
   test("groups projects with the same Git remote across hosts", async ({
     page,

@@ -151,6 +151,7 @@ import type { HostBadgeModel } from "@/hosts/appearance";
 import { useHostBadges } from "@/hosts/use-host-badges";
 import { useSidebarRowItems } from "@/components/sidebar/display-preferences/model";
 import { PullRequestStateIcon } from "@/git/pull-request-state-icon";
+import { groupSidebarWorkspacesByPath } from "@/components/sidebar/sidebar-workspace-paths";
 
 const workspaceKeyExtractor = (workspace: SidebarWorkspacePlacement) => workspace.workspaceKey;
 
@@ -1591,12 +1592,24 @@ function ProjectBlock({
   supportsPinningByServerId: ReadonlyMap<string, boolean>;
   onToggleWorkspacePin: ToggleSidebarWorkspacePin;
 }) {
+  const pathGroups = useMemo(
+    () => groupSidebarWorkspacesByPath(project.workspaces, workspaceEntriesByKey),
+    [project.workspaces, workspaceEntriesByKey],
+  );
+  const groupedWorkspaces = useMemo(
+    () => pathGroups.flatMap((group) => group.workspaces),
+    [pathGroups],
+  );
+  const pathHeaderByWorkspaceKey = useMemo(
+    () => new Map(pathGroups.map((group) => [group.workspaces[0]!.workspaceKey, group])),
+    [pathGroups],
+  );
   const {
     visibleItems: visibleWorkspaces,
     expanded: workspacesExpanded,
     canToggle: canToggleWorkspaces,
     toggleExpanded: toggleWorkspacesExpanded,
-  } = useLimitedSidebarGroup(project.workspaces);
+  } = useLimitedSidebarGroup(groupedWorkspaces);
   const rowModel = useMemo(
     () =>
       buildSidebarProjectRowModel({
@@ -1671,13 +1684,38 @@ function ProjectBlock({
       isActive,
       dragHandleProps: workspaceDragHandleProps,
     }: DraggableRenderItemInfo<SidebarWorkspacePlacement>) => {
-      return renderWorkspaceRow(item, {
-        drag: workspaceDrag,
-        isDragging: isActive,
-        dragHandleProps: workspaceDragHandleProps,
-      });
+      const group = pathHeaderByWorkspaceKey.get(item.workspaceKey);
+      return (
+        <View>
+          {group?.path ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <View style={styles.workspacePathHeader}>
+                  <Text
+                    style={styles.workspacePathLabel}
+                    numberOfLines={1}
+                    ellipsizeMode="head"
+                    accessibilityLabel={group.path}
+                    testID={`sidebar-workspace-path-${item.workspaceKey}`}
+                  >
+                    {group.label}
+                  </Text>
+                </View>
+              </TooltipTrigger>
+              <TooltipContent>{group.path}</TooltipContent>
+            </Tooltip>
+          ) : null}
+          <View style={styles.workspacePathRows}>
+            {renderWorkspaceRow(item, {
+              drag: workspaceDrag,
+              isDragging: isActive,
+              dragHandleProps: workspaceDragHandleProps,
+            })}
+          </View>
+        </View>
+      );
     },
-    [renderWorkspaceRow],
+    [pathHeaderByWorkspaceKey, renderWorkspaceRow],
   );
 
   const handleWorkspaceDragEnd = useCallback(
@@ -2520,6 +2558,20 @@ const styles = StyleSheet.create((theme) => ({
     paddingBottom: theme.spacing[3],
   },
   workspaceListContainer: {},
+  workspacePathHeader: {
+    paddingLeft: theme.spacing[8],
+    paddingRight: theme.spacing[3],
+    paddingTop: theme.spacing[2],
+    paddingBottom: theme.spacing[1],
+  },
+  workspacePathLabel: {
+    fontSize: theme.fontSize.sm,
+    fontWeight: theme.fontWeight.medium,
+    color: theme.colors.foregroundMuted,
+  },
+  workspacePathRows: {
+    paddingLeft: theme.spacing[4],
+  },
   // Kept in step with `workspaceRow` above. It stands in a project's list where a workspace row
   // would be, so it takes that row's geometry and both of its fills.
   //

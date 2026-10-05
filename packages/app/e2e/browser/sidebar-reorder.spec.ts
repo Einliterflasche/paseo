@@ -108,3 +108,29 @@ test("projects, workspaces, and pinned chats reorder with an immediate mouse dra
     await secondProject.cleanup();
   }
 });
+
+test("workspaces sharing a path reorder with an immediate mouse drag", async ({ page }) => {
+  const project = await seedWorkspace({ repoPrefix: "sidebar-path-reorder-" });
+  try {
+    const second = await project.client.createWorkspace({
+      source: { kind: "directory", path: project.repoPath, projectId: project.projectId },
+      title: "Second workspace",
+    });
+    if (!second.workspace) throw new Error(second.error ?? "Workspace creation failed");
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    const firstKey = `${getServerId()}:${project.workspaceId}`;
+    const secondKey = `${getServerId()}:${second.workspace.id}`;
+    await quickDragFirstRowAfterSecond(
+      page.locator(
+        `[data-testid="sidebar-workspace-row-${firstKey}"], [data-testid="sidebar-workspace-row-${secondKey}"]`,
+      ),
+      pressWorkspaceRow,
+    );
+    const pathHeaders = page.locator('[data-testid^="sidebar-workspace-path-"]');
+    await expect(pathHeaders).toHaveCount(1);
+    await expect(pathHeaders).toHaveAttribute("aria-label", project.repoPath);
+  } finally {
+    await project.cleanup();
+  }
+});
