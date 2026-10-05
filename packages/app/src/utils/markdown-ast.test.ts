@@ -1,5 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { markdownNodeContainsType } from "./markdown-ast";
+import { markdownBlockEdgeStyle, markdownNodeContainsType } from "./markdown-ast";
+
+it("removes block edge margins while retaining spacing inside lists and quotes", () => {
+  const style = { marginTop: 10, marginBottom: 12, marginVertical: 10, height: 1 };
+  expect(markdownBlockEdgeStyle(style, [{ type: "body" }])).toEqual({
+    marginTop: 0,
+    marginBottom: 0,
+    marginVertical: 0,
+    height: 1,
+  });
+  expect(markdownBlockEdgeStyle(style, [{ type: "list_item" }, { type: "body" }])).toBe(style);
+  expect(markdownBlockEdgeStyle(style, [{ type: "blockquote" }, { type: "body" }])).toBe(style);
+});
 
 describe("markdownNodeContainsType", () => {
   it("matches the node itself", () => {

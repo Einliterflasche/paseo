@@ -17,3 +17,12 @@ export function systemMessageBody(text: string): string | null {
 export function isSystemInjectedEnvelope(text: string): boolean {
   return systemMessageBody(text) !== null;
 }
+
+/** Daemon attribution is authoritative; legacy rows keep the exact envelope rule. */
+export function isSystemMessage(message: { text: string; sender?: AgentMessageSender }): boolean {
+  return (
+    message.sender?.kind === "agent" ||
+    message.sender?.kind === "system" ||
+    isSystemInjectedEnvelope(message.text)
+  );
+}

@@ -6,6 +6,7 @@ import { expect, test } from "vitest";
 import { ProviderInitializationCleanupError } from "./provider-initialization-cleanup-error.js";
 import { AgentManager } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
+import { buildTimelinePromptIndex } from "./timeline-prompt-index.js";
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { createCheckpointAgentClient } from "../test-utils/checkpoint-agent-client.js";
 import { RestartInProgressError } from "../restart/restart-errors.js";
@@ -351,6 +352,8 @@ test("restart preserves late output and user identity without native overwrite a
     text: expect.stringContaining("<paseo-system>"),
   });
   expect(rows[0]?.item).toMatchObject({ sender, clientMessageId: "user-1" });
+  expect(buildTimelinePromptIndex(again.timelines[agent.id]!.epoch, rows).prompts).toEqual([]);
+  expect(after.getAgent(agent.id)?.lastUserMessageAt).toBeNull();
   expect(JSON.stringify(rows)).not.toContain("must not enter");
 
   expect(again.agents[0]!.continue).toBe(false);

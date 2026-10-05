@@ -16,7 +16,9 @@ export function messageSenderLabel(sender?: AgentMessageSender): string {
 
 export function systemMessageLabel(message: string, sender?: AgentMessageSender): string {
   if (sender?.kind === "system") return sender.source;
+  if (sender?.kind === "agent") return "Agent message";
   const body = systemMessageBody(message);
   const firstLine = body?.split("\n").find((line) => line.trim().length > 0);
-  return firstLine?.trim() || "System message";
+  const label = firstLine?.trim();
+  return label && label.length <= 48 ? label : "System message";
 }

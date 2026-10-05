@@ -1,6 +1,10 @@
 import type { TurnTiming } from "@/timeline/turn-time";
 import type { StreamItem } from "@/types/stream";
-import { getAssistantBlockSpacing, getGapBetweenStreamItems } from "./spacing";
+import {
+  getAssistantBlockSpacing,
+  getGapBetweenStreamItems,
+  isOrdinaryUserMessage,
+} from "./spacing";
 import type { StreamFrameChildOrder, StreamStrategy } from "./strategy";
 import { continuesResponse, continuesTurn, isResponseBoundary } from "./turn-membership";
 
@@ -326,8 +330,8 @@ function layoutSegmentItem(
     assistantSpacing,
     completedFooter,
     toolSequence: getToolSequence({ item, aboveItem, belowItem }),
-    isFirstInUserGroup: item.kind === "user_message" && aboveItem?.kind !== "user_message",
-    isLastInUserGroup: item.kind === "user_message" && belowItem?.kind !== "user_message",
+    isFirstInUserGroup: isOrdinaryUserMessage(item) && !isOrdinaryUserMessage(aboveItem),
+    isLastInUserGroup: isOrdinaryUserMessage(item) && !isOrdinaryUserMessage(belowItem),
     isLastInToolSequence:
       isToolSequenceItem(item) &&
       !(isToolSequenceItem(belowItem) && continuesTurn(item, belowItem)),

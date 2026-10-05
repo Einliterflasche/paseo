@@ -4,6 +4,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { createRef } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { StreamViewportHandle } from "../strategy";
+import type { StreamItem } from "@/types/stream";
 import { useChatOutline } from "./use-chat-outline";
 
 const runtime = vi.hoisted(() => ({
@@ -35,6 +36,58 @@ describe("useChatOutline", () => {
     runtime.listAgentTimelinePrompts.mockReset();
     runtime.fetchAgentTimeline.mockReset();
     runtime.subscribeAgentTimeline.mockClear();
+  });
+
+  it("removes proven internal rows from a retained index and rejects their jump targets", async () => {
+    const timestamp = new Date("2026-10-05T20:34:54.190Z");
+    const seqs = [5947, 5953, 5966, 5981, 5999, 6009, 6044, 6045, 6185];
+    const tail = seqs.map((seq) => ({
+      kind: "user_message" as const,
+      id: `input-${seq}`,
+      text: "Original plain report",
+      timestamp,
+      sender: { kind: "agent" as const, agentId: "reviewer" },
+      timelineCursor: { epoch: "epoch-1", seq },
+    }));
+    runtime.listAgentTimelinePrompts.mockResolvedValue({
+      epoch: "epoch-1",
+      prompts: [5930, ...seqs, 6200]
+        .sort((a, b) => a - b)
+        .map((seq) => ({ seq, timestamp: timestamp.toISOString(), preview: "Retained preview" })),
+    });
+    const scrollToMessage = vi.fn();
+    runtime.fetchAgentTimeline.mockResolvedValue(undefined);
+    const viewportRef = { current: { scrollToMessage } } as unknown as ReturnType<
+      typeof createRef<StreamViewportHandle>
+    >;
+    let head: StreamItem[] = [];
+    const { result, rerender } = renderHook(() =>
+      useChatOutline({
+        agentId: "agent-1",
+        serverId: "server-1",
+        timelineEpoch: "epoch-1",
+        tail,
+        head,
+        enabled: true,
+        viewportRef,
+        onJumpError: vi.fn(),
+      }),
+    );
+    const visibleSeqs = () => result.current.prompts.map((prompt) => prompt.seq);
+    await waitFor(() => expect(visibleSeqs()).toEqual([5930, 6200]));
+    const retainedPrompts = result.current.prompts;
+    head = [
+      { kind: "assistant_message", id: "streaming-reply", text: "More assistant text", timestamp },
+    ];
+    rerender();
+    expect(result.current.prompts).toBe(retainedPrompts);
+    act(() => {
+      for (const seq of seqs) result.current.jumpToPrompt(seq);
+    });
+    expect(scrollToMessage).not.toHaveBeenCalled();
+    expect(runtime.fetchAgentTimeline).not.toHaveBeenCalled();
+    act(() => result.current.jumpToPrompt(5930));
+    expect(runtime.fetchAgentTimeline).toHaveBeenCalledTimes(1);
   });
 
   it("waits for a served timeline before requesting its prompt index", async () => {

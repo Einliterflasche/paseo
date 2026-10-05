@@ -3,6 +3,47 @@ import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
 import { buildTimelinePromptIndex } from "./timeline-prompt-index.js";
 
 describe("buildTimelinePromptIndex", () => {
+  it("excludes the seven attributed manager reports and completion entries without renumbering history", () => {
+    const timestamp = "2026-10-05T20:34:54.190Z";
+    const rows: AgentTimelineRow[] = [5947, 5953, 5966, 5981, 5999, 6009, 6045].map((seq) => ({
+      seq,
+      timestamp,
+      providerMessageId: `native-${seq}`,
+      item: {
+        type: "user_message",
+        text: "Original plain report",
+        clientMessageId: `accepted-${seq}`,
+        sender: { kind: "agent", agentId: "reviewer" },
+      },
+    }));
+    for (const seq of [6044, 6185])
+      rows.push({
+        seq,
+        timestamp,
+        item: {
+          type: "user_message",
+          text: "<paseo-system>\nCompletion report\n</paseo-system>",
+          sender: { kind: "system", source: "Completion report" },
+        },
+      });
+    for (const seq of [6025, 6057])
+      rows.push({
+        seq,
+        timestamp,
+        item: { type: "user_message", text: "Original plain report", sender: { kind: "human" } },
+      });
+    rows.push({
+      seq: 5930,
+      timestamp,
+      item: { type: "user_message", text: "Original plain report" },
+    });
+    rows.sort((a, b) => a.seq - b.seq);
+    const original = structuredClone(rows);
+    expect(buildTimelinePromptIndex("retained-epoch", rows).prompts.map((p) => p.seq)).toEqual([
+      5930, 6025, 6057,
+    ]);
+    expect(rows).toEqual(original);
+  });
   it("omits system envelopes while preserving ordinary prompts and their timeline positions", () => {
     const timestamp = "2026-01-01T00:00:00.000Z";
     const rows: AgentTimelineRow[] = [

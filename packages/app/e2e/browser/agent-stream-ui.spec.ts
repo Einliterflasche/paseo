@@ -28,6 +28,50 @@ import {
 const SCROLL_AWAY_MIN_SCROLLABLE_DISTANCE = 360;
 
 test.describe("Agent stream UI", () => {
+  test("keeps the reported manager bubble compact and its leading divider visible", async ({
+    page,
+  }) => {
+    const report =
+      "Production remains unchanged while the UI agent inspects the issue. The earlier screenshot showed an intentionally expanded message, so it does not prove that the default display is correct.";
+    const agent = await seedMockAgentWorkspace({
+      repoPrefix: "reported-bubble-",
+      title: "Reported manager bubble",
+      initialPrompt: "Inspect the captured manager content.",
+      featureValues: {
+        mockAssistantResponse: `---\n\n${report}\n\nSecond paragraph keeps normal spacing.\n\n> First quoted paragraph.\n>\n> Second quoted paragraph.`,
+      },
+    });
+    try {
+      await agent.client.waitForFinish(agent.agentId, 15000);
+      for (const width of [1440, 390]) {
+        await page.setViewportSize({ width, height: 1000 });
+        await openAgentRoute(page, agent);
+        const bubbles = page.getByTestId("assistant-message-bubble");
+        await expect(bubbles).toHaveCount(4);
+        const divider = await bubbles.first().boundingBox();
+        expect(divider?.height).toBeLessThan(30);
+        const paragraph = bubbles.nth(1).locator('[data-paseo-markdown-tag="p"]').first();
+        expect(await paragraph.evaluate((e) => getComputedStyle(e).marginBottom)).toBe("0px");
+        const quote = bubbles.last().locator('[data-paseo-markdown-tag="p"]').first();
+        expect(
+          await quote.evaluate((e) => parseFloat(getComputedStyle(e).marginBottom)),
+        ).toBeGreaterThan(0);
+        const stamp = page.getByTestId("assistant-message-timestamp");
+        const stampRect = await stamp.boundingBox(),
+          lastRect = await bubbles.last().boundingBox();
+        if (!stampRect || !lastRect) throw new Error("Timestamp is not mounted");
+        expect(stampRect.height).toBeLessThanOrEqual(20);
+        expect(lastRect.x + lastRect.width - stampRect.x - stampRect.width).toBeLessThanOrEqual(13);
+        await expect(bubbles.nth(1)).toHaveText(report);
+        await expectTurnCopyButton(page);
+        await page.screenshot({ path: test.info().outputPath(`reported-bubble-${width}.png`) });
+        await page.reload();
+        await expect(bubbles).toHaveCount(4);
+      }
+    } finally {
+      await agent.cleanup();
+    }
+  });
   for (const width of [1440, 390]) {
     test(`keeps a grouped agent bubble and one live timestamp at ${width}px`, async ({ page }) => {
       await page.setViewportSize({ width, height: 1000 });

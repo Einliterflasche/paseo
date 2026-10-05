@@ -257,14 +257,17 @@ foreground control ownership remains a separate daemon concern. Cancellation req
 with that record rather than in a React component, so an old request cannot clear a newer one. Submissions
 remain a separate pre-turn registry and retire on canonical acknowledgement.
 
-Tagged prompts remain in the full timeline. The app renders `<paseo-system>` envelopes as centered,
-gray monospace rows that expand to the complete text. Tags select presentation only. They do not
-change the provider role or identify the sender.
+Internal prompts remain in the full timeline. Agent-attributed messages, Paseo injections, and
+`<paseo-system>` envelopes use compact centered disclosures, collapsed by default. Expanding a
+disclosure shows the full original text. These entries do not enter ordinary message navigation
+or advance the last-user-message time. Their arrival does not raise attention or send a notification.
+Completion, failure, and permission events keep their separate lifecycle behavior.
 
 The daemon records the sender from the caller context: human, a specific agent, or Paseo with the
 injection source. Agent runtime tokens bind MCP and CLI calls to their agent identity. Human callers
-cannot select attribution through tags. Legacy rows without sender metadata show an unknown sender
-in the collapsed presentation.
+cannot select attribution through tags. Tags do not change the provider role or identify the sender.
+Tagged legacy rows show an unknown sender. Untagged legacy rows without sender provenance remain
+ordinary prompts. Do not infer their sender from report text.
 
 Native transcripts can omit daemon metadata and accepted prompts. The agent registry retains submitted
 rows and native identities so hydration preserves attribution, text, identity, and submission order.

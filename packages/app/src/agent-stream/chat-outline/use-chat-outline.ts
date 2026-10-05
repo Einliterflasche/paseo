@@ -5,6 +5,7 @@ import { useStableEvent } from "@/hooks/use-stable-event";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { planTimelinePromptJump } from "@/timeline/timeline-sync-plan";
 import type { StreamItem } from "@/types/stream";
+import { isSystemMessage } from "@getpaseo/protocol/agent-message";
 import type { StreamViewportHandle } from "../strategy";
 import {
   createActivePromptPublisher,
@@ -63,7 +64,21 @@ export function useChatOutline({
   const nextJumpRequestIdRef = useRef(0);
   const nextIndexRequestIdRef = useRef(0);
   const loadedItems = useMemo(() => [...tail, ...(head ?? NO_STREAM_ITEMS)], [head, tail]);
-  const prompts = enabled ? (index?.prompts ?? NO_PROMPTS) : NO_PROMPTS;
+  const internalSeqKey = loadedItems
+    .flatMap((item) =>
+      item.kind === "user_message" &&
+      isSystemMessage(item) &&
+      item.timelineCursor?.epoch === timelineEpoch
+        ? [item.timelineCursor.seq]
+        : [],
+    )
+    .join(",");
+  const prompts = useMemo(() => {
+    if (!enabled) return NO_PROMPTS;
+    if (!internalSeqKey) return index?.prompts ?? NO_PROMPTS;
+    const internalSeqs = new Set(internalSeqKey.split(",").map(Number));
+    return index?.prompts.filter((prompt) => !internalSeqs.has(prompt.seq)) ?? NO_PROMPTS;
+  }, [enabled, index, internalSeqKey]);
 
   // The viewed timeline already owns live delivery and reconnect catch-up. Its complete
   // loaded items (including rows outside the mounted window) invalidate the prompt index.
@@ -154,6 +169,7 @@ export function useChatOutline({
 
   const jumpToPrompt = useCallback(
     (seq: number) => {
+      if (!prompts.some((prompt) => prompt.seq === seq)) return;
       nextJumpRequestIdRef.current += 1;
       setPendingJump(null);
       const loaded = loadedItems.find((item) => item.timelineCursor?.seq === seq);
@@ -182,7 +198,7 @@ export function useChatOutline({
           });
         });
     },
-    [agentId, index, loadedItems, onJumpError, revealLoadedMessage, serverId, viewportRef],
+    [agentId, index, loadedItems, onJumpError, prompts, revealLoadedMessage, serverId, viewportRef],
   );
 
   return { prompts, activePrompt, jumpToPrompt, reportReadingPosition };

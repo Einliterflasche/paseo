@@ -1,4 +1,5 @@
 import type { StreamItem } from "@/types/stream";
+import { isSystemMessage } from "@getpaseo/protocol/agent-message";
 import { estimateAssistantMessageHeightFromCache } from "@/utils/assistant-message-height-estimate";
 import {
   DEFAULT_MOUNTED_RECENT_STREAM_ITEMS,
@@ -61,6 +62,7 @@ export interface WebVirtualizedHistoryWindow {
 export function estimateStreamItemHeight(item: StreamItem, contentMaxWidth: number): number {
   switch (item.kind) {
     case "user_message":
+      if (isSystemMessage(item)) return 36;
       return item.images && item.images.length > 0 ? 220 : 96;
     case "assistant_message":
       return estimateAssistantMessageHeightFromCache(item.text, contentMaxWidth) ?? 220;

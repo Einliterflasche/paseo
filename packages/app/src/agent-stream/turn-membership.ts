@@ -1,4 +1,5 @@
 import type { StreamItem } from "@/types/stream";
+import { isOrdinaryUserMessage } from "./spacing";
 
 /**
  * Canonical turn IDs take precedence. Timelines without them retain the legacy
@@ -9,16 +10,16 @@ export function continuesTurn(previous: StreamItem | null, next: StreamItem | nu
   if (previous.turnId !== undefined && next.turnId !== undefined) {
     return previous.turnId === next.turnId;
   }
-  return next.kind !== "user_message";
+  return !isOrdinaryUserMessage(next);
 }
 
 /**
  * A visible response can span multiple canonical turns when their prompts are
- * system-injected and therefore absent from the Paseo timeline.
+ * internal events retained as disclosures in the Paseo timeline.
  */
 export function continuesResponse(previous: StreamItem | null, next: StreamItem | null): boolean {
   if (!previous || !next) return false;
-  return continuesTurn(previous, next) || next.kind !== "user_message";
+  return continuesTurn(previous, next) || !isOrdinaryUserMessage(next);
 }
 
 export function isTurnBoundary(previous: StreamItem | null, next: StreamItem | null): boolean {

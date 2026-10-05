@@ -1,4 +1,4 @@
-import { isSystemInjectedEnvelope } from "@getpaseo/protocol/agent-message";
+import { isSystemMessage } from "@getpaseo/protocol/agent-message";
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
 
 const PROMPT_PREVIEW_MAX_LENGTH = 120;
@@ -29,7 +29,7 @@ export function buildTimelinePromptIndex(
   return {
     epoch,
     prompts: rows.flatMap((row) =>
-      row.item.type === "user_message" && !isSystemInjectedEnvelope(row.item.text)
+      row.item.type === "user_message" && !isSystemMessage(row.item)
         ? [
             {
               seq: row.seq,

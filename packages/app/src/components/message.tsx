@@ -66,7 +66,7 @@ import type { ToolCallDetail } from "@getpaseo/protocol/agent-types";
 import { buildToolCallPresentation } from "@/tool-calls/presentation";
 import { resolveToolCallIcon } from "@/utils/tool-call-icon";
 import { getMarkdownListMarker, getMarkdownListSpacing } from "@/utils/markdown-list";
-import { markdownNodeContainsType } from "@/utils/markdown-ast";
+import { markdownBlockEdgeStyle, markdownNodeContainsType } from "@/utils/markdown-ast";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { HighlightedCodeBlock } from "@/components/highlighted-code-block";
 import { MarkdownFenceBlock } from "@/components/markdown/fence";
@@ -798,8 +798,8 @@ export const assistantMessageStylesheet = StyleSheet.create((theme) => ({
   },
   timestamp: {
     alignSelf: "flex-end",
-    paddingTop: theme.spacing[1],
-    paddingBottom: theme.spacing[3],
+    paddingTop: 0,
+    paddingBottom: theme.spacing[1],
     color: theme.colors.foregroundMuted,
     fontSize: theme.fontSize.sm,
     ...(isWeb ? { userSelect: "none" as const } : {}),
@@ -1671,8 +1671,12 @@ export const AssistantMessage = memo(function AssistantMessage({
           {children}
         </View>
       ),
-      hr: (node: ASTNode, _children: ReactNode[], _parent: ASTNode[], styles: MarkdownStyles) => (
-        <View key={node.key} style={styles._VIEW_SAFE_hr} dataSet={markdownCopyDataSet.hr} />
+      hr: (node: ASTNode, _children: ReactNode[], parent: ASTNode[], styles: MarkdownStyles) => (
+        <View
+          key={node.key}
+          style={markdownBlockEdgeStyle(styles._VIEW_SAFE_hr, parent)}
+          dataSet={markdownCopyDataSet.hr}
+        />
       ),
       table: (node: ASTNode, children: ReactNode[], _parent: ASTNode[], styles: MarkdownStyles) => (
         <View key={node.key} style={styles._VIEW_SAFE_table} dataSet={markdownCopyDataSet.table}>
@@ -1973,12 +1977,12 @@ export const AssistantMessage = memo(function AssistantMessage({
       paragraph: (
         node: ASTNode,
         children: ReactNode[],
-        _parent: ASTNode[],
+        parent: ASTNode[],
         styles: MarkdownStyles,
       ) => (
         <MarkdownParagraphView
           key={node.key}
-          paragraphStyle={styles.paragraph}
+          paragraphStyle={markdownBlockEdgeStyle(styles.paragraph, parent)}
           containsImage={markdownNodeContainsType(node, "image")}
         >
           {children}
@@ -2035,8 +2039,7 @@ export const AssistantMessage = memo(function AssistantMessage({
       assistantMessageStylesheet.container,
       (spacing === "compactTop" || spacing === "compactBoth") &&
         assistantMessageStylesheet.containerCompactTop,
-      (spacing === "compactBottom" || spacing === "compactBoth") &&
-        assistantMessageStylesheet.containerCompactBottom,
+      assistantMessageStylesheet.containerCompactBottom,
     ],
     [spacing],
   );

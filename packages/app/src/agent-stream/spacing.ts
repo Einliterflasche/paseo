@@ -1,5 +1,9 @@
 import type { StreamItem } from "@/types/stream";
 import { SPACING } from "@/styles/theme";
+import { isSystemMessage } from "@getpaseo/protocol/agent-message";
+
+export const isOrdinaryUserMessage = (item?: StreamItem | null): boolean =>
+  item?.kind === "user_message" && !isSystemMessage(item);
 
 export function isSameAssistantBlockGroup(params: {
   item: StreamItem | null | undefined;
@@ -32,7 +36,6 @@ export function getAssistantBlockSpacing(params: {
   return "default";
 }
 
-const isUserMessageItem = (item?: StreamItem | null) => item?.kind === "user_message";
 const isToolSequenceItem = (item?: StreamItem | null) =>
   item?.kind === "tool_call" || item?.kind === "thought" || item?.kind === "todo_list";
 
@@ -44,7 +47,7 @@ export function getGapBetweenStreamItems(
     return 0;
   }
 
-  if (isUserMessageItem(item) && isUserMessageItem(belowItem)) {
+  if (isOrdinaryUserMessage(item) && isOrdinaryUserMessage(belowItem)) {
     return SPACING[1];
   }
   if (item.kind === "user_message" && belowItem.kind === "assistant_message") {

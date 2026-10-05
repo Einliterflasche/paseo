@@ -11154,58 +11154,90 @@ test("history replay retains legacy paseo-system envelopes with unknown attribut
   ]);
 });
 
-test("attributed tagged submissions retain identity through native hydration and pagination", async () => {
-  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-attribution-"));
-  const storage = new AgentStorage(join(workdir, "agents"), logger);
-  const text = formatSystemNotificationPrompt("  A report\n\nFull text  ");
-  const sender = { kind: "agent", agentId: "caller", title: "Reviewer" } as const;
-  const codex = fakeCodexEmitting({
-    turnItems: [
-      { type: "user_message", text, clientMessageId: "client-report", messageId: "native-report" },
-    ],
-    historyItems: [
-      { type: "user_message", text: "provider normalized report", messageId: "native-report" },
-      { type: "assistant_message", text: "reply", messageId: "native-reply" },
-    ],
-  });
-  const manager = new AgentManager({ clients: { codex }, registry: storage, logger });
-  try {
-    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
-      workspaceId: undefined,
+test.each([
+  formatSystemNotificationPrompt("  A report\n\nFull text  "),
+  "  A plain report\n\nFull text  ",
+])(
+  "attributed submissions retain identity and lifecycle attention through native hydration and pagination: %s",
+  async (text) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-attribution-"));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const sender = { kind: "agent", agentId: "caller", title: "Reviewer" } as const;
+    const codex = fakeCodexEmitting({
+      turnItems: [
+        {
+          type: "user_message",
+          text,
+          clientMessageId: "client-report",
+          messageId: "native-report",
+        },
+      ],
+      historyItems: [
+        { type: "user_message", text: "provider normalized report", messageId: "native-report" },
+        { type: "assistant_message", text: "reply", messageId: "native-reply" },
+      ],
     });
-    await manager.runAgent(agent.id, text, { clientMessageId: "client-report", sender });
-    const submitted = manager.getTimeline(agent.id)[0];
-    expect(submitted).toEqual({
-      type: "user_message",
-      text,
-      messageId: "client-report",
-      clientMessageId: "client-report",
-      sender,
+    const attention: string[] = [];
+    const arrivalAttention: boolean[] = [];
+    const manager = new AgentManager({
+      clients: { codex },
+      registry: storage,
+      logger,
+      onAgentAttention: ({ reason }) => attention.push(reason),
     });
-    await manager.flush();
-    expect(
-      (await new AgentStorage(join(workdir, "agents"), logger).get(agent.id))
-        ?.submittedMessages?.[0],
-    ).toMatchObject({ item: submitted, providerMessageId: "native-report" });
-    await manager.hydrateTimelineFromProvider(agent.id, { force: true });
-    await manager.hydrateTimelineFromProvider(agent.id, { force: true });
-    expect(manager.getTimeline(agent.id)).toEqual([
-      submitted,
-      { type: "assistant_message", text: "reply", messageId: "native-reply" },
-    ]);
-    const tail = manager.fetchTimeline(agent.id, { direction: "tail", limit: 1 });
-    const older = manager.fetchTimeline(agent.id, {
-      direction: "before",
-      cursor: { epoch: tail.epoch, seq: tail.startSeq! },
-      limit: 1,
-    });
-    expect(older.rows.map((row) => row.item)).toEqual([submitted]);
-    expect(older.rows[0]?.providerMessageId).toBe("native-report");
-  } finally {
-    await manager.closeAgentsForShutdown();
-    rmSync(workdir, { recursive: true, force: true });
-  }
-});
+    try {
+      const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: undefined,
+      });
+      const unsubscribe = manager.subscribe(
+        (event) => {
+          if (
+            event.type === "agent_stream" &&
+            event.event.type === "timeline" &&
+            event.event.item.type === "user_message"
+          )
+            arrivalAttention.push(manager.getAgent(agent.id)?.attention.requiresAttention ?? true);
+        },
+        { agentId: agent.id, replayState: false },
+      );
+      await manager.runAgent(agent.id, text, { clientMessageId: "client-report", sender });
+      unsubscribe();
+      expect(arrivalAttention).toEqual([false]);
+      expect(attention).toEqual(["finished"]);
+      expect(manager.getAgent(agent.id)?.lastUserMessageAt).toBeNull();
+      const submitted = manager.getTimeline(agent.id)[0];
+      expect(submitted).toEqual({
+        type: "user_message",
+        text,
+        messageId: "client-report",
+        clientMessageId: "client-report",
+        sender,
+      });
+      await manager.flush();
+      expect(
+        (await new AgentStorage(join(workdir, "agents"), logger).get(agent.id))
+          ?.submittedMessages?.[0],
+      ).toMatchObject({ item: submitted, providerMessageId: "native-report" });
+      await manager.hydrateTimelineFromProvider(agent.id, { force: true });
+      await manager.hydrateTimelineFromProvider(agent.id, { force: true });
+      expect(manager.getTimeline(agent.id)).toEqual([
+        submitted,
+        { type: "assistant_message", text: "reply", messageId: "native-reply" },
+      ]);
+      const tail = manager.fetchTimeline(agent.id, { direction: "tail", limit: 1 });
+      const older = manager.fetchTimeline(agent.id, {
+        direction: "before",
+        cursor: { epoch: tail.epoch, seq: tail.startSeq! },
+        limit: 1,
+      });
+      expect(older.rows.map((row) => row.item)).toEqual([submitted]);
+      expect(older.rows[0]?.providerMessageId).toBe("native-report");
+    } finally {
+      await manager.closeAgentsForShutdown();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
 
 test("native replay preserves two identical submissions and inserts a missing report at its anchor", () => {
   const text = formatSystemNotificationPrompt("Repeated report");

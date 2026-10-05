@@ -3,7 +3,23 @@ import type { StreamItem } from "@/types/stream";
 import { buildAgentStreamRenderModel } from "./model";
 import { layoutStream } from "./layout";
 import { resolveStreamRenderStrategy } from "./strategy-resolver";
-import { continuesTurn } from "./turn-membership";
+import { continuesResponse, continuesTurn } from "./turn-membership";
+
+it("internal reports do not create ordinary user bubble groups or legacy response boundaries", () => {
+  const prompt = user("human", 1, "turn-1");
+  const report = {
+    ...user("report", 2, "turn-2"),
+    sender: { kind: "agent" as const, agentId: "reviewer" },
+  };
+  const reply = assistant("reply", 3, "turn-2");
+  expect(continuesResponse(prompt, report)).toBe(true);
+  expect(continuesResponse(report, { ...prompt, id: "next", turnId: "turn-3" })).toBe(false);
+  const { layout } = layoutFor([prompt, report, reply], false);
+  const humanRow = layout.history.find((row) => row.item.id === "human");
+  const reportRow = layout.history.find((row) => row.item.id === "report");
+  expect(humanRow).toMatchObject({ isFirstInUserGroup: true, isLastInUserGroup: true });
+  expect(reportRow).toMatchObject({ isFirstInUserGroup: false, isLastInUserGroup: false });
+});
 
 function at(second: number): Date {
   return new Date(`2026-01-01T00:00:${second.toString().padStart(2, "0")}.000Z`);

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { isSystemInjectedEnvelope, isSystemMessage } from "./agent-message.js";
 import {
   FileExplorerRequestSchema,
   PaseoWorktreeArchiveRequestSchema,
@@ -25,6 +26,19 @@ function workspaceDescriptor(overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
 }
+
+test("internal messages use sender provenance without guessing legacy report text", () => {
+  const text = "An agent finished its work.";
+  expect(isSystemMessage({ text, sender: { kind: "agent", agentId: "reviewer" } })).toBe(true);
+  expect(isSystemMessage({ text, sender: { kind: "system", source: "Restart recovery" } })).toBe(
+    true,
+  );
+  expect(isSystemMessage({ text, sender: { kind: "human" } })).toBe(false);
+  expect(isSystemMessage({ text })).toBe(false);
+  expect(isSystemMessage({ text: "<paseo-system>\nOriginal report\n</paseo-system>" })).toBe(true);
+  expect(isSystemInjectedEnvelope(text)).toBe(false);
+  expect(isSystemInjectedEnvelope("<paseo-system> example </paseo-system>")).toBe(false);
+});
 
 function fetchWorkspacesResponse(workspace: Record<string, unknown>) {
   return {

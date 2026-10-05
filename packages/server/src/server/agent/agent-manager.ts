@@ -105,7 +105,7 @@ import {
   type PendingForegroundRun,
 } from "./agent-run-state.js";
 import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
-import { isSystemInjectedEnvelope } from "./agent-prompt.js";
+import { isSystemMessage } from "@getpaseo/protocol/agent-message";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
 import {
   agentCallerToken,
@@ -707,7 +707,7 @@ function resolveImportedAgentTitle(
 function getFirstUserMessageTextFromRows(rows: readonly AgentTimelineRow[]): string | null {
   for (const row of rows) {
     const item = row.item;
-    if (item.type !== "user_message" || isSystemInjectedEnvelope(item.text)) {
+    if (item.type !== "user_message" || isSystemMessage(item)) {
       continue;
     }
     const text = item.text.trim();
@@ -3971,7 +3971,7 @@ export class AgentManager {
     let startsAtBeginning = false;
     for (let i = timeline.length - 1; i >= 0; i--) {
       const item = timeline[i];
-      if (item.type === "user_message" && isSystemInjectedEnvelope(item.text)) {
+      if (item.type === "user_message" && isSystemMessage(item)) {
         if (chunks.length) startsAtBeginning = i === 0;
         continue;
       }
@@ -5282,7 +5282,7 @@ export class AgentManager {
     }
 
     this.commitTimeline(agent.id, event.item, event.provider, event.turnId);
-    if (event.item.type === "user_message") {
+    if (event.item.type === "user_message" && !isSystemMessage(event.item)) {
       agent.lastUserMessageAt = new Date();
       this.emitState(agent);
     }
@@ -5552,7 +5552,6 @@ export class AgentManager {
       return;
     }
     this.touchUpdatedAt(agent);
-    agent.lastUserMessageAt = new Date();
     const item: AgentTimelineItem = {
       type: "user_message",
       text: submittedPromptText(prompt),
@@ -5560,6 +5559,7 @@ export class AgentManager {
       clientMessageId,
       ...(options?.messageId ? { messageId: options.messageId } : {}),
     };
+    if (!isSystemMessage(item)) agent.lastUserMessageAt = new Date();
     const previous = this.timelineStore.getRows(agent.id).at(-1)?.item;
     const { row } = this.commitTimeline(agent.id, item, agent.provider, options?.turnId, options);
     const messages = this.submittedMessages.get(agent.id) ?? [];

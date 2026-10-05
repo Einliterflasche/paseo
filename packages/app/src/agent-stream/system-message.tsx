@@ -1,5 +1,6 @@
 import { memo, useCallback, useMemo, useState } from "react";
 import { Text, View } from "react-native";
+import { ChevronDown, ChevronRight } from "lucide-react-native";
 import { StyleSheet } from "react-native-unistyles";
 import type { AgentMessageSender } from "@getpaseo/protocol/agent-message";
 import { Button } from "@/components/ui/button";
@@ -24,6 +25,7 @@ export const SystemMessage = memo(function SystemMessage({ message, sender }: Sy
         {...webAccessibility}
         variant="ghost"
         size="xs"
+        leftIcon={expanded ? ChevronDown : ChevronRight}
         style={styles.trigger}
         textStyle={styles.label}
         accessibilityLabel={label}
@@ -46,8 +48,9 @@ export const SystemMessage = memo(function SystemMessage({ message, sender }: Sy
 
 const styles = StyleSheet.create((theme) => ({
   row: {
+    width: "100%",
     alignItems: "center",
-    paddingVertical: theme.spacing[2],
+    paddingVertical: theme.spacing[1],
     gap: theme.spacing[2],
   },
   trigger: {
