@@ -48,6 +48,14 @@ function isReusableBlock(block: AssistantMessageItem, source: AssistantMessageIt
   );
 }
 
+function getMessageTimestamp(
+  source: AssistantMessageItem,
+  previous: AssistantMessageItem[] | undefined,
+): Date {
+  // Keep the first timeline instant while tokens update the source timestamp.
+  return previous?.[0]?.messageTimestamp ?? source.timestamp;
+}
+
 /** Source messages reach plugins before any Markdown splitting or Overview grouping. */
 export function createStreamPresentation() {
   const userMessageCache = new WeakMap<UserMessageItem, UserMessageItem>();
@@ -93,6 +101,7 @@ export function createStreamPresentation() {
     if (cached) return cached;
     const previousSource = liveSources.get(item.id);
     const previous = previousSource && blocksBySource.get(previousSource);
+    const messageTimestamp = getMessageTimestamp(item, previous);
     // Parse only the growing last block on append, as the old live reducer did.
     // Canonical text replacements are parsed afresh instead of joining fragments.
     const isAppend = previousSource && previous && item.text.startsWith(previousSource.text);
@@ -127,6 +136,7 @@ export function createStreamPresentation() {
         ...item,
         id,
         blockGroupId: item.id,
+        messageTimestamp,
         blockIndex: index,
         text: blockText,
       });

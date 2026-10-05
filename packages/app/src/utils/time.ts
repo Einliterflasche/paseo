@@ -2,7 +2,7 @@
  * How often a relative label can change, which is all a caller needs to know to keep it honest.
  * `static` means it never will again.
  */
-export type RelativeTimeResolution = "minute" | "hour" | "day" | "static";
+export type RelativeTimeResolution = "second" | "minute" | "hour" | "day" | "static";
 
 export interface RelativeTimeLabel {
   label: string;
@@ -14,6 +14,19 @@ const HOUR_MS = 60 * MINUTE_MS;
 const DAY_MS = 24 * HOUR_MS;
 /** Past a week the elapsed count stops meaning anything; the date itself is more use. */
 const ABSOLUTE_AFTER_MS = 7 * DAY_MS;
+
+export function describeAgentMessageTime(date: Date, now: Date = new Date()): RelativeTimeLabel {
+  const elapsedMs = Math.max(0, now.getTime() - date.getTime());
+  if (elapsedMs < MINUTE_MS) {
+    return { label: `${Math.floor(elapsedMs / 1000)}s ago`, resolution: "second" };
+  }
+  if (elapsedMs < HOUR_MS) {
+    return { label: `${Math.floor(elapsedMs / MINUTE_MS)}m ago`, resolution: "minute" };
+  }
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return { label: `${hours}:${minutes}`, resolution: "static" };
+}
 
 /**
  * How long ago something was, before it's worded. The prose and compact formatters share this so

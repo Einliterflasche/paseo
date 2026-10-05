@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { StreamItem } from "@/types/stream";
-import { getAssistantBlockSpacing, isSameAssistantBlockGroup } from "./spacing";
+import {
+  getAssistantBlockSpacing,
+  getGapBetweenStreamItems,
+  isSameAssistantBlockGroup,
+} from "./spacing";
 
 function assistantBlock(params: {
   id: string;
@@ -62,6 +66,14 @@ describe("isSameAssistantBlockGroup", () => {
 });
 
 describe("getAssistantBlockSpacing", () => {
+  it("joins message blocks without joining tool activity or another message", () => {
+    const first = assistantBlock({ id: "first", blockGroupId: "message", blockIndex: 0 });
+    const second = assistantBlock({ id: "second", blockGroupId: "message", blockIndex: 1 });
+    const next = assistantBlock({ id: "next", blockGroupId: "another", blockIndex: 0 });
+    expect(getGapBetweenStreamItems(first, second)).toBe(0);
+    expect(getGapBetweenStreamItems(second, next)).toBeGreaterThan(0);
+    expect(getGapBetweenStreamItems(second, toolCallBlock("tool"))).toBeGreaterThan(0);
+  });
   it("returns default for non-assistant items", () => {
     const tc = toolCallBlock("tc-1");
     expect(getAssistantBlockSpacing({ item: tc, aboveItem: null, belowItem: null })).toBe(

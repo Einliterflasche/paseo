@@ -124,6 +124,40 @@ function rows(result: { tail: StreamItem[]; head: StreamItem[] }): StreamItem[] 
 }
 
 describe("stream presentation through installed plugins", () => {
+  it("keeps the message's first timeline timestamp across tokens, blocks, and completion", () => {
+    const present = createStreamPresentation();
+    let state: { tail: StreamItem[]; head: StreamItem[] } = { tail: [], head: [] };
+    for (const [elapsed, event] of [
+      [1000, assistant("First paragraph")],
+      [5000, assistant("\n\nSecond paragraph")],
+      [10000, { type: "turn_completed", provider: "claude" }],
+    ] satisfies [number, AgentStreamEventPayload][]) {
+      state = applyStreamEvent({ ...state, event, timestamp: new Date(elapsed) });
+      const displayed = rows(present({ ...presentationOptions, ...state, transform: undefined }));
+      for (const item of displayed) {
+        if (item.kind === "assistant_message") {
+          expect(item.messageTimestamp?.getTime()).toBe(1000);
+        }
+      }
+    }
+    const unrelated = rows(
+      present({
+        ...presentationOptions,
+        tail: [],
+        head: [
+          {
+            kind: "assistant_message",
+            id: "new-message",
+            text: "Next message",
+            timestamp: new Date(15000),
+          },
+        ],
+        transform: undefined,
+      }),
+    );
+    expect(unrelated[0]).toMatchObject({ messageTimestamp: new Date(15000) });
+  });
+
   it("offers every source tool call to an installed transformer in Overview mode", () => {
     const calls = [toolCall("call-1", "bash"), toolCall("call-2", "read")];
     const rendered = createStreamPresentation()({
@@ -549,7 +583,13 @@ describe("timeline presentation", () => {
     expect(projectTimelineItems(items)).toEqual(
       items.map((item) =>
         item.kind === "assistant_message"
-          ? { ...item, id: `${item.id}:block:0`, blockGroupId: item.id, blockIndex: 0 }
+          ? {
+              ...item,
+              id: `${item.id}:block:0`,
+              blockGroupId: item.id,
+              blockIndex: 0,
+              messageTimestamp: item.timestamp,
+            }
           : item,
       ),
     );

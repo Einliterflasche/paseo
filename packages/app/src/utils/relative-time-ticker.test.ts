@@ -18,6 +18,20 @@ describe("subscribeToRelativeTimeTick", () => {
     expect(activeRelativeTimeTickerCount()).toBe(0);
   });
 
+  it("shares one seconds timer across fifty messages and releases it", () => {
+    const listeners = Array.from({ length: 50 }, () => vi.fn());
+    const releases = listeners.map((listener) => subscribeToRelativeTimeTick("second", listener));
+    try {
+      expect(activeRelativeTimeTickerCount()).toBe(1);
+      vi.advanceTimersByTime(1000);
+      for (const listener of listeners) expect(listener).toHaveBeenCalledTimes(1);
+    } finally {
+      for (const release of releases) release();
+    }
+    expect(activeRelativeTimeTickerCount()).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("ticks a subscriber at its tier's period", () => {
     const listener = vi.fn();
     const unsubscribe = subscribeToRelativeTimeTick("minute", listener);
@@ -29,6 +43,14 @@ describe("subscribeToRelativeTimeTick", () => {
     expect(listener).toHaveBeenCalledTimes(2);
 
     unsubscribe();
+  });
+
+  it("stops the seconds timer when the last message changes tiers on its first tick", () => {
+    let unsubscribe = () => {};
+    unsubscribe = subscribeToRelativeTimeTick("second", () => unsubscribe());
+    vi.advanceTimersByTime(1000);
+    expect(activeRelativeTimeTickerCount()).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("shares one timer across every subscriber at the same tier", () => {

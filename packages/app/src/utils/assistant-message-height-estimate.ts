@@ -2,7 +2,7 @@ import { estimateAssistantMessageHeightFromCache as estimateAssistantImageMessag
 import { splitMarkdownBlocks } from "@/utils/split-markdown-blocks";
 
 const ASSISTANT_MARKDOWN_BLOCK_HEIGHT_CACHE_LIMIT = 1000;
-const ASSISTANT_MARKDOWN_BLOCK_INSET = 16;
+const ASSISTANT_MARKDOWN_BLOCK_INSET = 40;
 const ASSISTANT_MESSAGE_VERTICAL_PADDING = 24;
 const ASSISTANT_MARKDOWN_BLOCK_GAP = 12;
 

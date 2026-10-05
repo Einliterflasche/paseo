@@ -1,6 +1,15 @@
 import { useEffect, useState } from "react";
 import { subscribeToRelativeTimeTick, type TickResolution } from "@/utils/relative-time-ticker";
-import { describeCompactTimeAgo, describeTimeAgo, type RelativeTimeLabel } from "@/utils/time";
+import {
+  describeAgentMessageTime,
+  describeCompactTimeAgo,
+  describeTimeAgo,
+  type RelativeTimeLabel,
+} from "@/utils/time";
+
+export function useAgentMessageTime(date: Date | null): string {
+  return useRelativeTimeLabel(date, describeAgentMessageTime);
+}
 
 /** A prose relative timestamp ("5m ago") that keeps itself current. See `useCompactTimeAgo`. */
 export function useTimeAgo(date: Date | null): string {

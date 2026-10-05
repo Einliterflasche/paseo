@@ -717,6 +717,7 @@ export interface AssistantMessageItem {
   text: string;
   timestamp: Date;
   /** Display-only fields, assigned after source-item plugin transforms. */
+  messageTimestamp?: Date;
   blockGroupId?: string;
   blockIndex?: number;
 }

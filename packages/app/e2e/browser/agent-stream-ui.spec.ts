@@ -28,6 +28,49 @@ import {
 const SCROLL_AWAY_MIN_SCROLLABLE_DISTANCE = 360;
 
 test.describe("Agent stream UI", () => {
+  for (const width of [1440, 390]) {
+    test(`keeps a grouped agent bubble and one live timestamp at ${width}px`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 1000 });
+      const agent = await seedMockAgentWorkspace({
+        repoPrefix: "agent-bubble-",
+        title: "Agent bubble",
+        initialPrompt: "Show the message fixture.",
+        featureValues: {
+          mockAssistantResponse:
+            "The message keeps its paragraphs together.\n\n```ts\nconst message = { text: 'Ready', timestamp: '15:04' };\n```\n\n[Read the details](https://example.com/details).",
+        },
+      });
+      try {
+        await agent.client.waitForFinish(agent.agentId, 30000);
+        await openAgentRoute(page, agent);
+        const bubbles = page.getByTestId("assistant-message-bubble");
+        const timestamp = page.getByTestId("assistant-message-timestamp");
+        await expect(bubbles).toHaveCount(3);
+        await expect(timestamp).toHaveCount(1);
+        await expect(timestamp).toHaveText(/^(\d+[sm] ago|\d{2}:\d{2})$/);
+        const first = await bubbles.nth(0).boundingBox();
+        const second = await bubbles.nth(1).boundingBox();
+        if (!first || !second) throw new Error("Agent bubble is not visible");
+        expect(first.width).toBeGreaterThan(width === 1440 ? 600 : 250);
+        expect(second.y - first.y - first.height).toBeLessThan(1);
+        await expect(
+          page.getByRole("link", { name: "Read the details" }).and(page.locator("a")),
+        ).toBeVisible();
+        const markdown = page.getByTestId("assistant-message").first();
+        const body = await markdown.locator(":scope > *").first().elementHandle();
+        const initialTime = await timestamp.textContent();
+        await expect(timestamp).not.toHaveText(initialTime ?? "");
+        expect(await body?.evaluate((element) => element.isConnected)).toBe(true);
+        await expectTurnCopyButton(page);
+        await page.reload();
+        await expect(bubbles).toHaveCount(3);
+        await expect(timestamp).toHaveCount(1);
+      } finally {
+        await agent.cleanup();
+      }
+    });
+  }
+
   test("keeps running agent chrome after page refresh", async ({ page }) => {
     const title = "Running agent refresh";
     const agent = await seedRunningMockAgentWorkspace({
@@ -270,6 +313,10 @@ test.describe("Agent stream UI", () => {
       await expectInlineWorkingIndicator(page);
       await expectAgentIdle(page, 30_000);
       await scrollAgentChatToBottom(page);
+      await expect(page.getByTestId("tool-call-badge").first()).toBeVisible();
+      await expect(
+        page.locator('[data-testid="assistant-message-bubble"] [data-testid="tool-call-badge"]'),
+      ).toHaveCount(0);
       await expectTurnCopyButton(page);
     } finally {
       await agent.cleanup();

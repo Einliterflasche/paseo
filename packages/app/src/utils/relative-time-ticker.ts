@@ -20,6 +20,7 @@ export type TickResolution = Exclude<RelativeTimeResolution, "static">;
  * behind, which is invisible on a value that reads "3h" for sixty minutes either way.
  */
 const INTERVAL_MS: Record<TickResolution, number> = {
+  second: 1000,
   minute: 60_000,
   hour: 30 * 60_000,
   day: 60 * 60_000,
@@ -36,6 +37,7 @@ function createTier(): Tier {
 }
 
 const tiers: Record<TickResolution, Tier> = {
+  second: createTier(),
   minute: createTier(),
   hour: createTier(),
   day: createTier(),
@@ -62,7 +64,9 @@ function start(resolution: TickResolution): void {
   tier.handle = setTimeout(() => {
     tier.handle = null;
     notify(tier);
-    tier.interval = setInterval(() => notify(tier), period);
+    if (tier.listeners.size > 0) {
+      tier.interval = setInterval(() => notify(tier), period);
+    }
   }, delay);
 }
 

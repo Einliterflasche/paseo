@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  describeAgentMessageTime,
   describeCompactTimeAgo,
   describeTimeAgo,
   formatCompactTimeAgo,
@@ -8,6 +9,24 @@ import {
   formatMessageTimestamp,
   formatTimeAgo,
 } from "./time";
+
+describe("agent message time", () => {
+  const sent = new Date(2026, 9, 5, 9, 4);
+  it.each([
+    [-1000, "0s ago", "second"],
+    [5000, "5s ago", "second"],
+    [59999, "59s ago", "second"],
+    [60000, "1m ago", "minute"],
+    [3599999, "59m ago", "minute"],
+    [3600000, "09:04", "static"],
+    [8 * 24 * 3600000, "09:04", "static"],
+  ] as const)("uses the requested time tier at %s milliseconds", (elapsed, label, resolution) => {
+    expect(describeAgentMessageTime(sent, new Date(sent.getTime() + elapsed))).toEqual({
+      label,
+      resolution,
+    });
+  });
+});
 
 describe("formatTimeAgo", () => {
   const now = new Date("2026-07-16T12:00:00.000Z");

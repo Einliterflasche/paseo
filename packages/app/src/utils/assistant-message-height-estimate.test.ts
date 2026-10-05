@@ -19,12 +19,12 @@ describe("assistant message height estimate", () => {
   it("estimates assistant message height from measured markdown block heights", () => {
     setAssistantMarkdownBlockHeight({
       block: "First paragraph",
-      width: 804,
+      width: 780,
       height: 18.2,
     });
     setAssistantMarkdownBlockHeight({
       block: "Second paragraph",
-      width: 804,
+      width: 780,
       height: 41.1,
     });
 
@@ -37,7 +37,7 @@ describe("assistant message height estimate", () => {
   });
 
   it("reads block heights measured at the configured content width", () => {
-    setAssistantMarkdownBlockHeight({ block: "Wide paragraph", width: 1584, height: 20 });
+    setAssistantMarkdownBlockHeight({ block: "Wide paragraph", width: 1560, height: 20 });
 
     expect(estimateAssistantMessageHeightFromCache("Wide paragraph", 1600)).toBe(44);
     expect(

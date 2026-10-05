@@ -108,6 +108,7 @@ import { RewindMenu, type RewindMode } from "@/components/rewind/rewind-menu";
 import { useRewindAgentMutation } from "@/components/rewind/use-rewind-agent-mutation";
 import { AssistantForkMenu, type AssistantForkTarget } from "@/components/assistant-fork-menu";
 import { useRetainedPanelActive } from "@/components/retained-panel";
+import { useAgentMessageTime } from "@/hooks/use-time-ago";
 import {
   markdownCopyDataSet,
   markdownCopyOrderedListDataSet,
@@ -768,6 +769,8 @@ interface AssistantMessageProps {
   occurrenceKey: string;
   message: string;
   timestamp: number;
+  isFirstInGroup?: boolean;
+  isLastInGroup?: boolean;
   workspaceRoot?: string;
   serverId?: string;
   client?: DaemonClient | null;
@@ -776,6 +779,31 @@ interface AssistantMessageProps {
 }
 
 export const assistantMessageStylesheet = StyleSheet.create((theme) => ({
+  bubble: {
+    backgroundColor: theme.colors.surface2,
+    paddingHorizontal: theme.spacing[3],
+    width: "100%",
+    minWidth: 0,
+  },
+  bubbleFirst: {
+    borderTopLeftRadius: theme.borderRadius.sm,
+    borderTopRightRadius: theme.borderRadius.xl,
+  },
+  bubbleLast: {
+    borderBottomLeftRadius: theme.borderRadius.xl,
+    borderBottomRightRadius: theme.borderRadius.xl,
+  },
+  bubbleContinuation: {
+    paddingBottom: theme.spacing[3],
+  },
+  timestamp: {
+    alignSelf: "flex-end",
+    paddingTop: theme.spacing[1],
+    paddingBottom: theme.spacing[3],
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
+    ...(isWeb ? { userSelect: "none" as const } : {}),
+  },
   container: {
     paddingVertical: theme.spacing[3],
     ...(isWeb ? { userSelect: "text" as const } : {}),
@@ -1508,11 +1536,33 @@ function MarkdownListView({
   );
 }
 
+const AssistantMessageTimestamp = memo(function AssistantMessageTimestamp({
+  timestamp,
+}: {
+  timestamp: number;
+}) {
+  const active = useRetainedPanelActive();
+  const date = useMemo(() => new Date(timestamp), [timestamp]);
+  const label = useAgentMessageTime(active ? date : null);
+  return (
+    <Text
+      style={assistantMessageStylesheet.timestamp}
+      dataSet={markdownCopyDataSet.ignore}
+      testID="assistant-message-timestamp"
+      selectable={false}
+    >
+      {label}
+    </Text>
+  );
+});
+
 export const AssistantMessage = memo(function AssistantMessage({
   renderFullContent = false,
   occurrenceKey,
   message,
-  timestamp: _timestamp,
+  timestamp,
+  isFirstInGroup = true,
+  isLastInGroup = true,
   workspaceRoot,
   serverId,
   client,
@@ -1990,6 +2040,16 @@ export const AssistantMessage = memo(function AssistantMessage({
     ],
     [spacing],
   );
+  const bubbleStyle = useMemo(
+    () => [
+      assistantMessageStylesheet.bubble,
+      isFirstInGroup && assistantMessageStylesheet.bubbleFirst,
+      isLastInGroup
+        ? assistantMessageStylesheet.bubbleLast
+        : assistantMessageStylesheet.bubbleContinuation,
+    ],
+    [isFirstInGroup, isLastInGroup],
+  );
   const revealDataSet = useMemo(
     () =>
       isRenderProfileEnabled()
@@ -2003,33 +2063,36 @@ export const AssistantMessage = memo(function AssistantMessage({
   );
 
   return (
-    <View testID="assistant-message" dataSet={revealDataSet} style={assistantContainerStyle}>
-      {keyedBlocks.map(({ key, block }, index) => (
-        <AssistantMessageBlockContainer
-          key={key}
-          block={block}
-          marginBottom={index < keyedBlocks.length - 1 ? 12 : 0}
-        >
-          <MemoizedMarkdownBlock
-            text={block}
-            rules={markdownRules}
-            parser={
-              phase === "streaming" && index === keyedBlocks.length - 1
-                ? streamingMarkdownParser
-                : markdownParser
-            }
-            onLinkPress={handleMarkdownLinkPress}
-          />
-        </AssistantMessageBlockContainer>
-      ))}
-      {fullMessageByteLength !== null ? (
-        <Text
-          testID="assistant-message-capped-notice"
-          style={assistantMessageStylesheet.cappedNotice}
-        >
-          {t("agentStream.messageCapped", { bytes: fullMessageByteLength })}
-        </Text>
-      ) : null}
+    <View testID="assistant-message-bubble" style={bubbleStyle}>
+      <View testID="assistant-message" dataSet={revealDataSet} style={assistantContainerStyle}>
+        {keyedBlocks.map(({ key, block }, index) => (
+          <AssistantMessageBlockContainer
+            key={key}
+            block={block}
+            marginBottom={index < keyedBlocks.length - 1 ? 12 : 0}
+          >
+            <MemoizedMarkdownBlock
+              text={block}
+              rules={markdownRules}
+              parser={
+                phase === "streaming" && index === keyedBlocks.length - 1
+                  ? streamingMarkdownParser
+                  : markdownParser
+              }
+              onLinkPress={handleMarkdownLinkPress}
+            />
+          </AssistantMessageBlockContainer>
+        ))}
+        {fullMessageByteLength !== null ? (
+          <Text
+            testID="assistant-message-capped-notice"
+            style={assistantMessageStylesheet.cappedNotice}
+          >
+            {t("agentStream.messageCapped", { bytes: fullMessageByteLength })}
+          </Text>
+        ) : null}
+      </View>
+      {isLastInGroup ? <AssistantMessageTimestamp timestamp={timestamp} /> : null}
     </View>
   );
 });
