@@ -1,0 +1,72 @@
+2026-10-05. Final passing file results from the focused test runs.
+Some files ran in batches. These are their individual result lines.
+Every Vitest run used --bail=1. The full suite did not run.
+
+Working directory: packages/server
+npx vitest run src/server/agent/agent-manager.test.ts --bail=1
+✓ src/server/agent/agent-manager.test.ts (194 tests) 2951ms
+
+Working directory: packages/server
+npx vitest run src/server/agent/agent-manager-restart.test.ts --bail=1
+✓ src/server/agent/agent-manager-restart.test.ts (42 tests) 661ms
+
+Working directory: packages/server
+npx vitest run src/server/agent/agent-prompt.test.ts --bail=1
+✓ src/server/agent/agent-prompt.test.ts (20 tests) 632ms
+
+Working directory: packages/server
+npx vitest run src/server/agent/mcp-parity.e2e.test.ts --bail=1
+✓ src/server/agent/mcp-parity.e2e.test.ts (32 tests) 5827ms
+
+Working directory: packages/server
+npx vitest run src/server/agent/prompt-attachments.test.ts --bail=1
+✓ src/server/agent/prompt-attachments.test.ts (9 tests) 6ms
+
+Working directory: packages/server
+npx vitest run src/server/daemon-e2e/timeline-reconnect-contract.e2e.test.ts --bail=1
+✓ src/server/daemon-e2e/timeline-reconnect-contract.e2e.test.ts (4 tests) 6933ms
+
+Working directory: packages/server
+npx vitest run src/server/daemon-e2e/controlled-restart.e2e.test.ts --bail=1
+✓ src/server/daemon-e2e/controlled-restart.e2e.test.ts (4 tests) 25643ms
+
+Working directory: packages/server
+npx vitest run src/server/daemon-e2e/controlled-restart-schedule.e2e.test.ts --bail=1
+✓ src/server/daemon-e2e/controlled-restart-schedule.e2e.test.ts (1 test) 1146ms
+
+Working directory: packages/server
+npx vitest run src/server/daemon-e2e/controlled-restart-obligations.e2e.test.ts --bail=1
+✓ src/server/daemon-e2e/controlled-restart-obligations.e2e.test.ts (1 test) 1073ms
+
+Working directory: packages/app
+npx vitest run src/types/stream.test.ts --bail=1
+✓  unit  src/types/stream.test.ts (67 tests) 27ms
+
+Working directory: packages/app
+npx vitest run src/runtime/replica-cache/index.test.ts --bail=1
+✓  unit  src/runtime/replica-cache/index.test.ts (29 tests) 59ms
+
+Working directory: packages/protocol
+npx vitest run tests/validation/ws-outbound.test.ts --bail=1
+✓ tests/validation/ws-outbound.test.ts (17 tests) 747ms
+
+npm run test:e2e --workspace=@getpaseo/app -- --project=browser e2e/browser/system-messages.spec.ts
+✓  1 [browser] › e2e/browser/system-messages.spec.ts:7:5 › tagged messages collapse, expand, and retain human attribution after reload (13.9s)
+1 passed (45.7s)
+EXIT=0
+
+npm run build:server
+Passed.
+npm run typecheck
+Passed.
+npm run lint
+Found 0 warnings and 0 errors.
+npm run format
+Passed.
+
+Screenshots: collapsed.png, expanded.png, compact-expanded.png.
+The browser test exercises a real isolated daemon and a mock agent provider.
+It covers default collapse, click/tap toggles, full text, reload, and monospace styles.
+Native iOS, Android, and Electron did not run. Real provider accounts did not run.
+Legacy rows remain readable. Missing historical sender metadata stays unknown.
+No live deployment was requested or performed.

@@ -1,3 +1,4 @@
+import { AgentMessageSenderSchema } from "@getpaseo/protocol/agent-message";
 import { z } from "zod";
 import { open } from "node:fs/promises";
 import { AgentAttachmentSchema } from "../messages.js";
@@ -20,6 +21,7 @@ export const RecoveryInputSchema = z.object({
   options: z
     .object({
       clientMessageId: z.string().optional(),
+      sender: AgentMessageSenderSchema.optional(),
       maxThinkingTokens: z.number().optional(),
       outputSchema: z
         .unknown()
@@ -60,7 +62,7 @@ export async function verifyRecoveryInputFiles(inputs: readonly RecoveryInput[])
   }
 }
 
-/** One hidden envelope, retaining all accepted inputs and binary content in order. */
+/** One system envelope, retaining all accepted inputs and binary content in order. */
 export function continuationPrompt(inputs: readonly RecoveryInput[]): AgentPromptInput {
   const text = [
     "The Paseo daemon restarted and interrupted this task. Continue the unfinished work in this same session.",

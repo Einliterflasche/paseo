@@ -105,6 +105,11 @@ Each agent is stored as a separate JSON file, grouped by project directory.
 | `internal`           | `boolean?`                               | Whether this is a system-internal agent                                                                                                                                                                                                                                                                                                                                             |
 | `archivedAt`         | `string?` (ISO 8601)                     | Soft-delete timestamp                                                                                                                                                                                                                                                                                                                                                               |
 
+Native transcripts do not retain Paseo sender metadata or every accepted prompt.
+The optional `submittedMessages` field preserves those rows and their native
+correlations. The [timeline contract](timeline-sync.md) owns their display and
+hydration rules.
+
 ### Nested: SerializableConfig
 
 | Field              | Type                       | Description                  |

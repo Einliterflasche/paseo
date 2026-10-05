@@ -1489,7 +1489,7 @@ export class ScheduleService {
     this.watchRunOutcome(agent.id, runId);
     const observed = await this.agentManager.startObservedRun(agent.id, runId, () =>
       startAgentRun(this.agentManager, agent.id, wrappedPrompt, this.logger, {
-        runOptions: { clientMessageId: runId },
+        runOptions: { clientMessageId: runId, sender: { kind: "system", source: "Schedule" } },
       }),
     );
     const completion = (async (): Promise<ScheduleExecutionResult> => {
@@ -1591,6 +1591,7 @@ export class ScheduleService {
     if (created.initialPromptError) throw created.initialPromptError;
     const result = await this.agentManager.runAgent(agent.id, schedule.prompt, {
       clientMessageId: runId,
+      sender: { kind: "system", source: "Schedule" },
     });
     if (result.canceled) throw new Error(`Scheduled agent ${agent.id} was canceled`);
     return {

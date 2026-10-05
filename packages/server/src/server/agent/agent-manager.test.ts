@@ -14,6 +14,7 @@ import {
   type ManagedAgent,
 } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
+import { reconcileSubmittedHistory, type SubmittedMessage } from "./submitted-messages.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { toAgentPayload } from "./agent-projections.js";
 import { projectTimelineRows } from "./timeline-projection.js";
@@ -2858,6 +2859,7 @@ test("createAgent passes daemon launch env through the provider launch context",
     agentId: snapshot.id,
     env: {
       PASEO_AGENT_ID: snapshot.id,
+      PASEO_AGENT_TOKEN: expect.any(String),
       PASEO_AGENT_CWD: workdir,
     },
   });
@@ -2988,6 +2990,7 @@ test("createAgent injects paseo MCP server only into provider launch config", as
     paseo: {
       type: "http",
       url: `http://127.0.0.1:6767/mcp/agents?callerAgentId=${snapshot.id}`,
+      headers: { Authorization: expect.stringMatching(/^Bearer /) },
     },
     custom: {
       type: "stdio",
@@ -3289,9 +3292,16 @@ test("createAgent allows best-effort internal MCP when the provider session repo
   expect(client.lastConfig?.mcpServers?.paseo).toEqual({
     type: "http",
     url: `http://127.0.0.1:6767/mcp/agents?callerAgentId=${snapshot.id}`,
-    headers: { Authorization: "Bearer cap-token" },
+    headers: { Authorization: expect.stringMatching(/^Bearer /) },
   });
 
+  const server = client.lastConfig?.mcpServers?.paseo;
+  if (!server || server.type !== "http") throw new Error("Missing runtime MCP connection");
+  const token = server.headers!.Authorization.slice("Bearer ".length);
+  expect(manager.resolveMessageSender(token)).toEqual({ kind: "agent", agentId: snapshot.id });
+  expect(manager.resolveMessageSender()).toEqual({ kind: "human" });
+  expect(() => manager.resolveMessageSender("invalid")).toThrow("Invalid agent caller token");
+  expect(snapshot.config.mcpServers).toBeUndefined();
   rmSync(workdir, { recursive: true, force: true });
 });
 
@@ -3428,6 +3438,7 @@ test("keeps the global Paseo-tools gate outside provider policy and MCP injectio
   expect(enabledClient.lastConfig?.mcpServers?.paseo).toEqual({
     type: "http",
     url: `http://127.0.0.1:6767/mcp/agents?callerAgentId=${enabledAgent.id}`,
+    headers: { Authorization: expect.stringMatching(/^Bearer /) },
   });
 
   const disabledClient = new McpClient();
@@ -3497,6 +3508,7 @@ test("resumeAgentFromPersistence replaces stored internal paseo MCP with current
     paseo: {
       type: "http",
       url: `http://127.0.0.1:6768/mcp/agents?callerAgentId=${snapshot.id}`,
+      headers: { Authorization: expect.stringMatching(/^Bearer /) },
     },
     custom: {
       type: "stdio",
@@ -4188,6 +4200,7 @@ test("resumeAgentFromPersistence keeps metadata config, applies overrides, and p
     agentId: resumed.id,
     env: {
       PASEO_AGENT_ID: resumed.id,
+      PASEO_AGENT_TOKEN: expect.any(String),
       PASEO_AGENT_CWD: workdir,
     },
   });
@@ -4296,6 +4309,7 @@ test("importProviderSession imports the selected session without listing and pub
     agentId: imported.id,
     env: {
       PASEO_AGENT_ID: imported.id,
+      PASEO_AGENT_TOKEN: expect.any(String),
       PASEO_AGENT_CWD: workdir,
     },
   });
@@ -4399,6 +4413,7 @@ test("reloadAgentSession passes daemon launch env through the provider launch co
     agentId: snapshot.id,
     env: {
       PASEO_AGENT_ID: snapshot.id,
+      PASEO_AGENT_TOKEN: expect.any(String),
       PASEO_AGENT_CWD: workdir,
     },
   });
@@ -4411,6 +4426,7 @@ test("reloadAgentSession passes daemon launch env through the provider launch co
     agentId: snapshot.id,
     env: {
       PASEO_AGENT_ID: snapshot.id,
+      PASEO_AGENT_TOKEN: expect.any(String),
       PASEO_AGENT_CWD: workdir,
     },
   });
@@ -7826,13 +7842,13 @@ test("subscribe hides provider subagents of internal parents from global subscri
     }),
   );
   expect(() => manager.listProviderSubagents(internalAgentId)).toThrow(
-    `Unknown agent '${internalAgentId}'`,
+    `Agent ${internalAgentId} not found`,
   );
   expect(() => manager.getProviderSubagent(internalAgentId, "hidden-child")).toThrow(
-    `Unknown agent '${internalAgentId}'`,
+    `Agent ${internalAgentId} not found`,
   );
   expect(() => manager.fetchProviderSubagentTimeline(internalAgentId, "hidden-child")).toThrow(
-    `Unknown agent '${internalAgentId}'`,
+    `Agent ${internalAgentId} not found`,
   );
   expect(manager.listProviderSubagentActivity()).toEqual([]);
 });
@@ -10695,6 +10711,8 @@ test("authoritative timeline records a daemon-handled submitted prompt before it
         type: "user_message",
         text: "/handled",
         clientMessageId: "msg-client-daemon-handled",
+        messageId: "msg-client-daemon-handled",
+        sender: { kind: "human" },
       },
       { type: "assistant_message", text: "Handled by the daemon" },
     ]);
@@ -10705,6 +10723,8 @@ test("authoritative timeline records a daemon-handled submitted prompt before it
         type: "user_message",
         text: "/handled",
         clientMessageId: "msg-client-daemon-handled",
+        messageId: "msg-client-daemon-handled",
+        sender: { kind: "human" },
       },
       { type: "assistant_message", text: "Handled by the daemon" },
     ]);
@@ -11050,7 +11070,7 @@ test("listImportableSessions searches every provider result before global rankin
   ]);
 });
 
-test("user_message events wrapping a paseo-system envelope are not added to the timeline", async () => {
+test("user_message events retain a paseo-system envelope in the live timeline", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-envelope-live-"));
   const storagePath = join(workdir, "agents");
   const storage = new AgentStorage(storagePath, logger);
@@ -11081,11 +11101,13 @@ test("user_message events wrapping a paseo-system envelope are not added to the 
   const timeline = manager.getTimeline(snapshot.id);
   const userMessages = timeline.filter((item) => item.type === "user_message");
 
-  expect(userMessages).toHaveLength(1);
-  expect(userMessages[0].text).toBe("plain user message");
+  expect(userMessages.map((item) => item.text)).toEqual([
+    formatSystemNotificationPrompt("child finished"),
+    "plain user message",
+  ]);
 });
 
-test("user_message events wrapping a paseo-system envelope are not restored during history replay", async () => {
+test("history replay retains legacy paseo-system envelopes with unknown attribution", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-envelope-history-"));
   const storagePath = join(workdir, "agents");
   const storage = new AgentStorage(storagePath, logger);
@@ -11122,8 +11144,125 @@ test("user_message events wrapping a paseo-system envelope are not restored duri
   const timeline = manager.getTimeline(snapshot.id);
   const userMessages = timeline.filter((item) => item.type === "user_message");
 
-  expect(userMessages).toHaveLength(1);
-  expect(userMessages[0].text).toBe("real user message");
+  expect(userMessages).toEqual([
+    {
+      type: "user_message",
+      text: formatSystemNotificationPrompt("schedule fired"),
+      messageId: "msg_history_envelope",
+    },
+    { type: "user_message", text: "real user message", messageId: "msg_history_real" },
+  ]);
+});
+
+test("attributed tagged submissions retain identity through native hydration and pagination", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-attribution-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const text = formatSystemNotificationPrompt("  A report\n\nFull text  ");
+  const sender = { kind: "agent", agentId: "caller", title: "Reviewer" } as const;
+  const codex = fakeCodexEmitting({
+    turnItems: [
+      { type: "user_message", text, clientMessageId: "client-report", messageId: "native-report" },
+    ],
+    historyItems: [
+      { type: "user_message", text: "provider normalized report", messageId: "native-report" },
+      { type: "assistant_message", text: "reply", messageId: "native-reply" },
+    ],
+  });
+  const manager = new AgentManager({ clients: { codex }, registry: storage, logger });
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.runAgent(agent.id, text, { clientMessageId: "client-report", sender });
+    const submitted = manager.getTimeline(agent.id)[0];
+    expect(submitted).toEqual({
+      type: "user_message",
+      text,
+      messageId: "client-report",
+      clientMessageId: "client-report",
+      sender,
+    });
+    await manager.flush();
+    expect(
+      (await new AgentStorage(join(workdir, "agents"), logger).get(agent.id))
+        ?.submittedMessages?.[0],
+    ).toMatchObject({ item: submitted, providerMessageId: "native-report" });
+    await manager.hydrateTimelineFromProvider(agent.id, { force: true });
+    await manager.hydrateTimelineFromProvider(agent.id, { force: true });
+    expect(manager.getTimeline(agent.id)).toEqual([
+      submitted,
+      { type: "assistant_message", text: "reply", messageId: "native-reply" },
+    ]);
+    const tail = manager.fetchTimeline(agent.id, { direction: "tail", limit: 1 });
+    const older = manager.fetchTimeline(agent.id, {
+      direction: "before",
+      cursor: { epoch: tail.epoch, seq: tail.startSeq! },
+      limit: 1,
+    });
+    expect(older.rows.map((row) => row.item)).toEqual([submitted]);
+    expect(older.rows[0]?.providerMessageId).toBe("native-report");
+  } finally {
+    await manager.closeAgentsForShutdown();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("native replay preserves two identical submissions and inserts a missing report at its anchor", () => {
+  const text = formatSystemNotificationPrompt("Repeated report");
+  const messages: SubmittedMessage[] = [
+    {
+      item: {
+        type: "user_message",
+        text,
+        messageId: "one",
+        clientMessageId: "one",
+        sender: { kind: "agent", agentId: "reviewer" },
+      },
+      timestamp: "2026-10-05T00:00:00Z",
+      providerMessageId: "native-one",
+    },
+    {
+      item: {
+        type: "user_message",
+        text,
+        messageId: "two",
+        clientMessageId: "two",
+        sender: { kind: "system", source: "Schedule" },
+      },
+      timestamp: "2026-10-05T00:00:01Z",
+      afterMessageId: "native-reply",
+    },
+  ];
+  const history: Extract<AgentStreamEvent, { type: "timeline" }>[] = [
+    {
+      type: "timeline",
+      provider: "codex",
+      item: { type: "user_message", text, messageId: "native-one" },
+    },
+    {
+      type: "timeline",
+      provider: "codex",
+      item: { type: "user_message", text, messageId: "native-one" },
+    },
+    {
+      type: "timeline",
+      provider: "codex",
+      item: { type: "assistant_message", text: "reply", messageId: "native-reply" },
+    },
+    {
+      type: "timeline",
+      provider: "codex",
+      item: { type: "user_message", text: "external human", messageId: "external" },
+    },
+  ];
+  const restored = reconcileSubmittedHistory(history, messages, "codex");
+  expect(restored.map((event) => event.item)).toEqual([
+    messages[0]!.item,
+    history[2]!.item,
+    messages[1]!.item,
+    history[3]!.item,
+  ]);
+  expect(reconcileSubmittedHistory(restored, messages, "codex")).toEqual(restored);
 });
 
 test("commandMayHaveChangedExternalState matches remote-state commands", () => {

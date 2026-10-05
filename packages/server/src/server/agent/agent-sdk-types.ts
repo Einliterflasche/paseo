@@ -1,3 +1,4 @@
+import type { AgentMessageSender } from "@getpaseo/protocol/agent-message";
 import type {
   AgentFeature,
   AgentFeatureSelect,
@@ -200,6 +201,8 @@ export interface AgentRunOptions {
   resumeFrom?: AgentPersistenceHandle;
   maxThinkingTokens?: number;
   clientMessageId?: string;
+  /** Daemon-owned attribution. Never changes the provider instruction role. */
+  sender?: AgentMessageSender;
 }
 
 export interface AgentSteerOptions extends AgentRunOptions {
@@ -388,7 +391,13 @@ export interface PluginTimelineItem {
 }
 
 export type AgentTimelineItem =
-  | { type: "user_message"; text: string; messageId?: string; clientMessageId?: string }
+  | {
+      type: "user_message";
+      text: string;
+      messageId?: string;
+      clientMessageId?: string;
+      sender?: AgentMessageSender;
+    }
   | { type: "assistant_message"; text: string; messageId?: string }
   | { type: "reasoning"; text: string }
   | ToolCallTimelineItem

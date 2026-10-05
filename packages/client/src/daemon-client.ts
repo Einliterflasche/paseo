@@ -438,6 +438,7 @@ export interface DaemonClientTrace {
 }
 
 export interface SendMessageOptions {
+  callerToken?: string;
   messageId?: string;
   /** What happens when the agent is mid-turn. The daemon interrupts the turn when omitted. */
   activeTurnBehavior?: ActiveTurnBehavior;
@@ -464,6 +465,7 @@ export interface CreateAgentRequestOptions extends AgentConfigOverrides {
   env?: CreateAgentRequestMessage["env"];
   workspaceId?: string;
   callerAgentId?: string;
+  callerToken?: string;
   initialPrompt?: string;
   idempotencyKey?: string;
   clientMessageId?: string;
@@ -2977,6 +2979,7 @@ export class DaemonClient {
       ...(options.env ? { env: options.env } : {}),
       ...(options.workspaceId !== undefined ? { workspaceId: options.workspaceId } : {}),
       ...(options.callerAgentId !== undefined ? { callerAgentId: options.callerAgentId } : {}),
+      ...(options.callerToken !== undefined ? { callerToken: options.callerToken } : {}),
       ...(options.initialPrompt ? { initialPrompt: options.initialPrompt } : {}),
       idempotencyKey: options.idempotencyKey,
       ...(options.clientMessageId ? { clientMessageId: options.clientMessageId } : {}),
@@ -3632,6 +3635,7 @@ export class DaemonClient {
     // retried request's fingerprint or attachment bytes under the same identity.
     const prepared = SessionInboundMessageSchema.parse({
       type: "send_agent_message_request",
+      callerToken: options?.callerToken,
       requestId,
       agentId,
       text,
@@ -7237,6 +7241,7 @@ function resolveAgentConfig(options: CreateAgentRequestOptions): AgentSessionCon
     idempotencyKey: _idempotencyKey,
     clientMessageId: _clientMessageId,
     callerAgentId: _callerAgentId,
+    callerToken: _callerToken,
     outputSchema: _outputSchema,
     attachments: _attachments,
     worktree: _worktree,

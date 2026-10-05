@@ -1,3 +1,4 @@
+import type { AgentMessageSender } from "@getpaseo/protocol/agent-message";
 import type {
   AgentProvider,
   AgentTimelineItem,
@@ -90,6 +91,7 @@ export type StreamItem =
 export type UserMessageImageAttachment = AttachmentMetadata;
 
 export interface UserMessageItem {
+  sender?: AgentMessageSender;
   kind: "user_message";
   id: string;
   clientMessageId?: string;
@@ -103,6 +105,7 @@ export interface UserMessageItem {
 }
 
 export interface UserMessageInput {
+  sender?: AgentMessageSender;
   id?: string;
   clientMessageId?: string;
   messageId?: string;
@@ -121,6 +124,7 @@ export function createUserMessage(input: UserMessageInput): UserMessageItem {
   }
   return {
     kind: "user_message",
+    ...(input.sender ? { sender: input.sender } : {}),
     id,
     ...(input.clientMessageId ? { clientMessageId: input.clientMessageId } : {}),
     ...(input.messageId ? { messageId: input.messageId } : {}),
@@ -259,12 +263,14 @@ function produceUserMessage(
     ...presentation,
     clientMessageId: incoming.clientMessageId ?? existing.clientMessageId,
     messageId: incoming.messageId ?? existing.messageId,
+    sender: incoming.sender ?? existing.sender,
     timelineCursor: incoming.timelineCursor ?? existing.timelineCursor,
   });
   if (
     existing.id === merged.id &&
     existing.clientMessageId === merged.clientMessageId &&
     existing.messageId === merged.messageId &&
+    existing.sender === merged.sender &&
     existing.timelineCursor === merged.timelineCursor &&
     existing.text === merged.text &&
     existing.timestamp === merged.timestamp &&
@@ -890,8 +896,10 @@ function appendUserMessage(
   clientMessageId?: string,
   timelineCursor?: TimelinePosition,
   turnId?: string,
+  sender?: AgentMessageSender,
 ): StreamItem[] {
-  const { chunk, hasContent } = normalizeChunk(text);
+  const chunk = text;
+  const hasContent = /\S/.test(text);
   if (!hasContent) {
     return state;
   }
@@ -899,6 +907,7 @@ function appendUserMessage(
   const chunkSeed = chunk.trim() || chunk;
   const nextItem = createUserMessage({
     id: messageId ?? createUniqueTimelineId(state, "user", chunkSeed, timestamp),
+    sender,
     clientMessageId,
     messageId,
     timelineCursor,
@@ -1512,6 +1521,7 @@ function reduceTimelineEvent(
           item.clientMessageId,
           timelineCursor,
           event.turnId,
+          item.sender,
         ),
       );
     case "assistant_message":
@@ -1871,7 +1881,7 @@ function applyCanonicalUserMessageEvent(params: {
 }): ApplyStreamEventResult | null {
   const { tail, head, event, timestamp, timelineCursor, unmatchedInsert = "tail" } = params;
   if (event.type !== "timeline" || event.item.type !== "user_message") return null;
-  const normalized = normalizeChunk(event.item.text);
+  const normalized = { chunk: event.item.text, hasContent: /\S/.test(event.item.text) };
 
   const flushedTail = head.length > 0 ? flushHeadToTail(tail, head) : tail;
   const flushedHead = head.length > 0 ? [] : head;
@@ -1880,6 +1890,7 @@ function applyCanonicalUserMessageEvent(params: {
       event.item.messageId ??
       createUniqueTimelineId([...tail, ...head], "user", normalized.chunk.trim(), timestamp),
     messageId: event.item.messageId,
+    sender: event.item.sender,
     clientMessageId: event.item.clientMessageId,
     turnId: event.turnId,
     timelineCursor,

@@ -153,8 +153,15 @@ test("two real process replacements preserve the prefix and never duplicate or r
   expect(thirdSaved.agents.timelines[active.id].rows.slice(0, prefix.rows.length)).toEqual(
     prefix.rows,
   );
-  expect(timeline.entries.filter((row) => row.item.type === "user_message")).toHaveLength(1);
-  expect(JSON.stringify(timeline.entries)).not.toContain("<paseo-system>");
+  expect(timeline.entries.filter((row) => row.item.type === "user_message")).toHaveLength(2);
+  expect(
+    timeline.entries.find(
+      (row) => row.item.type === "user_message" && row.item.sender?.kind === "system",
+    )?.item,
+  ).toMatchObject({
+    sender: { kind: "system", source: "Restart recovery" },
+    text: expect.stringContaining("<paseo-system>"),
+  });
   expect(await dispatches(home)).toEqual(calls);
 }, 30_000);
 

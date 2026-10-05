@@ -1959,6 +1959,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         agentStorage,
         agentId,
         prompt,
+        sender: agentManager.messageSenderForCaller(callerAgentId),
         sessionMode,
         logger: childLogger,
         ...(notifyOnFinish && callerAgentId ? { finishNotification: { callerAgentId } } : {}),

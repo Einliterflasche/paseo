@@ -360,6 +360,7 @@ import { isHostnameAllowed, type HostnamesConfig } from "./hostnames.js";
 import {
   createRequireBearerMiddleware,
   isAgentMcpRequestAuthorized,
+  extractHttpBearerToken,
   type DaemonAuthConfig,
 } from "./auth.js";
 import { deleteLocalCredential, writeLocalCredential } from "./local-credential.js";
@@ -1741,11 +1742,16 @@ export async function createPaseoDaemon(
         res.status(404).json({ error: "Agent MCP endpoint disabled" });
         return;
       }
+      const suppliedToken = extractHttpBearerToken(req.header("authorization"));
+      const authenticatedCaller = suppliedToken
+        ? agentManager.resolveCallerToken(suppliedToken)
+        : null;
       // This route is exempt from the global daemon-password middleware, so it
       // authenticates here using the injected capability token (or a valid
       // daemon password). Without this, a password-protected daemon would be
       // wide open on its agent control plane.
       if (
+        !authenticatedCaller &&
         !(await isAgentMcpRequestAuthorized({
           password: config.auth?.password,
           capabilityToken: agentMcpAuthToken,
@@ -1782,13 +1788,12 @@ export async function createPaseoDaemon(
           });
           return;
         }
-        const callerAgentIdRaw = req.query.callerAgentId;
-        let callerAgentId: string | undefined;
-        if (typeof callerAgentIdRaw === "string") {
-          callerAgentId = callerAgentIdRaw;
-        } else if (Array.isArray(callerAgentIdRaw) && typeof callerAgentIdRaw[0] === "string") {
-          callerAgentId = callerAgentIdRaw[0];
+        const requestedCaller = req.query.callerAgentId;
+        if (requestedCaller !== undefined && requestedCaller !== authenticatedCaller) {
+          res.status(403).json({ error: "Caller identity does not match the agent token" });
+          return;
         }
+        const callerAgentId = authenticatedCaller ?? undefined;
         const handler = await createAgentMcpSession(callerAgentId);
         try {
           await toNodeHandler(handler, {

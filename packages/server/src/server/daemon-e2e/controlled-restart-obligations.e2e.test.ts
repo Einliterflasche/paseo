@@ -69,8 +69,23 @@ test("a restored child notifies its parent once, without reporting restart suspe
     limit: 0,
     projection: "canonical",
   });
-  expect(timeline.entries.filter((entry) => entry.item.type === "user_message")).toHaveLength(1);
-  expect(JSON.stringify(timeline.entries)).not.toContain("<paseo-system>");
+  const requests = timeline.entries.filter((entry) => entry.item.type === "user_message");
+  expect(requests.map((entry) => entry.item.sender)).toEqual([
+    { kind: "human" },
+    { kind: "system", source: "Restart recovery" },
+    { kind: "system", source: "Completion report" },
+  ]);
+  expect(
+    timeline.entries.find(
+      (row) =>
+        row.item.type === "user_message" &&
+        row.item.sender?.kind === "system" &&
+        row.item.sender.source === "Completion report",
+    )?.item,
+  ).toMatchObject({
+    sender: { kind: "system", source: "Completion report" },
+    text: expect.stringContaining("<paseo-system>"),
+  });
 
   // A completed obligation must not reappear in the next checkpoint or boot.
   await restored.client.prepareRestart();

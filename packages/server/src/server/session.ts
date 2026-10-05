@@ -4390,6 +4390,13 @@ export class Session {
     let createdWorktreeForCleanup: CreatePaseoWorktreeWorkflowResult | null = null;
     let createdAgentId: string | null = null;
     try {
+      const sender = this.agentManager.resolveMessageSender(msg.callerToken);
+      if (sender.kind === "agent") {
+        if (msg.callerAgentId && msg.callerAgentId !== sender.agentId) {
+          throw new Error("Caller identity does not match the agent token");
+        }
+        msg = { ...msg, callerAgentId: sender.agentId };
+      }
       const requestedCwd = resolve(config.cwd);
       const needsRequestedDirectory =
         Boolean(worktreeName || git || worktree) || (!msg.workspaceId && !msg.callerAgentId);
@@ -4435,6 +4442,7 @@ export class Session {
         },
         {
           kind: "session",
+          sender,
           onAgentReady: async (agent) => {
             createdAgentId = agent.id;
             await onAgentReady?.(await this.buildAgentPayload(agent));
@@ -8314,10 +8322,12 @@ export class Session {
       const agentId = resolved.agentId;
 
       const prompt = buildAgentPrompt(msg.text, msg.images, msg.attachments);
+      const sender = this.agentManager.resolveMessageSender(msg.callerToken);
       this.sessionLogger.trace(
         {
           agentId,
           messageId: msg.messageId,
+          sender,
           activeTurnBehavior: msg.activeTurnBehavior,
           textPrefix: msg.text.slice(0, 80),
         },
@@ -8329,6 +8339,7 @@ export class Session {
           agentStorage: this.agentStorage,
           agentId,
           prompt,
+          sender,
           messageId: msg.messageId,
           activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",
           clearPendingPermissions: true,
@@ -8346,7 +8357,13 @@ export class Session {
         await this.messageReceipts.send({
           agentId,
           messageId: msg.messageId,
-          request: { prompt, activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt" },
+          request: {
+            prompt,
+            ...(sender.kind === "agent"
+              ? { sender: { kind: sender.kind, agentId: sender.agentId } }
+              : {}),
+            activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",
+          },
           prepare: async () => {
             await this.prepareAgentMessage(agentId, msg.text);
           },

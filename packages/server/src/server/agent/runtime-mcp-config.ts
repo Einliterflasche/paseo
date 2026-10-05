@@ -1,7 +1,24 @@
+import { createHmac, timingSafeEqual } from "node:crypto";
 import type { AgentSessionConfig, McpServerConfig } from "./agent-sdk-types.js";
 
 const PASEO_MCP_SERVER_NAME = "paseo";
 const PASEO_MCP_PATHNAME = "/mcp/agents";
+
+export function agentCallerToken(agentId: string, secret: string): string {
+  const identity = Buffer.from(agentId).toString("base64url");
+  const signature = createHmac("sha256", secret).update(identity).digest("base64url");
+  return `${identity}.${signature}`;
+}
+
+export function resolveAgentCallerToken(token: string, secret: string): string | null {
+  const parts = token.split(".");
+  if (parts.length !== 2) return null;
+  const [identity, signature] = parts;
+  const expected = createHmac("sha256", secret).update(identity).digest();
+  const provided = Buffer.from(signature, "base64url");
+  if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) return null;
+  return Buffer.from(identity, "base64url").toString();
+}
 
 export function stripInternalPaseoMcpServer(config: AgentSessionConfig): AgentSessionConfig {
   const mcpServers = config.mcpServers;

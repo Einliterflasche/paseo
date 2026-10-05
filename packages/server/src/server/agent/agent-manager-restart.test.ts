@@ -296,7 +296,7 @@ test("failed durable completion keeps admissions closed after restoring history"
   expect((await after.quiesceForRestart()).timelines).toEqual(saved.timelines);
 });
 
-test("restart preserves late output and user identity without native overwrite or visible continuation", async () => {
+test("restart preserves late output and user identity without native overwrite and records the attributed continuation", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-manager-restart-"));
   const before = await manager(home);
   const agent = await before.createAgent(
@@ -304,7 +304,11 @@ test("restart preserves late output and user identity without native overwrite o
     "54d45fd1-71f4-4c51-8206-7e90bbf6244a",
     { workspaceId: "workspace" },
   );
-  const run = before.streamAgent(agent.id, "keep this request", { clientMessageId: "user-1" });
+  const sender = { kind: "agent", agentId: "reviewer", title: "Reviewer" } as const;
+  const run = before.streamAgent(agent.id, "keep this request", {
+    clientMessageId: "user-1",
+    sender,
+  });
   await run.next();
   const saved = await before.quiesceForRestart();
   expect(saved.agents.map((entry) => [entry.record.id, entry.continue])).toEqual([
@@ -338,9 +342,17 @@ test("restart preserves late output and user identity without native overwrite o
     saved.timelines[agent.id]!.rows,
   );
   expect(again.timelines[agent.id]!.epoch).toBe(saved.timelines[agent.id]!.epoch);
-  expect(rows.filter((row) => row.item.type === "user_message")).toHaveLength(1);
+  expect(rows.filter((row) => row.item.type === "user_message")).toHaveLength(2);
+  const recovery = rows.find(
+    (row) => row.item.type === "user_message" && row.item.sender?.kind === "system",
+  );
+  expect(recovery?.item).toMatchObject({
+    sender: { kind: "system", source: "Restart recovery" },
+    text: expect.stringContaining("<paseo-system>"),
+  });
+  expect(rows[0]?.item).toMatchObject({ sender, clientMessageId: "user-1" });
   expect(JSON.stringify(rows)).not.toContain("must not enter");
-  expect(JSON.stringify(rows)).not.toContain("<paseo-system>");
+
   expect(again.agents[0]!.continue).toBe(false);
 });
 
@@ -464,9 +476,9 @@ test("restart retains the active input and every accepted steer in order without
   await after.installRestartCheckpoint(snapshot);
   await after.resumeRestartCheckpoint(snapshot);
   const again = await after.quiesceForRestart();
-  const users = again.timelines[agent.id]!.rows.flatMap((row) =>
-    row.item.type === "user_message" ? [row.item] : [],
-  );
+  const users = again.timelines[agent.id]!.rows.filter(
+    (row) => row.item.type !== "user_message" || row.item.sender?.kind !== "system",
+  ).flatMap((row) => (row.item.type === "user_message" ? [row.item] : []));
   expect(users.map((row) => row.clientMessageId)).toEqual([
     "original",
     "steer-first",
@@ -550,7 +562,9 @@ test("an active restoration's failed completion closes capture before pause and 
     current.timelines[agent.id]!.rows.slice(0, saved.timelines[agent.id]!.rows.length),
   ).toEqual(saved.timelines[agent.id]!.rows);
   expect(
-    current.timelines[agent.id]!.rows.filter((row) => row.item.type === "user_message"),
+    current.timelines[agent.id]!.rows.filter(
+      (row) => row.item.type === "user_message" && row.item.sender?.kind !== "system",
+    ),
   ).toHaveLength(1);
   expect(
     (await after.getCanonicalTimelineRows(agent.id))
@@ -621,7 +635,9 @@ test("a later continuation failure preserves every agent and does not retain amb
     resumed.timelines[ids[0]!]!.rows.slice(0, current.timelines[ids[0]!]!.rows.length),
   ).toEqual(current.timelines[ids[0]!]!.rows);
   expect(
-    resumed.timelines[ids[1]!]!.rows.filter((row) => row.item.type === "user_message"),
+    resumed.timelines[ids[1]!]!.rows.filter(
+      (row) => row.item.type === "user_message" && row.item.sender?.kind !== "system",
+    ),
   ).toHaveLength(1);
 });
 
@@ -687,9 +703,11 @@ test.each(["before rejection", "during close"] as const)(
     expect(
       current.timelines[agent.id]!.rows.slice(0, saved.timelines[agent.id]!.rows.length),
     ).toEqual(saved.timelines[agent.id]!.rows);
-    expect(after.getTimeline(agent.id).filter((item) => item.type === "user_message")).toHaveLength(
-      1,
-    );
+    expect(
+      after
+        .getTimeline(agent.id)
+        .filter((item) => item.type === "user_message" && item.sender?.kind !== "system"),
+    ).toHaveLength(1);
     expect(
       (await after.getCanonicalTimelineRows(agent.id))
         .map((row) => row.item)
@@ -1258,9 +1276,11 @@ test("recovery drains a cancellation accepted during marker publication and reti
     type: "user_canceled",
     runId: "marker-original",
   });
-  expect(after.getTimeline(agent.id).filter((item) => item.type === "user_message")).toHaveLength(
-    1,
-  );
+  expect(
+    after
+      .getTimeline(agent.id)
+      .filter((item) => item.type === "user_message" && item.sender?.kind !== "system"),
+  ).toHaveLength(1);
   expect(
     (await after.getCanonicalTimelineRows(agent.id))
       .map((row) => row.item)
@@ -1317,12 +1337,14 @@ test("checkpoint and ordinary reload resume with native replay fenced until an e
       saved.timelines[agent.id]!.rows.length,
     ),
   ).toEqual(saved.timelines[agent.id]!.rows);
+  const submitted = after.getTimeline(agent.id).filter((item) => item.type === "user_message");
   await after.reloadAgentSession(agent.id, undefined, { rehydrateFromDisk: true });
   expect(options[2]?.replayHistory).not.toBe(false);
   await after.hydrateTimelineFromProvider(agent.id);
   expect(historyReads).toBe(1);
   expect(after.getTimeline(agent.id)).toEqual([
     { type: "assistant_message", text: "explicit native history" },
+    ...submitted,
   ]);
   await after.closeAgentsForShutdown();
 });

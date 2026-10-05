@@ -20,8 +20,52 @@ import type { AgentProvider, ToolCallDetail } from "@getpaseo/protocol/agent-typ
 import type { AgentStreamEventPayload } from "@getpaseo/protocol/messages";
 import { buildToolCallDisplayModel } from "@getpaseo/protocol/tool-call-display";
 import { timelineItemIdentity } from "@getpaseo/protocol/timeline-identity";
+import { messageSenderLabel, systemMessageLabel } from "../agent-stream/system-message-label";
 
 type CanonicalToolStatus = "running" | "completed" | "failed" | "canceled";
+
+it("labels tagged messages using recorded senders and meaningful content", () => {
+  const text = "<paseo-system>\n\n  Review complete  \n\nFull report\n</paseo-system>";
+  expect(systemMessageLabel(text)).toBe("Review complete");
+  expect(messageSenderLabel()).toBe("Unknown sender");
+  expect(messageSenderLabel({ kind: "human" })).toBe("You");
+  const sender = {
+    kind: "agent",
+    agentId: "12345678-1234-1234-1234-123456789abc",
+    title: "Reviewer",
+  } as const;
+  expect(messageSenderLabel(sender)).toBe("Reviewer (12345678)");
+  expect(systemMessageLabel(text, sender)).toBe("Review complete");
+  const system = { kind: "system", source: "Completion report" } as const;
+  expect(messageSenderLabel(system)).toBe("Paseo");
+  expect(systemMessageLabel(text, system)).toBe("Completion report");
+});
+
+it("retains tagged text and attribution across live echoes and history hydration", () => {
+  const text = "<paseo-system>\n  A report\n\nDetails  \n</paseo-system>";
+  const sender = { kind: "agent", agentId: "reviewer", title: "Reviewer" } as const;
+  const event: AgentStreamEventPayload = {
+    type: "timeline",
+    provider: "codex",
+    item: { type: "user_message", text, messageId: "report", clientMessageId: "report", sender },
+  };
+  const first = reduceStreamUpdate([], event, new Date(1));
+  const echoed = reduceStreamUpdate(first, event, new Date(2));
+  expect(echoed).toEqual(first);
+  expect(first).toMatchObject([{ kind: "user_message", text, sender, messageId: "report" }]);
+  const second = {
+    ...event,
+    item: { ...event.item, messageId: "report-two", clientMessageId: "report-two" },
+  };
+  const live = reduceStreamUpdate(first, second, new Date(2));
+  expect(live.map((item) => item.id)).toEqual(["report", "report-two"]);
+  expect(
+    hydrateStreamState([
+      { event, timestamp: new Date(1) },
+      { event: second, timestamp: new Date(2) },
+    ]),
+  ).toEqual(live);
+});
 
 it("updates a resolved Claude plan at its proposal position across a follow-up", () => {
   const proposal = {

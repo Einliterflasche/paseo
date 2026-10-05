@@ -1,3 +1,5 @@
+import { isSystemInjectedEnvelope } from "@getpaseo/protocol/agent-message";
+import { SystemMessage } from "./system-message";
 import { ChatFind, ChatFindExpansion } from "@/agent-stream/chat-find";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import React, {
@@ -697,12 +699,16 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
 
     const renderUserMessageItem = useCallback(
       (layoutItem: StreamLayoutItem, item: Extract<StreamItem, { kind: "user_message" }>) => {
+        if (isSystemInjectedEnvelope(item.text)) {
+          return <SystemMessage key={item.id} message={item.text} sender={item.sender} />;
+        }
         return (
           <UserMessage
             serverId={resolvedServerId}
             agentId={agentId}
             messageId={item.messageId}
             message={item.text}
+            sender={item.sender}
             images={item.images}
             attachments={item.attachments}
             timestamp={item.timestamp.getTime()}

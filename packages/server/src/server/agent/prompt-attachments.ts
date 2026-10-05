@@ -9,11 +9,10 @@ export function buildAgentPrompt(
   images?: Array<{ data: string; mimeType: string }>,
   attachments?: AgentAttachment[],
 ): AgentPromptInput {
-  const normalized = text.trim();
   const hasImages = (images?.length ?? 0) > 0;
   const hasAttachments = (attachments?.length ?? 0) > 0;
   if (!hasImages && !hasAttachments) {
-    return normalized;
+    return text;
   }
 
   const chatHistoryAttachments: AgentAttachment[] = [];
@@ -27,8 +26,8 @@ export function buildAgentPrompt(
   }
 
   const blocks: AgentPromptContentBlock[] = [...chatHistoryAttachments];
-  if (normalized.length > 0) {
-    blocks.push({ type: "text", text: normalized });
+  if (text.trim().length > 0) {
+    blocks.push({ type: "text", text });
   }
   for (const image of images ?? []) {
     blocks.push({ type: "image", data: image.data, mimeType: image.mimeType });

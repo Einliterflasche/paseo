@@ -92,6 +92,17 @@ test("the original scheduled run survives two active restarts and completes once
     output: "partial-outputlate-close-outputcontinued-outputcontinued-output",
   });
   const savedAgent = await third.instance.daemon.agentStorage.get(agent.id);
+  const timeline = await third.client.fetchAgentTimeline(agent.id, { direction: "tail", limit: 0 });
+  const messages = timeline.entries.flatMap((row) =>
+    row.item.type === "user_message" ? [row.item] : [],
+  );
+  expect(messages.map((item) => item.sender)).toEqual([
+    { kind: "system", source: "Schedule" },
+    { kind: "system", source: "Restart recovery" },
+    { kind: "system", source: "Restart recovery" },
+  ]);
+  expect(messages[0]?.clientMessageId).toBe(original.id);
+  expect(messages.every((item) => item.text.startsWith("<paseo-system>\n"))).toBe(true);
   expect(savedAgent).not.toBeNull();
   expect(savedAgent?.archivedAt).toBeFalsy();
   const calls: Array<{ sessionId: string; resumed: boolean }> = (await readFile(log, "utf8"))

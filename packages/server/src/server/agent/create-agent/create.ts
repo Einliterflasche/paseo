@@ -1,3 +1,4 @@
+import type { AgentMessageSender } from "@getpaseo/protocol/agent-message";
 import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 
@@ -60,6 +61,7 @@ export type EnsureWorkspaceForCreate = (
 
 export interface CreateAgentFromSessionInput {
   kind: "session";
+  sender?: AgentMessageSender;
   onAgentReady?: (agent: ManagedAgent) => Promise<void>;
   agentId?: string;
   config: AgentSessionConfig;
@@ -282,7 +284,7 @@ async function resolveSessionCreateAgent(
     modeId: resolvedCreateConfig.modeId,
     featureValues: resolvedCreateConfig.featureValues,
   };
-  const prompt = buildAgentPrompt(trimmedPrompt ?? "", input.images, input.attachments);
+  const prompt = buildAgentPrompt(input.initialPrompt ?? "", input.images, input.attachments);
   const hasPromptContent = Array.isArray(prompt) ? prompt.length > 0 : prompt.length > 0;
   const clientMessageId = normalizeClientMessageId(input.clientMessageId);
   const runOptions: AgentRunOptions | undefined =
@@ -307,7 +309,7 @@ async function resolveSessionCreateAgent(
       workspaceId: requireResolvedWorkspaceId(workspaceId),
     },
     prompt: hasPromptContent ? prompt : undefined,
-    runOptions,
+    runOptions: { ...runOptions, sender: input.sender ?? { kind: "human" } },
     setupContinuation,
     background: true,
     promptFailure: "throw",
@@ -377,7 +379,8 @@ async function resolveMcpCreateAgent(
       owner: input.owner,
       env: input.env,
     },
-    prompt: trimmedPrompt ? trimmedPrompt : undefined,
+    prompt: trimmedPrompt ? input.initialPrompt : undefined,
+    runOptions: { sender: dependencies.agentManager.messageSenderForCaller(input.callerAgentId) },
     setupContinuation,
     createdWorktree,
     background: input.background,

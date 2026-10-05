@@ -1,3 +1,4 @@
+import { SubmittedMessageSchema, type SubmittedMessage } from "./submitted-messages.js";
 import { promises as fs, type Dirent } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
@@ -44,6 +45,7 @@ const PERSISTENCE_HANDLE_SCHEMA = z
 
 const STORED_AGENT_SCHEMA = z.object({
   id: z.string(),
+  submittedMessages: z.array(SubmittedMessageSchema).optional(),
   provider: z.string(),
   cwd: z.string(),
   workspaceId: z.string().optional(),
@@ -239,7 +241,7 @@ export class AgentStorage {
 
   async applySnapshot(
     agent: ManagedAgent,
-    options?: { title?: string | null; internal?: boolean },
+    options?: { title?: string | null; internal?: boolean; submittedMessages?: SubmittedMessage[] },
   ): Promise<void> {
     await this.load();
     const hasTitleOverride =
@@ -252,6 +254,8 @@ export class AgentStorage {
         createdAt: existing?.createdAt,
         internal: hasInternalOverride ? options?.internal : (agent.internal ?? existing?.internal),
       });
+
+      record.submittedMessages = options?.submittedMessages ?? existing?.submittedMessages;
 
       // Preserve soft-delete/archive status across snapshot flushes. The
       // projection runs inside the per-agent write queue so it cannot commit a

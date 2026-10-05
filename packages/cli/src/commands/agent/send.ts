@@ -192,7 +192,10 @@ export async function runSendCommand(
       options.image && options.image.length > 0 ? await readImageFiles(options.image) : undefined;
 
     // Send the message
-    await client.sendAgentMessage(agentIdArg, promptInput, { images });
+    await client.sendAgentMessage(agentIdArg, promptInput, {
+      images,
+      callerToken: process.env.PASEO_AGENT_TOKEN,
+    });
 
     // If --no-wait, return immediately
     if (options.wait === false) {

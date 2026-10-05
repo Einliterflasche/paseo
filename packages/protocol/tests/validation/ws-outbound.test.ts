@@ -63,6 +63,37 @@ async function compileInlineSchema(sourceSchema: string): Promise<GeneratedSchem
 
 describe("WS outbound zod-aot validation", () => {
   it.each([
+    undefined,
+    { kind: "human" },
+    { kind: "agent", agentId: "reviewer", title: "Reviewer" },
+    { kind: "system", source: "Schedule" },
+  ])("accepts optional sender metadata in the generated timeline validator: %j", (sender) => {
+    const envelope = {
+      type: "session",
+      message: {
+        type: "agent_stream",
+        payload: {
+          agentId: "agent-1",
+          timestamp: "2026-10-05T00:00:00Z",
+          event: {
+            type: "timeline",
+            provider: "codex",
+            item: {
+              type: "user_message",
+              text: "<paseo-system>\nReport\n</paseo-system>",
+              messageId: "report",
+              ...(sender ? { sender } : {}),
+            },
+          },
+        },
+      },
+    };
+    expect(GeneratedWSOutboundMessageSchema.safeParse(envelope)).toEqual({
+      success: true,
+      data: envelope,
+    });
+  });
+  it.each([
     {
       type: "service.preview.prepare.response",
       result: {

@@ -256,6 +256,43 @@ function deleteDirectory(cache: ReplicaCache, serverId: string): void {
 }
 
 describe("ReplicaCache", () => {
+  it("round-trips tagged rows, sender identity, text, and order", async () => {
+    const storage = new MemoryStorage();
+    const writer = createCache(storage);
+    const items: StreamItem[] = [
+      {
+        kind: "user_message",
+        id: "report-one",
+        messageId: "report-one",
+        clientMessageId: "report-one",
+        text: "<paseo-system>\n  Full report\n\nDetails  \n</paseo-system>",
+        sender: { kind: "agent", agentId: "reviewer", title: "Reviewer" },
+        timestamp: new Date(1),
+        timelineCursor: { epoch: "epoch-1", seq: 1 },
+      },
+      {
+        kind: "user_message",
+        id: "report-two",
+        messageId: "report-two",
+        clientMessageId: "report-two",
+        text: "<paseo-system>\nSchedule fired\n</paseo-system>",
+        sender: { kind: "system", source: "Schedule" },
+        timestamp: new Date(2),
+        timelineCursor: { epoch: "epoch-1", seq: 2 },
+      },
+      {
+        kind: "user_message",
+        id: "legacy",
+        text: "<paseo-system>\nLegacy report\n</paseo-system>",
+        timestamp: new Date(3),
+        timelineCursor: { epoch: "epoch-1", seq: 3 },
+      },
+    ];
+    const original = { ...timeline(), items, range: { epoch: "epoch-1", startSeq: 1, endSeq: 3 } };
+    writer.commitTimeline(SERVER_ID, "agent-1", original);
+    await writer.flush();
+    expect(await createCache(storage).readTimeline(SERVER_ID, "agent-1")).toEqual(original);
+  });
   it("rejects pre-baseline-fix checkpoints without discarding cached rows or timelines", async () => {
     const storage = new MemoryStorage();
     const writer = createCache(storage);

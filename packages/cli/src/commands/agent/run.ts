@@ -697,6 +697,7 @@ export async function runRunCommand(
       cwd: runCwd,
       workspaceId,
       callerAgentId,
+      callerToken: callerAgentId ? process.env.PASEO_AGENT_TOKEN : undefined,
       title: resolvedTitle,
       modeId: options.mode,
       model: resolvedProviderModel.model,

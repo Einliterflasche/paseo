@@ -1,3 +1,4 @@
+import { AgentMessageSenderSchema } from "./agent-message.js";
 import { AgentProfileSchema, AgentSkillSelectionSchema } from "./agent-profile.js";
 export {
   AgentProfileSchema,
@@ -659,15 +660,18 @@ const ToolCallTimelineItemPayloadSchema: z.ZodType<ToolCallTimelineItem, unknown
     ToolCallCanceledPayloadSchema,
   ]);
 
+export const AgentUserMessagePayloadSchema = z.object({
+  type: z.literal("user_message"),
+  text: z.string(),
+  messageId: z.string().optional(),
+  clientMessageId: z.string().optional(),
+  sender: AgentMessageSenderSchema.optional(),
+});
+
 // zod-aot 0.20.4 miscompiles this as a nested discriminated union by omitting
 // the inner tool_call branch from the generated outer dispatch.
 export const AgentTimelineItemPayloadSchema: z.ZodType<AgentTimelineItem, unknown> = z.union([
-  z.object({
-    type: z.literal("user_message"),
-    text: z.string(),
-    messageId: z.string().optional(),
-    clientMessageId: z.string().optional(),
-  }),
+  AgentUserMessagePayloadSchema,
   z.object({
     type: z.literal("assistant_message"),
     text: z.string(),
@@ -1349,6 +1353,7 @@ export const FetchAgentRequestMessageSchema = z.object({
 
 export const SendAgentMessageRequestSchema = z.object({
   type: z.literal("send_agent_message_request"),
+  callerToken: z.string().optional(),
   requestId: z.string(),
   /** Accepts full ID, unique prefix, or exact full title (server resolves). */
   agentId: z.string(),
@@ -1690,6 +1695,7 @@ export const CreateAgentRequestMessageSchema = z.object({
   // Optional caller context lets managed CLI invocations use the same daemon-owned
   // workspace and parentage policy as agent-scoped MCP creation.
   callerAgentId: z.string().optional(),
+  callerToken: z.string().optional(),
   worktreeName: z.string().optional(),
   initialPrompt: z.string().optional(),
   clientMessageId: z.string().optional(),

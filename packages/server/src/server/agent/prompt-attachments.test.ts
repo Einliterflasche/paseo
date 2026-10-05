@@ -31,7 +31,7 @@ describe("prompt attachments", () => {
       ),
     ).toEqual([
       chatHistory,
-      { type: "text", text: "Take a different approach" },
+      { type: "text", text: "  Take a different approach  " },
       { type: "image", data: "image-data", mimeType: "image/png" },
       issue,
     ]);

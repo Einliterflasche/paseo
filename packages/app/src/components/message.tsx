@@ -1,3 +1,6 @@
+import type { AgentMessageSender } from "@getpaseo/protocol/agent-message";
+import { messageSenderLabel } from "@/agent-stream/system-message-label";
+import { CODE_SURFACE_DATASET } from "@/styles/code-surface";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import { TaskListRow } from "@/components/task-list-row";
 import {
@@ -116,6 +119,7 @@ export type { InlinePathTarget } from "@/assistant-file-links";
 export type { AssistantForkTarget };
 
 interface UserMessageProps {
+  sender?: AgentMessageSender;
   serverId?: string;
   agentId?: string;
   messageId?: string;
@@ -331,6 +335,12 @@ const userMessageStylesheet = StyleSheet.create((theme) => ({
     justifyContent: "flex-end",
     ...(isWeb ? { userSelect: "text" as const } : {}),
   },
+  sender: {
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
+    fontFamily: theme.fontFamily.mono,
+    marginBottom: theme.spacing[1],
+  },
   content: {
     alignItems: "flex-end",
     maxWidth: "100%",
@@ -424,6 +434,7 @@ function UserMessageImagePill({ image, onOpen, accessibilityLabel }: UserMessage
 const MESSAGE_TEXT_DATASET = { messageText: "true" };
 
 export const UserMessage = memo(function UserMessage({
+  sender,
   serverId,
   agentId,
   messageId,
@@ -510,6 +521,11 @@ export const UserMessage = memo(function UserMessage({
         onPointerEnter={handlePointerEnter}
         onPointerLeave={handlePointerLeave}
       >
+        {sender && sender.kind !== "human" ? (
+          <Text dataSet={CODE_SURFACE_DATASET} style={userMessageStylesheet.sender}>
+            {messageSenderLabel(sender)}
+          </Text>
+        ) : null}
         <View style={userMessageStylesheet.bubble}>
           {hasImages ? (
             <View style={imagePreviewContainerStyle}>

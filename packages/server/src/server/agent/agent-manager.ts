@@ -1,3 +1,5 @@
+import { reconcileSubmittedHistory, type SubmittedMessage } from "./submitted-messages.js";
+import type { AgentMessageSender } from "@getpaseo/protocol/agent-message";
 import { SharedLogStore } from "./shared-log.js";
 import { projectTimelineRows } from "./timeline-projection.js";
 import { AgentNotFoundError } from "./agent-not-found-error.js";
@@ -105,7 +107,12 @@ import {
 import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
 import { isSystemInjectedEnvelope } from "./agent-prompt.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
-import { stripInternalPaseoMcpServer, withRuntimePaseoMcpServer } from "./runtime-mcp-config.js";
+import {
+  agentCallerToken,
+  resolveAgentCallerToken,
+  stripInternalPaseoMcpServer,
+  withRuntimePaseoMcpServer,
+} from "./runtime-mcp-config.js";
 import { resolveCreateAgentTitles } from "./create-agent-title.js";
 import type { PaseoToolCatalogFactory } from "./tools/types.js";
 import { isPaseoToolPolicyEnabled } from "./paseo-tool-policy.js";
@@ -140,8 +147,7 @@ function submittedPromptText(prompt: AgentPromptInput): string {
   }
   return prompt
     .flatMap((block) => (block.type === "text" && !("mimeType" in block) ? [block.text] : []))
-    .join("\n")
-    .trim();
+    .join("\n");
 }
 
 export class AgentManagerShuttingDownError extends Error {
@@ -674,9 +680,6 @@ function buildExplicitTimelineSeedForRegister(
 function buildImportedTimelineRows(entries: readonly ImportedTimelineEntry[]): AgentTimelineRow[] {
   const rows: AgentTimelineRow[] = [];
   for (const entry of entries) {
-    if (entry.item.type === "user_message" && isSystemInjectedEnvelope(entry.item.text)) {
-      continue;
-    }
     rows.push({
       seq: rows.length + 1,
       timestamp: entry.timestamp ?? new Date().toISOString(),
@@ -704,7 +707,7 @@ function resolveImportedAgentTitle(
 function getFirstUserMessageTextFromRows(rows: readonly AgentTimelineRow[]): string | null {
   for (const row of rows) {
     const item = row.item;
-    if (item.type !== "user_message") {
+    if (item.type !== "user_message" || isSystemInjectedEnvelope(item.text)) {
       continue;
     }
     const text = item.text.trim();
@@ -743,6 +746,7 @@ export class AgentManager {
   private readonly providerDefinitions = new Map<AgentProvider, ProviderEnabledFlag>();
   private readonly agents = new Map<string, LiveManagedAgent>();
   private readonly timelineStore = new InMemoryAgentTimelineStore();
+  private readonly submittedMessages = new Map<string, SubmittedMessage[]>();
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
@@ -958,6 +962,7 @@ export class AgentManager {
       const record = {
         ...existing,
         ...toStoredAgentRecord(agent, { title: existing?.title ?? null }),
+        submittedMessages: this.submittedMessages.get(agent.id) ?? existing?.submittedMessages,
       };
       await this.registry?.upsert(record);
       inventory.set(agent.id, { record, continue: false, inputs: [] });
@@ -1003,6 +1008,8 @@ export class AgentManager {
     // unstarted agent after an installation error. Existing owned histories are never replaced.
     for (const entry of snapshot.agents) {
       this.retainRecoveryEntry(entry);
+      if (entry.record.submittedMessages)
+        this.submittedMessages.set(entry.record.id, entry.record.submittedMessages);
     }
     for (const [id, timeline] of Object.entries(snapshot.timelines)) {
       if (!this.timelineStore.has(id)) this.timelineStore.restoreSnapshot(id, timeline);
@@ -1066,7 +1073,11 @@ export class AgentManager {
         const iterator = this.streamAgentInternal(
           record.id,
           continuationPrompt(inputs),
-          inputs[0]?.options ? { ...inputs[0].options, clientMessageId: undefined } : undefined,
+          {
+            ...inputs[0]?.options,
+            clientMessageId: randomUUID(),
+            sender: { kind: "system", source: "Restart recovery" },
+          },
           (operation) => Promise.resolve().then(operation),
         );
         this.runs.restoreInputs(
@@ -1170,6 +1181,7 @@ export class AgentManager {
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
+  private readonly callerTokenSecret = randomUUID();
   private paseoToolsEnabled = true;
   private paseoToolCatalogFactory: PaseoToolCatalogFactory | null = null;
   private readonly paseoToolPolicies = new Map<string, ProviderPaseoToolsPolicy | undefined>();
@@ -1293,12 +1305,25 @@ export class AgentManager {
     return this.paseoToolPolicies.get(agentId);
   }
 
-  /**
-   * Capability token the daemon's own MCP clients must present to the Agent MCP
-   * endpoint when a daemon password is configured. Read by the per-client
-   * session to authenticate its own MCP connection. Stays in the daemon — never
-   * sent to remote clients.
-   */
+  messageSenderForCaller(agentId?: string): AgentMessageSender {
+    if (!agentId) return { kind: "human" };
+    const agent = this.requireAgent(agentId);
+    const title = agent.config.title;
+    return { kind: "agent", agentId, ...(title ? { title } : {}) };
+  }
+
+  resolveMessageSender(callerToken?: string): AgentMessageSender {
+    if (!callerToken) return { kind: "human" };
+    const agentId = this.resolveCallerToken(callerToken);
+    if (!agentId) throw new Error("Invalid agent caller token");
+    return this.messageSenderForCaller(agentId);
+  }
+
+  resolveCallerToken(token: string): string | null {
+    return resolveAgentCallerToken(token, this.callerTokenSecret);
+  }
+
+  /** Capability token for the daemon's own, unscoped MCP clients. */
   getMcpAuthToken(): string | null {
     return this.mcpAuthToken;
   }
@@ -2983,7 +3008,10 @@ export class AgentManager {
       return false;
     }
     if (options?.clientMessageId) {
-      this.recordSubmittedPrompt(agent, prompt, options.clientMessageId);
+      this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, {
+        messageId: options.clientMessageId,
+        sender: options.sender,
+      });
       this.emitState(agent);
     }
     const dispatch = (event: AgentStreamEvent): void => {
@@ -3129,6 +3157,7 @@ export class AgentManager {
     const echo = echoIndex >= 0 ? pendingRun.stagedEvents.splice(echoIndex, 1)[0] : undefined;
     this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, {
       messageId: options.clientMessageId,
+      sender: options.sender,
       turnId,
       providerMessageId:
         echo?.type === "timeline" && echo.item.type === "user_message"
@@ -3385,7 +3414,7 @@ export class AgentManager {
           expectedTurnId,
         });
         if (admission.status === "accepted") {
-          await this.recordAcceptedSteer(agent, prompt, options?.clientMessageId, expectedTurnId);
+          await this.recordAcceptedSteer(agent, prompt, options, expectedTurnId);
         }
         return admission;
       });
@@ -3417,12 +3446,7 @@ export class AgentManager {
               expectedTurnId,
             });
             if (admission.status === "accepted") {
-              await this.recordAcceptedSteer(
-                agent,
-                prompt,
-                options?.clientMessageId,
-                expectedTurnId,
-              );
+              await this.recordAcceptedSteer(agent, prompt, options, expectedTurnId);
             }
             return admission;
           })
@@ -3526,15 +3550,17 @@ export class AgentManager {
   private async recordAcceptedSteer(
     agent: ActiveManagedAgent,
     prompt: AgentPromptInput,
-    clientMessageId: string | undefined,
+    options: AgentRunOptions | undefined,
     expectedTurnId: string,
   ): Promise<void> {
-    this.runs.rememberInput(agent.id, prompt, { clientMessageId }, "steer");
+    const clientMessageId = options?.clientMessageId;
+    this.runs.rememberInput(agent.id, prompt, options, "steer");
     if (!clientMessageId) {
       return;
     }
     this.recordSubmittedPrompt(agent, prompt, clientMessageId, {
       messageId: clientMessageId,
+      sender: options?.sender,
       turnId: expectedTurnId,
     });
     this.emitState(agent);
@@ -3875,6 +3901,13 @@ export class AgentManager {
         );
         await invokeRewindCapability(agent.session, { messageId: providerMessageId, mode });
         if (mode !== "files") {
+          const messages = this.submittedMessages.get(agentId) ?? [];
+          const target = messages.findIndex(
+            (message) =>
+              message.item.messageId === messageId ||
+              message.providerMessageId === providerMessageId,
+          );
+          if (target >= 0) this.submittedMessages.set(agentId, messages.slice(0, target));
           await this.hydrateTimelineFromProvider(agentId, {
             force: true,
             broadcast: true,
@@ -3933,11 +3966,15 @@ export class AgentManager {
   private getLastAssistantMessageSegmentFromTimeline(
     timeline: readonly AgentTimelineItem[],
   ): { text: string; startsAtBeginning: boolean } | null {
-    // Collect the last contiguous assistant messages (Claude streams chunks)
+    // System rows retain context without splitting an assistant continuation.
     const chunks: string[] = [];
     let startsAtBeginning = false;
     for (let i = timeline.length - 1; i >= 0; i--) {
       const item = timeline[i];
+      if (item.type === "user_message" && isSystemInjectedEnvelope(item.text)) {
+        if (chunks.length) startsAtBeginning = i === 0;
+        continue;
+      }
       if (item.type !== "assistant_message") {
         if (chunks.length) {
           break;
@@ -4186,6 +4223,7 @@ export class AgentManager {
         options?.initialTitle ?? null,
       );
 
+      await this.loadSubmittedMessages(resolvedAgentId);
       const now = new Date();
       const { durableTimelineHasRows } = await this.initializeAgentTimelineForRegister({
         agentId: resolvedAgentId,
@@ -4284,6 +4322,12 @@ export class AgentManager {
       }
       throw error;
     }
+  }
+
+  private async loadSubmittedMessages(agentId: string): Promise<void> {
+    if (this.submittedMessages.has(agentId)) return;
+    const savedMessages = (await this.registry?.get(agentId))?.submittedMessages;
+    if (savedMessages) this.submittedMessages.set(agentId, savedMessages);
   }
 
   private async closeUnregisteredSession(
@@ -4649,7 +4693,10 @@ export class AgentManager {
     if (agent.internal) {
       return;
     }
-    await this.registry.applySnapshot(agent, options);
+    await this.registry.applySnapshot(agent, {
+      ...options,
+      submittedMessages: this.submittedMessages.get(agent.id),
+    });
   }
 
   private requireRegistry(): AgentStorage {
@@ -4749,9 +4796,6 @@ export class AgentManager {
     for await (const rawEvent of agent.session.streamHistory()) {
       const event = limitAgentStreamEventContent(rawEvent);
       if (event.type === "timeline") {
-        if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
-          continue;
-        }
         historyEvents.push({ ...event, item: historyLogs.retain(event.item) });
       } else if (event.type === "provider_subagent") {
         providerSubagentEvents.push(this.retainHistorySubagentEvent(event, childHistoryLogs));
@@ -4775,8 +4819,13 @@ export class AgentManager {
         this.dispatch({ type: "provider_subagent", event: update });
       }
     }
-    for (const event of historyEvents) {
+    for (const event of reconcileSubmittedHistory(
+      historyEvents,
+      this.submittedMessages.get(agent.id) ?? [],
+      agent.provider,
+    )) {
       this.commitTimeline(agent.id, event.item, event.provider, event.turnId, {
+        providerMessageId: event.providerMessageId,
         timestamp: event.timestamp,
         fromHistory: true,
         notifyWaiters: false,
@@ -4813,9 +4862,6 @@ export class AgentManager {
         if (event.type !== "timeline") {
           continue;
         }
-        if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
-          continue;
-        }
         historyEvents.push({ ...event, item: historyLogs.retain(event.item) });
       }
     } catch (error) {
@@ -4841,8 +4887,13 @@ export class AgentManager {
         this.dispatch(managerEvent);
       }
     }
-    for (const event of historyEvents) {
+    for (const event of reconcileSubmittedHistory(
+      historyEvents,
+      this.submittedMessages.get(agent.id) ?? [],
+      agent.provider,
+    )) {
       const row = this.commitTimeline(agent.id, event.item, event.provider, event.turnId, {
+        providerMessageId: event.providerMessageId,
         timestamp: event.timestamp,
         fromHistory: true,
         notifyWaiters: false,
@@ -5196,11 +5247,16 @@ export class AgentManager {
     flags: StreamEventFlags;
   }): Promise<void> {
     const { agent, event, options, flags } = params;
-
-    if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
-      flags.shouldDispatchEvent = false;
-      flags.shouldNotifyWaiters = false;
-      return;
+    const item = event.item;
+    if (item.type === "user_message" && item.messageId && !item.clientMessageId) {
+      const submitted = this.submittedMessages
+        .get(agent.id)
+        ?.find((message) => message.providerMessageId === item.messageId);
+      if (submitted) {
+        flags.shouldDispatchEvent = false;
+        flags.shouldNotifyWaiters = false;
+        return;
+      }
     }
 
     if (
@@ -5485,12 +5541,14 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     prompt: AgentPromptInput,
     clientMessageId: string,
-    options?: { messageId?: string; providerMessageId?: string; turnId?: string },
+    options?: {
+      messageId?: string;
+      providerMessageId?: string;
+      turnId?: string;
+      sender?: AgentMessageSender;
+    },
   ): void {
-    if (
-      isSystemInjectedEnvelope(submittedPromptText(prompt)) ||
-      this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId)
-    ) {
+    if (this.timelineStore.getSubmittedUserMessage(agent.id, clientMessageId)) {
       return;
     }
     this.touchUpdatedAt(agent);
@@ -5498,10 +5556,24 @@ export class AgentManager {
     const item: AgentTimelineItem = {
       type: "user_message",
       text: submittedPromptText(prompt),
+      sender: options?.sender ?? { kind: "human" },
       clientMessageId,
       ...(options?.messageId ? { messageId: options.messageId } : {}),
     };
-    this.commitTimeline(agent.id, item, agent.provider, options?.turnId, options);
+    const previous = this.timelineStore.getRows(agent.id).at(-1)?.item;
+    const { row } = this.commitTimeline(agent.id, item, agent.provider, options?.turnId, options);
+    const messages = this.submittedMessages.get(agent.id) ?? [];
+    messages.push({
+      item,
+      timestamp: row.timestamp,
+      turnId: row.turnId,
+      providerMessageId: row.providerMessageId,
+      afterMessageId:
+        previous?.type === "user_message" || previous?.type === "assistant_message"
+          ? previous.messageId
+          : undefined,
+    });
+    this.submittedMessages.set(agent.id, messages);
   }
 
   private reconcileSubmittedPromptEcho(
@@ -5528,6 +5600,14 @@ export class AgentManager {
         messageId,
       );
       if (enriched) this.enqueueDurableTimelineUpdate(agent.id, enriched);
+      const messages = this.submittedMessages.get(agent.id);
+      const submitted = messages?.find(
+        (message) => message.item.clientMessageId === clientMessageId,
+      );
+      if (submitted) {
+        submitted.providerMessageId = messageId;
+        this.emitState(agent);
+      }
     }
     return existing;
   }
@@ -5955,7 +6035,7 @@ export class AgentManager {
           this.paseoToolsEnabled && isPaseoToolPolicyEnabled(paseoToolPolicy)
             ? this.mcpBaseUrl
             : null,
-        mcpAuthToken: this.mcpAuthToken,
+        mcpAuthToken: agentCallerToken(agentId, this.callerTokenSecret),
       }),
     );
     return { storedConfig, launchConfig, paseoToolPolicy };
@@ -6004,6 +6084,7 @@ export class AgentManager {
       env: {
         ...env,
         PASEO_AGENT_ID: agentId,
+        PASEO_AGENT_TOKEN: agentCallerToken(agentId, this.callerTokenSecret),
         PASEO_AGENT_CWD: cwd,
       },
     };

@@ -229,11 +229,12 @@ exact epochs/sequences and set `historyPrimed` for checkpoint-owned history;
 checkpoint retain native loading. An unusable native session leaves its saved
 history and blocked task visible; never silently create a fresh conversation.
 
-Continue interrupted attempts through the existing hidden system-envelope
-convention, including the active input and all unsettled accepted steers in order.
-Reuse logical IDs and existing user rows. Filter provider echoes of the envelope;
-do not create a visible continuation request or deduplicate by text. Two independent
-identical submissions remain two. A repeated real tool execution is a new event.
+Continue interrupted attempts through the existing `<paseo-system>` envelope,
+including the active input and all unsettled accepted steers in order. Keep the
+original logical IDs and user rows. Record the continuation with its own message
+identity and Paseo attribution. Correlate its provider echo by identity so it
+appears once. The app collapses that row by default. Never deduplicate by text.
+Two independent identical submissions remain two. A repeated real tool execution is a new event.
 Dispatch pending operations with their original queue/steer/replace semantics.
 Restore active work before permitting a client queue to drain.
 

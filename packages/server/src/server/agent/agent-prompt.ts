@@ -1,3 +1,5 @@
+import type { AgentMessageSender } from "@getpaseo/protocol/agent-message";
+export { isSystemInjectedEnvelope } from "@getpaseo/protocol/agent-message";
 import { AgentTurnStartUncertainError } from "./agent-turn-start-uncertain-error.js";
 import type { Logger } from "pino";
 import { randomUUID } from "node:crypto";
@@ -218,12 +220,6 @@ export function formatSystemNotificationPrompt(reason: string): string {
   return `<paseo-system>\n${reason}\n</paseo-system>`;
 }
 
-const SYSTEM_ENVELOPE_PATTERN = /^<paseo-system>\n[\s\S]*\n<\/paseo-system>$/;
-
-export function isSystemInjectedEnvelope(text: string): boolean {
-  return SYSTEM_ENVELOPE_PATTERN.test(text);
-}
-
 export interface SendPromptToAgentParams {
   agentManager: AgentManager;
   agentStorage: AgentStorage;
@@ -231,6 +227,7 @@ export interface SendPromptToAgentParams {
   /** Prompt to dispatch to the provider (may include image blocks or wrapped text). */
   prompt: AgentPromptInput;
   messageId?: string;
+  sender?: AgentMessageSender;
   finishNotification?: { callerAgentId: string; requireParentOwnership?: boolean };
   activeTurnBehavior?: ActiveTurnBehavior;
   runOptions?: AgentRunOptions;
@@ -337,7 +334,11 @@ async function sendAcceptedPrompt(
   }
 
   const messageId = params.messageId ?? params.runOptions?.clientMessageId ?? randomUUID();
-  const runOptions = { ...params.runOptions, clientMessageId: messageId };
+  const runOptions: AgentRunOptions = {
+    ...params.runOptions,
+    clientMessageId: messageId,
+    sender: params.sender ?? params.runOptions?.sender ?? { kind: "human" },
+  };
   const start = () =>
     startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
       replaceRunning: true,
@@ -743,6 +744,7 @@ function setupFinishNotificationWatch(
       agentStorage,
       agentId: callerAgentId,
       prompt: formatSystemNotificationPrompt(body),
+      sender: { kind: "system", source: "Completion report" },
       // The pending record's own id, so a retried/restored delivery threads
       // through the same receipt/dedup identity as the original attempt.
       messageId: entry.id,

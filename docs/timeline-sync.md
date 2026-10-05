@@ -257,10 +257,19 @@ foreground control ownership remains a separate daemon concern. Cancellation req
 with that record rather than in a React component, so an old request cannot clear a newer one. Submissions
 remain a separate pre-turn registry and retire on canonical acknowledgement.
 
-Canonical turns and visible responses are different boundaries. System-injected prompts are absent from
-the Paseo timeline, so one visible response can span several canonical turns without a user message
-between them. Layout and copy group that response together; lifecycle, timing, tool sequences, and exact
-fork positions retain the canonical `turnId` boundaries.
+Tagged prompts remain in the full timeline. The app renders `<paseo-system>` envelopes as centered,
+gray monospace rows that expand to the complete text. Tags select presentation only. They do not
+change the provider role or identify the sender.
+
+The daemon records the sender from the caller context: human, a specific agent, or Paseo with the
+injection source. Agent runtime tokens bind MCP and CLI calls to their agent identity. Human callers
+cannot select attribution through tags. Legacy rows without sender metadata show an unknown sender
+in the collapsed presentation.
+
+Native transcripts can omit daemon metadata and accepted prompts. The agent registry retains submitted
+rows and native identities so hydration preserves attribution, text, identity, and submission order.
+The replica cache retains the same metadata. Controlled restart snapshots preserve the complete raw
+timeline and record each continuation as a separate Paseo row. See [restart recovery](restart-recovery-plan.md).
 
 The compatibility boundary for older daemons is snapshot normalization: running/idle status becomes an
 anonymous active turn or idle state once, and downstream code consumes the same activity shape. The app
