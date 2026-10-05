@@ -4,6 +4,12 @@ import MarkdownIt from "markdown-it";
 const markdownBlockParser = new MarkdownIt();
 markdownBlockParser.core.ruler.disable("inline");
 
+export function isMarkdownDividerBlock(text: string): boolean {
+  if (!/^[\s*_-]+$/.test(text)) return false;
+  const tokens = markdownBlockParser.parse(text, {});
+  return tokens.length === 1 && tokens[0]?.type === "hr";
+}
+
 // The renderer decides what counts as a definition, so ask the same parser: a block
 // that produces no tokens but registers references is nothing but definitions.
 function isLinkReferenceDefinitionBlock(block: string): boolean {

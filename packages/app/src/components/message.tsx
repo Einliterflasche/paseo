@@ -71,7 +71,7 @@ import { useStableEvent } from "@/hooks/use-stable-event";
 import { HighlightedCodeBlock } from "@/components/highlighted-code-block";
 import { MarkdownFenceBlock } from "@/components/markdown/fence";
 import type { MarkdownPhase } from "@/components/markdown/fence/types";
-import { splitMarkdownBlocks } from "@/utils/split-markdown-blocks";
+import { isMarkdownDividerBlock, splitMarkdownBlocks } from "@/utils/split-markdown-blocks";
 import { useRevealedText } from "@/hooks/use-revealed-text";
 import { colorMarkdownLinkChildren } from "@/components/markdown/link-children";
 import { createAssistantMarkdownParser } from "@/utils/assistant-markdown-parser";
@@ -810,6 +810,9 @@ export const assistantMessageStylesheet = StyleSheet.create((theme) => ({
   },
   containerCompactTop: {
     paddingTop: 0,
+  },
+  containerLeadingDivider: {
+    paddingTop: theme.spacing[1],
   },
   containerCompactBottom: {
     paddingBottom: 0,
@@ -2037,11 +2040,14 @@ export const AssistantMessage = memo(function AssistantMessage({
   const assistantContainerStyle = useMemo(
     () => [
       assistantMessageStylesheet.container,
+      isFirstInGroup &&
+        isMarkdownDividerBlock(message) &&
+        assistantMessageStylesheet.containerLeadingDivider,
       (spacing === "compactTop" || spacing === "compactBoth") &&
         assistantMessageStylesheet.containerCompactTop,
       assistantMessageStylesheet.containerCompactBottom,
     ],
-    [spacing],
+    [isFirstInGroup, message, spacing],
   );
   const bubbleStyle = useMemo(
     () => [

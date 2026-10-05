@@ -1,7 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { splitMarkdownBlocks } from "../split-markdown-blocks";
+import { isMarkdownDividerBlock, splitMarkdownBlocks } from "../split-markdown-blocks";
 
 describe("splitMarkdownBlocks", () => {
+  it.each(["---", "***", "_ _ _", "\n\n---\n\n"])(
+    "recognizes a standalone divider without changing its source: %j",
+    (text) => {
+      expect(isMarkdownDividerBlock(text)).toBe(true);
+      expect(splitMarkdownBlocks(text)).toEqual([text.trim()]);
+    },
+  );
+
+  it.each(["", "*", "- item", "    ---", "Hello\n---", "`---`", "---\n\n---"])(
+    "keeps other Markdown blocks distinct from standalone dividers: %j",
+    (text) => {
+      expect(isMarkdownDividerBlock(text)).toBe(false);
+    },
+  );
+
   it("returns a single block for a single paragraph", () => {
     expect(splitMarkdownBlocks("Hello world")).toEqual(["Hello world"]);
   });

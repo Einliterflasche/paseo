@@ -32,13 +32,13 @@ test.describe("Agent stream UI", () => {
     page,
   }) => {
     const report =
-      "Production remains unchanged while the UI agent inspects the issue. The earlier screenshot showed an intentionally expanded message, so it does not prove that the default display is correct.";
+      "The seven proven agent-to-agent reports will become collapsed internal entries and disappear from message navigation. I told the owner that this follows your existing instruction.";
     const agent = await seedMockAgentWorkspace({
       repoPrefix: "reported-bubble-",
       title: "Reported manager bubble",
       initialPrompt: "Inspect the captured manager content.",
       featureValues: {
-        mockAssistantResponse: `---\n\n${report}\n\nSecond paragraph keeps normal spacing.\n\n> First quoted paragraph.\n>\n> Second quoted paragraph.`,
+        mockAssistantResponse: `\n\n---\n\n${report}\n\nOlder rows will only be reclassified with source evidence. The agent is also removing the measured excess bubble spacing. Production is unchanged.\n\n> First quoted paragraph.\n>\n> Second quoted paragraph.`,
       },
     });
     try {
@@ -49,7 +49,8 @@ test.describe("Agent stream UI", () => {
         const bubbles = page.getByTestId("assistant-message-bubble");
         await expect(bubbles).toHaveCount(4);
         const divider = await bubbles.first().boundingBox();
-        expect(divider?.height).toBeLessThan(30);
+        expect(divider?.height).toBeLessThanOrEqual(20);
+        await expect(bubbles.first().locator('[data-paseo-markdown-tag="hr"]')).toHaveCount(1);
         const paragraph = bubbles.nth(1).locator('[data-paseo-markdown-tag="p"]').first();
         expect(await paragraph.evaluate((e) => getComputedStyle(e).marginBottom)).toBe("0px");
         const quote = bubbles.last().locator('[data-paseo-markdown-tag="p"]').first();
