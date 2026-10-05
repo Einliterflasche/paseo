@@ -112,8 +112,9 @@ Never bypass failure with raw restart, signals, direct NixOS switch, or reboot.
 Keep the reviewed descendant cleanup in the deployment package and wrapper.
 The first Cloudflare activation left Chromium processes in `paseo.service` and blocked systemd startup.
 Raphael reports external intervention before the saved generation resumed.
-The cleanup must require a successful checkpoint and a stopped daemon before it can terminate remaining service processes.
-See [fork maintenance](fork-maintenance.md) for the guarded transition from older packages.
+Use the reviewed deployment wrapper for the guarded transition from older packages.
+It preserves the successful checkpoint guard and refuses activation without proof that the old service stopped safely.
+See [fork maintenance](fork-maintenance.md) for this transition.
 
 Qualify public ordinary traffic before changing Services policy.
 Exercise authenticated browser and native-style WebSockets through the real Cloudflare hostname.
