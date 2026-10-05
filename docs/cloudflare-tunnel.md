@@ -109,6 +109,12 @@ Make sure that the replacement reports the exact restored generation before proc
 If checkpoint preparation fails, preserve the running or paused daemon and diagnose the failure.
 Never bypass failure with raw restart, signals, direct NixOS switch, or reboot.
 
+Keep the reviewed descendant cleanup in the deployment package and wrapper.
+The first Cloudflare activation left Chromium processes in `paseo.service` and blocked systemd startup.
+Raphael reports external intervention before the saved generation resumed.
+The cleanup must require a successful checkpoint and a stopped daemon before it can terminate remaining service processes.
+See [fork maintenance](fork-maintenance.md) for the guarded transition from older packages.
+
 Qualify public ordinary traffic before changing Services policy.
 Exercise authenticated browser and native-style WebSockets through the real Cloudflare hostname.
 Exercise browser reconnection, history reads, and direct pairing endpoint generation.
@@ -124,8 +130,9 @@ Make sure that foreign origins and requests without preview authority still fail
 Report the end of old-origin preview grants plainly.
 
 If ordinary Cloudflare qualification fails, retain Tailscale access and remove the candidate import with the checkpointed deployment path.
-Restore the previous source pin only after its checkpoint-format preflight passes.
-The initial rollback package supports format 4 and the same reserved-ingress guard.
+Keep the reviewed package with descendant cleanup when you restore the previous routing configuration.
+The initial package supports checkpoint format 4 but lacks that cleanup.
+Its old system closure remains a diagnostic snapshot, not the preferred deployment target.
 Never restore an old checkpoint over newer accepted work.
 
 If Services qualification fails, restore the exact saved policy and set `migrateServices = false`.
