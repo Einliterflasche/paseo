@@ -1,4 +1,10 @@
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
+import { z } from "zod";
+import { CheckpointStore } from "./restart/checkpoint-store.js";
+import { RestartController } from "./restart/restart-controller.js";
 import {
   DEFAULT_SHUTDOWN_CHECKPOINT_TIMEOUT_MS,
   SHUTDOWN_CHECKPOINT_TIMEOUT_ENV,
@@ -69,6 +75,46 @@ describe("stopWithShutdownCheckpoint", () => {
     ).toMatchObject({ checkpoint: "skipped", generationId: "gen-ready" });
     expect(calls).toEqual(["stop"]);
   });
+  test("a paused generation handed to replacement stops without replacing the checkpoint", async () => {
+    const { daemon, calls } = createDaemon(
+      { state: "paused", stage: "replacing", generationId: "gen-replacing" },
+      async () => ({ generationId: "never" }),
+    );
+    expect(
+      await stopWithShutdownCheckpoint(daemon, { logger: createLogger(), reason: "test" }),
+    ).toMatchObject({ checkpoint: "skipped", generationId: "gen-replacing" });
+    expect(calls).toEqual(["stop"]);
+  });
+
+  test("a controlled restart can stop the worker it is replacing", async () => {
+    const home = await mkdtemp(join(tmpdir(), "paseo-shutdown-replacing-"));
+    const store = new CheckpointStore(home, z.object({ message: z.string() }).parse);
+    const controller = new RestartController({
+      store,
+      capture: async () => ({ message: "retained" }),
+    });
+    const stop = vi.fn(async () => {});
+    let outcome: Awaited<ReturnType<typeof stopWithShutdownCheckpoint>> | undefined;
+
+    await controller.replace(async () => {
+      // Replacement asks the supervisor to stop this worker while the stage is "replacing".
+      outcome = await stopWithShutdownCheckpoint(
+        {
+          getRestartStatus: () => controller.status,
+          prepareRestart: () => controller.prepare(),
+          stop,
+        },
+        { logger: createLogger(), reason: "controlled restart" },
+      );
+    });
+
+    expect(outcome).toMatchObject({
+      checkpoint: "skipped",
+      generationId: controller.status.generationId,
+    });
+    expect(stop).toHaveBeenCalledOnce();
+  });
+
   test.each(["paused", "restoring"] as const)(
     "a blocked %s daemon retains execution ownership",
     async (state) => {

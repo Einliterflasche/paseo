@@ -62,9 +62,12 @@ async function checkpointBeforeStop(
 ): Promise<ShutdownCheckpointOutcome> {
   const { logger, reason } = options;
   const status = daemon.getRestartStatus();
+  // A committed generation stays authoritative once it is ready, including after a
+  // controlled restart has handed it to replacement: that hand-off is what asks the
+  // supervisor to stop this worker.
   if (
     status.state === "paused" &&
-    status.stage === "ready" &&
+    (status.stage === "ready" || status.stage === "replacing") &&
     status.generationId &&
     !status.error
   ) {
