@@ -341,6 +341,7 @@ in
         PASEO_HOME = cfg.dataDir;
         PASEO_LISTEN = "${cfg.listenAddress}:${toString (if cfg.previews.enable then cfg.previews.daemonPort else cfg.port)}";
         PASEO_SHUTDOWN_CHECKPOINT_TIMEOUT_MS = toString (cfg.shutdownCheckpointTimeout * 1000);
+        PASEO_SERVICE_CGROUP = "/system.slice/paseo.service";
       } // lib.optionalAttrs cfg.previews.enable {
         PASEO_SERVICES_FRONT_PORT = toString cfg.port;
         PASEO_SERVICES_GATEWAY_SOCKET = previewSocket;

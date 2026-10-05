@@ -88,19 +88,17 @@ cat > "$ACTIVATION_SCRIPT" <<'ACTIVATE'
 set -euo pipefail
 closure="$1"
 before="$(systemctl show paseo.service --property=InvocationID --value)"
+# The old package can leave detached processes behind. Stop through its checkpoint
+# guard. Clean the prepared group first so privileged children cannot block exit.
+"$closure/sw/bin/paseo-service-cleanup" "$before"
+systemctl stop paseo.service
+"$closure/sw/bin/paseo-service-cleanup" --stopped "$before"
 nix-env --profile /nix/var/nix/profiles/system --set "$closure"
 "$closure/bin/switch-to-configuration" switch
-after="$(systemctl show paseo.service --property=InvocationID --value)"
-# An unchanged unit is left running by NixOS. It is now checkpointed and paused,
-# so it still needs one replacement. Never restart an already replaced daemon:
-# its checkpoint has been claimed and it may already be generating new output.
-if [[ "$before" == "$after" ]]; then
-  systemctl restart paseo.service
-else
-  systemctl start paseo.service
-fi
+# Activation can start the replacement itself. start is harmless if it did.
+systemctl start paseo.service
 ACTIVATE
 chmod 700 "$ACTIVATION_SCRIPT"
 exec "$TARGET_CLI" daemon deploy \
   --target-cli "$TARGET_CLI" --reason "$REASON" "${EXTRA_DEPLOY_ARGS[@]}" -- \
-  /run/wrappers/bin/sudo "$ACTIVATION_SCRIPT" "$CLOSURE_DIR"
+  /run/wrappers/bin/sudo --preserve-env=PASEO_DEPLOY_HOME,PASEO_DEPLOY_GENERATION "$ACTIVATION_SCRIPT" "$CLOSURE_DIR"

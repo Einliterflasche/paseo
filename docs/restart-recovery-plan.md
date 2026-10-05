@@ -123,10 +123,19 @@ ordinary post-mortem cleanup; EOF or a synthesized process-exit failure cannot.
 This inspection and signaling are separate operations, not atomic containment.
 Creation-identity checks reduce PID-reuse risk but leave a read-to-signal race; macOS
 process creation timestamps also have coarser precision than Linux start ticks.
-Descendants reparented outside the observed family before capture are outside this
-certificate. Starting a new process group or session alone does not escape traversal
-while the parent relationship remains owned. Launch-time
-containment through cgroups or Windows Job Objects requires separate work.
+Descendants reparented outside the observed family before capture are outside the
+provider certificate. Starting a new process group or session alone does not escape
+traversal while the parent relationship remains owned.
+
+The NixOS service also owns a cgroup, the kernel group that contains its processes.
+After the checkpoint guard succeeds and the daemon stops, the worker clears remaining
+members of that exact group. It excludes itself and its supervisor. Cleanup sends
+SIGTERM first, waits ten seconds, then sends SIGKILL and waits ten seconds.
+It reads membership and creation identities before each signal. Failed inspection or
+uncertain termination blocks exit. A checkpoint failure or unexpected crash never
+enters this cleanup. Separate reads and signals retain the race described above.
+Agent subprocesses do not inherit the service cleanup setting.
+Windows Job Objects and containment for other launch paths require separate work.
 
 Bind completion obligations to the logical run, including across native-session
 replacement. Subscribe before dispatch so immediate completion cannot be missed.

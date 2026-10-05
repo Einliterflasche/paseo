@@ -97,7 +97,10 @@ export interface DeployCommandDependencies {
   targetFormats(executable: string): Promise<readonly number[]>;
   validateTarget(executable: string, home: string, generationId: string): Promise<void>;
   /** Runs the caller-supplied activation argv directly, no shell. */
-  spawnActivation(argv: readonly string[]): Promise<DeployActivationResult>;
+  spawnActivation(
+    argv: readonly string[],
+    proof: { home: string; generationId: string },
+  ): Promise<DeployActivationResult>;
   sleep(ms: number): Promise<void>;
   now(): number;
 }
@@ -179,10 +182,21 @@ async function defaultAcquireLock(home: string): Promise<DeployLock> {
   };
 }
 
-function defaultSpawnActivation(argv: readonly string[]): Promise<DeployActivationResult> {
+export function spawnDeployActivation(
+  argv: readonly string[],
+  proof: { home: string; generationId: string },
+): Promise<DeployActivationResult> {
   return new Promise((resolve, reject) => {
     const [command, ...args] = argv;
-    const child = spawn(command, args, { stdio: "inherit", shell: false });
+    const child = spawn(command, args, {
+      stdio: "inherit",
+      shell: false,
+      env: {
+        ...process.env,
+        PASEO_DEPLOY_HOME: proof.home,
+        PASEO_DEPLOY_GENERATION: proof.generationId,
+      },
+    });
     child.once("error", reject);
     child.once("exit", (code, signal) => resolve({ code, signal }));
   });
@@ -216,7 +230,7 @@ const defaultDeployCommandDependencies: DeployCommandDependencies = {
     }),
   targetFormats: readTargetCheckpointFormats,
   validateTarget: validateTargetCheckpoint,
-  spawnActivation: defaultSpawnActivation,
+  spawnActivation: spawnDeployActivation,
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   now: () => Date.now(),
 };
@@ -489,7 +503,7 @@ export async function runDeployCommand(
       targetCli,
     );
 
-    const activation = await deps.spawnActivation(argv);
+    const activation = await deps.spawnActivation(argv, { home: state.home, generationId });
     if (activation.code !== 0 || activation.signal) {
       const error: CommandError = {
         code: "DEPLOY_ACTIVATION_FAILED",

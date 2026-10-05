@@ -27,6 +27,13 @@ export type ShutdownCheckpointOutcome =
   | { checkpoint: "skipped"; state: string; generationId?: string; error?: string }
   | { checkpoint: "failed"; error: unknown; elapsedMs: number };
 
+interface ShutdownCheckpointOptions {
+  logger: ShutdownCheckpointLogger;
+  reason: string;
+  timeoutMs?: number;
+  cleanup?: () => Promise<void>;
+}
+
 export function resolveShutdownCheckpointTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env[SHUTDOWN_CHECKPOINT_TIMEOUT_ENV];
   if (raw === undefined || raw.trim().length === 0) {
@@ -49,10 +56,13 @@ export function resolveWorkerGracefulExitMs(env: NodeJS.ProcessEnv = process.env
 /** A failed checkpoint keeps the daemon and its execution owners alive for diagnosis/retry. */
 export async function stopWithShutdownCheckpoint(
   daemon: ShutdownCheckpointDaemon,
-  options: { logger: ShutdownCheckpointLogger; reason: string; timeoutMs?: number },
+  options: ShutdownCheckpointOptions,
 ): Promise<ShutdownCheckpointOutcome> {
   const outcome = await checkpointBeforeStop(daemon, options);
-  if (outcome.checkpoint !== "failed") await daemon.stop();
+  if (outcome.checkpoint !== "failed") {
+    await daemon.stop();
+    await options.cleanup?.();
+  }
   return outcome;
 }
 

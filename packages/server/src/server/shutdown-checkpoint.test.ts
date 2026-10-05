@@ -51,6 +51,35 @@ describe("stopWithShutdownCheckpoint", () => {
     expect(logger.warn).not.toHaveBeenCalled();
   });
 
+  test("service cleanup runs after the successful checkpoint and daemon stop", async () => {
+    const { daemon, calls } = createDaemon({ state: "running" }, async () => ({
+      generationId: "gen-cleanup",
+    }));
+    await stopWithShutdownCheckpoint(daemon, {
+      logger: createLogger(),
+      reason: "service stop",
+      cleanup: async () => {
+        calls.push("cleanup");
+      },
+    });
+    expect(calls).toEqual(["prepare", "stop", "cleanup"]);
+  });
+
+  test("a failed checkpoint never starts destructive service cleanup", async () => {
+    const { daemon, calls } = createDaemon({ state: "running" }, async () => {
+      throw new Error("checkpoint write failed");
+    });
+    const outcome = await stopWithShutdownCheckpoint(daemon, {
+      logger: createLogger(),
+      reason: "service stop",
+      cleanup: async () => {
+        calls.push("cleanup");
+      },
+    });
+    expect(outcome.checkpoint).toBe("failed");
+    expect(calls).toEqual(["prepare"]);
+  });
+
   test("a preparing daemon joins the checkpoint already in flight", async () => {
     const { daemon, calls } = createDaemon({ state: "preparing" }, async () => ({
       generationId: "gen-2",

@@ -1,11 +1,33 @@
 import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   runDeployCommand,
+  spawnDeployActivation,
   type DeployCommandDependencies,
   type DeployPrepareClient,
   type DeployReadinessClient,
 } from "./deploy.js";
 import type { LocalDaemonState } from "./local-daemon.js";
+
+it("the default activation passes exact proof through a real child process", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-activation-proof-"));
+  const output = join(home, "proof.json");
+  const proof = { home, generationId: "exact-prepared-generation" };
+  expect(
+    await spawnDeployActivation(
+      [
+        process.execPath,
+        "-e",
+        "require('node:fs').writeFileSync(process.argv[1],JSON.stringify({home:process.env.PASEO_DEPLOY_HOME,generationId:process.env.PASEO_DEPLOY_GENERATION}))",
+        output,
+      ],
+      proof,
+    ),
+  ).toEqual({ code: 0, signal: null });
+  expect(JSON.parse(await readFile(output, "utf8"))).toEqual(proof);
+});
 
 function baseState(overrides: Partial<LocalDaemonState> = {}): LocalDaemonState {
   return {
@@ -102,6 +124,7 @@ function makeDeps(overrides: Partial<DeployCommandDependencies> = {}): {
     lockReleased: number;
     connectPrepare: number;
     spawnActivation: readonly string[][];
+    activationProof: Array<{ home: string; generationId: string }>;
     connectReadiness: number;
   };
 } {
@@ -110,6 +133,7 @@ function makeDeps(overrides: Partial<DeployCommandDependencies> = {}): {
     lockReleased: 0,
     connectPrepare: 0,
     spawnActivation: [] as readonly string[][],
+    activationProof: [] as Array<{ home: string; generationId: string }>,
     connectReadiness: 0,
   };
   const deps: DeployCommandDependencies = {
@@ -132,8 +156,9 @@ function makeDeps(overrides: Partial<DeployCommandDependencies> = {}): {
     },
     targetFormats: async () => [1, 2, 3],
     validateTarget: async () => {},
-    spawnActivation: async (argv) => {
+    spawnActivation: async (argv, proof) => {
       calls.spawnActivation = [...calls.spawnActivation, [...argv]];
+      calls.activationProof.push(proof);
       return { code: 0, signal: null };
     },
     sleep: async () => {},
@@ -350,6 +375,7 @@ describe("runDeployCommand", () => {
       ["sudo", "/nix/store/xyz/bin/switch-to-configuration", "switch"],
     ]);
     expect(result.data).toMatchObject({ action: "deployed", generationId: "gen-1" });
+    expect(calls.activationProof).toEqual([{ home: baseState().home, generationId: "gen-1" }]);
   });
 
   it("reports activation failure without ever polling for readiness", async () => {

@@ -138,10 +138,17 @@ with a `deploy.lock` file in `PASEO_HOME`. Investigate its owner if a previous a
 failed; never delete state to force a deployment through. `scripts/deploy-nixos.sh` wraps the whole sequence for a
 NixOS host: it builds the closure with `nixos-rebuild build` (never `switch` directly),
 then hands activation of that exact closure to `paseo daemon deploy`, with the closure's
-own Paseo executable as `--target-cli`. Only after
-the checkpoint succeeds does activation update the system profile and switch the
-configuration. If NixOS leaves the service unchanged, activation replaces the
-paused service once; if NixOS already replaced it, activation does not restart it again.
+own Paseo executable as `--target-cli`. After the checkpoint succeeds, the CLI passes its exact generation to activation.
+The replacement package cleans the prepared service's exact cgroup before stopping it.
+This supports the first deployment from a package without worker cleanup.
+Cleanup excludes the supervisor, worker, and executor. It requires the same live leaders,
+service invocation, and unclaimed ready generation at the final signal boundary.
+Activation privileges allow cleanup of children that changed user through `sudo`.
+The wrapper then stops the service through its checkpoint guard.
+Before changing the system profile, it requires a normal successful exit from the old
+invocation, the same unclaimed generation, and an empty old service group.
+A failed or changed proof blocks activation and preserves the checkpoint and logs.
+Activation starts the replacement once and waits for restoration of that generation.
 The wrapper runs the built closure's CLI for both deployment and checkpoint
 validation. That CLI refuses ordinary or unclassified live terminals before Prepare
 and checks again after Prepare freezes mutation admission and drains the scheduler.
@@ -162,6 +169,8 @@ daemon at all. Teardown certification skips such foreign-owned processes: the
 daemon stops everything it owns, including owned descendants beneath the foreign
 process, and the foreign process itself is left running as an orphan. It cannot
 write into the provider pipe the daemon owns, so it cannot alter recorded history.
+Worker cleanup refuses to certify an exit while that process remains in the service.
+The deployment wrapper clears such children with activation privileges before it waits for service stop.
 This does not change service OOM preferences or the activation command's privileges. Readiness has no
 default deadline; `--wait-timeout` adds one explicitly and never kills a process.
 

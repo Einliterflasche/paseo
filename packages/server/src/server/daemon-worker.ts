@@ -5,6 +5,7 @@ import { loadConfig } from "./config.js";
 import { resolvePaseoHome } from "./paseo-home.js";
 import { createRootLogger } from "./logger.js";
 import type { DaemonLifecycleIntent } from "./bootstrap.js";
+import { cleanupServiceCgroup, openServiceCgroup } from "../utils/service-cgroup-cleanup.js";
 import { getProcessDiagnostics } from "./process-diagnostics.js";
 import {
   resolveShutdownCheckpointTimeoutMs,
@@ -133,6 +134,9 @@ function applyCliFlagOverrides(config: ReturnType<typeof loadConfig>): void {
 }
 
 async function main() {
+  const serviceCgroup = process.env.PASEO_SERVICE_CGROUP;
+  // Agent-launched daemons must never inherit authority over this service group.
+  delete process.env.PASEO_SERVICE_CGROUP;
   const { paseoHome, logger, config } = bootstrapFromEnvironment();
   let daemon: Awaited<ReturnType<typeof createPaseoDaemon>> | null = null;
   let shutdownPromise: Promise<number | null> | null = null;
@@ -167,6 +171,12 @@ async function main() {
             logger,
             reason,
             timeoutMs: shutdownCheckpointTimeoutMs,
+            cleanup: serviceCgroup
+              ? async () =>
+                  cleanupServiceCgroup(
+                    await openServiceCgroup(serviceCgroup, [process.pid, process.ppid]),
+                  )
+              : undefined,
           });
           if (outcome.checkpoint === "failed") return null;
           logger.info("Server closed");

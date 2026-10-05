@@ -17,6 +17,10 @@ async function fixture() {
     writeFile(name, `#!/usr/bin/env bash\nset -eu\n${body}\n`, { mode: 0o700 });
   await executable(join(closure, "sw/bin/paseo"), 'printf "%s\\n" "$@" > "$TEST_ROOT/deploy-argv"');
   await executable(
+    join(closure, "sw/bin/paseo-service-cleanup"),
+    'test "$PASEO_DEPLOY_HOME" = "$TEST_ROOT/proof-home"; test "$PASEO_DEPLOY_GENERATION" = "exact-proof"; echo "cleanup $*" >> "$TEST_ROOT/actions"; if [[ "${1:-}" == --stopped ]]; then exit "${CERTIFY_EXIT:-0}"; fi; exit "${CLEANUP_EXIT:-0}"',
+  );
+  await executable(
     join(closure, "bin/switch-to-configuration"),
     'echo switch >> "$TEST_ROOT/actions"; if [[ "${SWITCH_EXIT:-0}" != 0 ]]; then exit "$SWITCH_EXIT"; fi; if [[ "${SWITCH_REPLACES:-0}" == 1 ]]; then echo replacement > "$TEST_ROOT/invocation"; fi',
   );
@@ -40,6 +44,8 @@ async function fixture() {
       ...process.env,
       PATH: `${bin}:${process.env.PATH}`,
       PASEO_CLI: join(bin, "paseo"),
+      PASEO_DEPLOY_HOME: join(root, "proof-home"),
+      PASEO_DEPLOY_GENERATION: "exact-proof",
       TEST_ROOT: root,
       PASEO_DEPLOY_FLAKE: "",
       PASEO_PASSWORD: "",
@@ -67,10 +73,11 @@ test("host configuration is built before exact activation argv is handed to chec
     "--",
     "/run/wrappers/bin/sudo",
   ]);
-  assert.equal(argv.length, 10);
-  assert.ok(argv[8].endsWith("/activate.sh"));
-  assert.equal(argv[9], f.closure);
-  await access(argv[8]);
+  assert.equal(argv[8], "--preserve-env=PASEO_DEPLOY_HOME,PASEO_DEPLOY_GENERATION");
+  assert.equal(argv.length, 11);
+  assert.ok(argv[9].endsWith("/activate.sh"));
+  assert.equal(argv[10], f.closure);
+  await access(argv[9]);
   await assert.rejects(access(join(f.root, "actions")), { code: "ENOENT" });
 });
 
@@ -158,20 +165,23 @@ test("a missing credential file never launches a deployment job", async () => {
 });
 
 for (const replaces of [false, true]) {
-  test(`activation records the system generation and ${replaces ? "never restarts the replacement again" : "replaces an unchanged paused service"}`, async () => {
+  test(`activation cleans the prepared old unit and certifies its stop and starts the replacement once (switch starts it: ${replaces})`, async () => {
     const f = await fixture();
     const prepare = spawnSync(script, ["--worker"], { env: f.env, encoding: "utf8" });
     assert.equal(prepare.status, 0, prepare.stderr);
     const args = (await readFile(join(f.root, "deploy-argv"), "utf8")).trimEnd().split("\n");
-    const activation = spawnSync(args[8], [args[9]], {
+    const activation = spawnSync(args[9], [args[10]], {
       env: { ...f.env, SWITCH_REPLACES: replaces ? "1" : "0" },
       encoding: "utf8",
     });
     assert.equal(activation.status, 0, activation.stderr);
     assert.deepEqual((await readFile(join(f.root, "actions"), "utf8")).trimEnd().split("\n"), [
+      "cleanup original",
+      "stop paseo.service",
+      "cleanup --stopped original",
       `profile --profile /nix/var/nix/profiles/system --set ${f.closure}`,
       "switch",
-      `${replaces ? "start" : "restart"} paseo.service`,
+      "start paseo.service",
     ]);
   });
 }
@@ -181,7 +191,7 @@ test("a failed activation never attempts an additional restart", async () => {
   const prepare = spawnSync(script, ["--worker"], { env: f.env, encoding: "utf8" });
   assert.equal(prepare.status, 0, prepare.stderr);
   const args = (await readFile(join(f.root, "deploy-argv"), "utf8")).trimEnd().split("\n");
-  const activation = spawnSync(args[8], [args[9]], {
+  const activation = spawnSync(args[9], [args[10]], {
     env: { ...f.env, SWITCH_EXIT: "8" },
     encoding: "utf8",
   });
@@ -189,6 +199,21 @@ test("a failed activation never attempts an additional restart", async () => {
   const actions = await readFile(join(f.root, "actions"), "utf8");
   assert.ok(!actions.includes("restart"));
   assert.ok(!actions.includes("start paseo.service"));
+});
+
+test("a cleanup refusal prevents profile changes and replacement startup", async () => {
+  const f = await fixture();
+  const prepare = spawnSync(script, ["--worker"], { env: f.env, encoding: "utf8" });
+  assert.equal(prepare.status, 0, prepare.stderr);
+  const args = (await readFile(join(f.root, "deploy-argv"), "utf8")).trimEnd().split("\n");
+  const activation = spawnSync(args[9], [args[10]], {
+    env: { ...f.env, CLEANUP_EXIT: "9" },
+    encoding: "utf8",
+  });
+  assert.equal(activation.status, 9);
+  assert.deepEqual((await readFile(join(f.root, "actions"), "utf8")).trimEnd().split("\n"), [
+    "cleanup original",
+  ]);
 });
 
 test("worker cannot build or checkpoint while the privileged launcher is still present", async () => {
@@ -227,4 +252,21 @@ test("an abandoned launcher fails closed before checkpointing", async () => {
   assert.equal(result.status, 1);
   assert.match(result.stderr, /launcher exited/);
   await assert.rejects(access(join(f.root, "build-argv")), { code: "ENOENT" });
+});
+
+test("a final stopped certification refusal prevents profile changes and replacement startup", async () => {
+  const f = await fixture();
+  const prepare = spawnSync(script, ["--worker"], { env: f.env, encoding: "utf8" });
+  assert.equal(prepare.status, 0, prepare.stderr);
+  const args = (await readFile(join(f.root, "deploy-argv"), "utf8")).trimEnd().split("\n");
+  const activation = spawnSync(args[9], [args[10]], {
+    env: { ...f.env, CERTIFY_EXIT: "9" },
+    encoding: "utf8",
+  });
+  assert.equal(activation.status, 9);
+  assert.deepEqual((await readFile(join(f.root, "actions"), "utf8")).trimEnd().split("\n"), [
+    "cleanup original",
+    "stop paseo.service",
+    "cleanup --stopped original",
+  ]);
 });

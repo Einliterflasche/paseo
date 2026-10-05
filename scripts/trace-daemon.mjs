@@ -48,6 +48,7 @@ const traceDesktop = process.env.PASEO_TRACE_DESKTOP === "1";
 const entries = [
   "packages/cli/dist/index.js",
   "packages/server/dist/scripts/supervisor-entrypoint.js",
+  "packages/server/dist/scripts/cleanup-prepared-service.js",
   "packages/server/dist/server/terminal/terminal-worker-process.js",
   "packages/server/dist/server/server/speech/providers/local/worker-process.js",
   "packages/server/dist/server/server/service-preview/worker-process.js",
