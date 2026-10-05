@@ -25,6 +25,7 @@ import {
   expectReadingStreamedMarkdown,
 } from "../support/helpers/chat-outline";
 import { createCreationScenario } from "../support/helpers/creation";
+import { seedMockAgentWorkspace } from "../support/helpers/mock-agent";
 import {
   expectTimelineAtMaximumScrollWithPromptVisible,
   expectTimelinePromptNotMounted,
@@ -45,6 +46,61 @@ const WIDE_VIEWPORT = { width: 1440, height: 900 };
 const LOADED_TURNS = 16;
 
 test.describe("desktop chat outline", () => {
+  test("omits system messages from counts and hover targets while keeping jumps correct", async ({
+    page,
+  }) => {
+    const first = "First regular prompt.";
+    const second = "Second regular prompt.";
+    const agent = await seedMockAgentWorkspace({
+      repoPrefix: "chat-outline-system-",
+      title: "System messages in outline",
+      initialPrompt: first,
+      featureValues: { mockAssistantResponse: "A short agent reply." },
+    });
+    try {
+      await agent.client.waitForFinish(agent.agentId, 15_000);
+      await page.setViewportSize(WIDE_VIEWPORT);
+      await openAgentTimeline(page, agent);
+      await agent.client.sendAgentMessage(
+        agent.agentId,
+        "<paseo-system>\nBackground update\n</paseo-system>",
+      );
+      await agent.client.waitForFinish(agent.agentId, 15_000);
+      await expect(page.getByTestId("system-message-toggle")).toHaveText("You · Background update");
+      await expectNoChatOutline(page);
+      await agent.client.sendAgentMessage(agent.agentId, second);
+      await agent.client.waitForFinish(agent.agentId, 15_000);
+      await expectChatOutlinePrompts(page, 2);
+      const ticks = chatOutlineRail(page).getByRole("tab");
+      await expect(ticks.nth(0)).toHaveAccessibleName(`1 of 2: ${first}`);
+      await expect(ticks.nth(1)).toHaveAccessibleName(`2 of 2: ${second}`);
+      await hoverChatOutlinePrompt(page, 1);
+      await expectChatOutlinePreview(page, first);
+      await clickChatOutlineRowEdge(page, 1);
+      await expectTimelinePromptVisible(page, first);
+      await expectActiveChatOutlinePrompt(page, 1);
+      await hoverChatOutlinePrompt(page, 2);
+      await expectChatOutlinePreview(page, second);
+      await clickChatOutlineRowEdge(page, 2);
+      await expectTimelinePromptVisible(page, second);
+      await expectOneActiveChatOutlinePrompt(page);
+      await expect(page.getByTestId("system-message")).toBeVisible();
+      await page.getByTestId("system-message-toggle").click();
+      await expect(page.getByTestId("system-message-content")).toHaveText(
+        "<paseo-system>\nBackground update\n</paseo-system>",
+      );
+      await hoverChatOutlinePrompt(page, 2);
+      await expectChatOutlinePreview(page, second);
+      await page.screenshot({ path: test.info().outputPath("system-messages-outline.png") });
+      await page.reload();
+      await expectChatOutlinePrompts(page, 2);
+      await expect(ticks.nth(0)).toHaveAccessibleName(`1 of 2: ${first}`);
+      await expect(ticks.nth(1)).toHaveAccessibleName(`2 of 2: ${second}`);
+    } finally {
+      await agent.cleanup();
+    }
+  });
+
   test("keeps the prompt marked while reading split Markdown blocks and after completion", async ({
     page,
   }) => {

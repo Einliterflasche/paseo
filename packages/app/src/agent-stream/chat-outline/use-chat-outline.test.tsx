@@ -255,10 +255,13 @@ describe("useChatOutline", () => {
     await waitFor(() => expect(onJumpError).toHaveBeenCalledOnce());
   });
 
-  it("reveals an already-loaded older prompt before scrolling to it", async () => {
+  it("reveals a loaded prompt past a system message before scrolling to its original position", async () => {
     runtime.listAgentTimelinePrompts.mockResolvedValue({
       epoch: "epoch-1",
-      prompts: [{ seq: 1, timestamp: new Date(1).toISOString(), preview: "prompt" }],
+      prompts: [
+        { seq: 1, timestamp: new Date(1).toISOString(), preview: "first prompt" },
+        { seq: 3, timestamp: new Date(3).toISOString(), preview: "prompt" },
+      ],
     });
     const scrollToMessage = vi.fn();
     const revealLoadedMessage = vi.fn(() => true);
@@ -270,11 +273,25 @@ describe("useChatOutline", () => {
     const viewportRef = { current: viewport };
     const tail = [
       {
+        id: "first-prompt",
+        kind: "user_message" as const,
+        text: "first prompt",
+        timestamp: new Date(1),
+        timelineCursor: { epoch: "epoch-1", seq: 1 },
+      },
+      {
+        id: "system-message",
+        kind: "user_message" as const,
+        text: "<paseo-system>\nBackground update\n</paseo-system>",
+        timestamp: new Date(2),
+        timelineCursor: { epoch: "epoch-1", seq: 2 },
+      },
+      {
         id: "older-prompt",
         kind: "user_message" as const,
         text: "prompt",
-        timestamp: new Date(1),
-        timelineCursor: { epoch: "epoch-1", seq: 1 },
+        timestamp: new Date(3),
+        timelineCursor: { epoch: "epoch-1", seq: 3 },
       },
     ];
     const { result, rerender } = renderHook(
@@ -294,13 +311,17 @@ describe("useChatOutline", () => {
       { initialProps: { visibleMessageIds: new Set<string>() } },
     );
 
-    await waitFor(() => expect(result.current.prompts).toHaveLength(1));
-    await act(async () => result.current.jumpToPrompt(1));
+    await waitFor(() => expect(result.current.prompts).toHaveLength(2));
+    await act(async () => result.current.reportReadingPosition(2));
+    expect(result.current.activePrompt.getActiveSeq()).toBe(1);
+    await act(async () => result.current.jumpToPrompt(3));
     expect(revealLoadedMessage).toHaveBeenCalledWith("older-prompt");
     expect(scrollToMessage).not.toHaveBeenCalled();
 
     rerender({ visibleMessageIds: new Set(["older-prompt"]) });
     await waitFor(() => expect(scrollToMessage).toHaveBeenCalledWith("older-prompt"));
+    await act(async () => result.current.reportReadingPosition(3));
+    expect(result.current.activePrompt.getActiveSeq()).toBe(3);
   });
 
   it("reveals a fetched prompt that lands outside the mounted history window", async () => {
