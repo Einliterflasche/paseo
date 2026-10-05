@@ -211,7 +211,10 @@ export class ManagedPreviewRoutes {
       // The service port is assigned before the child necessarily begins
       // listening. A later runtime/endpoint transition may therefore be the
       // first point at which HTTP can be observed for this same binding.
-      if (unchanged && (record.registered || record.qualification)) continue;
+      // Registration survives invalidation, so only a current route skips a probe.
+      const available =
+        record.registered && this.options.routes.capture(record.enrollment.serviceId) !== null;
+      if (unchanged && (available || record.qualification)) continue;
       this.qualify(record, binding);
     }
   }

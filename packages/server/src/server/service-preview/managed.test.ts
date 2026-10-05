@@ -195,6 +195,74 @@ it("requalifies the same binding after a later lifecycle notification", async ()
   managed.close();
 });
 
+it("recovers a registered route after a replacement first fails HTTP qualification", async () => {
+  const runtime = new WorkspaceScriptRuntimeStore();
+  const endpoints = createServiceProxySubsystem({ logger: pino({ level: "silent" }) });
+  const routes = new PreviewRoutes({ excludedPorts: [] });
+  const failures: unknown[] = [];
+  const probes: number[] = [];
+  let httpReady = true;
+  const managed = new ManagedPreviewRoutes({
+    runtime,
+    endpoints,
+    routes,
+    qualifyHttp(port) {
+      probes.push(port);
+      return Promise.resolve(httpReady);
+    },
+    onFailure(error) {
+      failures.push(error);
+    },
+  });
+  const endpoint = {
+    workspaceId: enrollment.workspaceId,
+    projectSlug: "slow-http",
+    branchName: "main",
+    scriptName: enrollment.scriptName,
+    port: 7133,
+  };
+  const serviceId = managedPreviewServiceId(enrollment);
+  try {
+    endpoints.registerWorkspaceService(endpoint);
+    runtime.set(runtimeEntry());
+    managed.restoreDefault(enrollment.workspaceId, enrollment.scriptName);
+    await Promise.resolve();
+    const old = routes.capture(serviceId);
+    expect(old?.isCurrent()).toBe(true);
+
+    runtime.set(runtimeEntry({ lifecycle: "stopped" }));
+    expect(old?.isCurrent()).toBe(false);
+    expect(routes.capture(serviceId)).toBeNull();
+    await expect(old?.invalidated).resolves.toBeUndefined();
+
+    httpReady = false;
+    endpoints.registerWorkspaceService({ ...endpoint, port: 7134 });
+    const replacement = runtimeEntry({ terminalId: "terminal-b" });
+    runtime.set(replacement);
+    await Promise.resolve();
+    expect(probes).toEqual([7133, 7134]);
+    expect(routes.describe()[0].available).toBe(false);
+
+    httpReady = true;
+    managed.refreshWorkspace(enrollment.workspaceId);
+    runtime.set(replacement);
+    await Promise.resolve();
+    expect(probes).toEqual([7133, 7134, 7134]);
+    const current = routes.capture(serviceId);
+    expect(current?.route.port).toBe(7134);
+    expect(current?.isCurrent()).toBe(true);
+    expect(old?.isCurrent()).toBe(false);
+
+    runtime.set(replacement);
+    endpoints.registerWorkspaceService({ ...endpoint, port: 7134 });
+    expect(probes).toEqual([7133, 7134, 7134]);
+    expect(current?.isCurrent()).toBe(true);
+    expect(failures).toEqual([]);
+  } finally {
+    managed.close();
+  }
+});
+
 function start(f: Fixture) {
   f.endpoint();
   f.runtime.set(runtimeEntry());
