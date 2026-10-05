@@ -9,10 +9,14 @@ export function parseControlOrigin(value: string): URL {
   return origin;
 }
 
-export function controlAuthorities(controlOrigin: string | null, localPorts: readonly number[]) {
+export function controlAuthorities(
+  controlOrigin: string | null,
+  localPorts: readonly number[],
+  additionalControlOrigins: readonly string[] = [],
+) {
   const authorities = new Set<string>();
-  if (controlOrigin) {
-    const origin = parseControlOrigin(controlOrigin);
+  for (const value of [...(controlOrigin ? [controlOrigin] : []), ...additionalControlOrigins]) {
+    const origin = parseControlOrigin(value);
     authorities.add(origin.host.toLowerCase());
     if (!origin.port) authorities.add(`${origin.hostname.toLowerCase()}:443`);
   }

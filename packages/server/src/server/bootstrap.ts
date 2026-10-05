@@ -131,11 +131,16 @@ function createControlAdmission({
 }) {
   if (!transport) return undefined;
   const origin = transport.status === "configured" ? transport.controlOrigin : null;
-  const frontPorts = transport.status === "configured" ? [transport.frontPort] : [];
+  const frontPorts =
+    transport.status === "configured"
+      ? [transport.frontPort, ...(transport.additionalFrontPorts ?? [])]
+      : [];
+  const additionalOrigins =
+    transport.status === "configured" ? (transport.additionalControlOrigins ?? []) : [];
   return (request: IncomingMessage) => {
     const listen = getListenTarget();
     const ports = [...frontPorts, ...(listen.type === "tcp" ? [listen.port] : [])];
-    return admitControlRequest(request, controlAuthorities(origin, ports));
+    return admitControlRequest(request, controlAuthorities(origin, ports, additionalOrigins));
   };
 }
 

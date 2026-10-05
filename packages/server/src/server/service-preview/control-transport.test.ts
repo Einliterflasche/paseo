@@ -6,7 +6,7 @@ import { admitControlRequest, controlAuthorities } from "./control-transport.js"
 
 const cleanups: Array<() => Promise<void>> = [];
 
-async function fixture(origin: string | null) {
+async function fixture(origin: string | null, additionalOrigins: string[] = []) {
   const observations: Array<{
     target: string | undefined;
     host: string | undefined;
@@ -48,7 +48,7 @@ async function fixture(origin: string | null) {
   await once(server, "listening");
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Missing control fixture address");
-  authorities = controlAuthorities(origin, [address.port]);
+  authorities = controlAuthorities(origin, [address.port], additionalOrigins);
   cleanups.push(async () => {
     for (const socket of sockets) socket.destroy();
     await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -80,6 +80,24 @@ afterEach(async () => {
 });
 
 describe("control request authority", () => {
+  it("admits both explicit migration authorities without rewriting either one", async () => {
+    const f = await fixture("https://old.test:8443", ["https://new.test"]);
+    for (const upgrading of [false, true]) {
+      for (const host of ["old.test:8443", "new.test", "new.test:443"])
+        expect(await f.exchange("/ws", [`Host: ${host}`], upgrading)).toBe(204);
+      for (const host of ["old.test", "new.test:8443", "alias.new.test"])
+        expect(await f.exchange("/ws", [`Host: ${host}`], upgrading)).toBe(403);
+    }
+    expect(f.observations.map((entry) => entry.forwardedHost)).toEqual([
+      "old.test:8443",
+      "new.test",
+      "new.test:443",
+      "old.test:8443",
+      "new.test",
+      "new.test:443",
+    ]);
+  });
+
   it("admits omitted or explicit HTTPS default port and hostname case, but not other authorities", async () => {
     const f = await fixture("https://control.test");
     for (const host of ["control.test", "control.test:443", "CONTROL.TEST:443"])

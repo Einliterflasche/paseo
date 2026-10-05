@@ -88,6 +88,23 @@ in
         '';
       };
 
+      additionalControlOrigins = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "https://paseo.example.com" ];
+        description = ''
+          Additional exact HTTPS origins for ordinary control traffic during
+          migration. Services previews remain bound to controlOrigin and their
+          matching saved policy. These origins do not grant preview authority.
+        '';
+      };
+
+      additionalFrontPorts = lib.mkOption {
+        type = lib.types.listOf lib.types.port;
+        default = [ ];
+        description = "Additional loopback control fronts excluded from Services registration.";
+      };
+
       daemonPort = lib.mkOption {
         type = lib.types.port;
         default = 6768;
@@ -249,13 +266,14 @@ in
         nativeBuildInputs = [ pkgs.nodejs_22 ];
       } ''
         node --input-type=module - ${previewFrontModule} \
-          ${toString cfg.port} ${toString cfg.previews.daemonPort} ${lib.escapeShellArg previewSocket} ${lib.escapeShellArg cfg.previews.controlOrigin} > "$out" <<'JS'
+          ${toString cfg.port} ${toString cfg.previews.daemonPort} ${lib.escapeShellArg previewSocket} ${lib.escapeShellArg cfg.previews.controlOrigin} ${lib.escapeShellArg (builtins.toJSON cfg.previews.additionalControlOrigins)} > "$out" <<'JS'
         const { createPreviewFrontConfig } = await import(process.argv[2]);
         process.stdout.write(JSON.stringify(createPreviewFrontConfig({
           listenPort: Number(process.argv[3]),
           daemonPort: Number(process.argv[4]),
           gatewaySocketPath: process.argv[5],
           controlOrigin: process.argv[6],
+          additionalControlOrigins: JSON.parse(process.argv[7]),
         })));
         JS
       '';
@@ -327,6 +345,10 @@ in
         PASEO_SERVICES_FRONT_PORT = toString cfg.port;
         PASEO_SERVICES_GATEWAY_SOCKET = previewSocket;
         PASEO_SERVICES_CONTROL_ORIGIN = cfg.previews.controlOrigin;
+      } // lib.optionalAttrs (cfg.previews.enable && cfg.previews.additionalControlOrigins != [ ]) {
+        PASEO_SERVICES_ADDITIONAL_CONTROL_ORIGINS = lib.concatStringsSep "," cfg.previews.additionalControlOrigins;
+      } // lib.optionalAttrs (cfg.previews.enable && cfg.previews.additionalFrontPorts != [ ]) {
+        PASEO_SERVICES_ADDITIONAL_FRONT_PORTS = lib.concatMapStringsSep "," toString cfg.previews.additionalFrontPorts;
       } // lib.optionalAttrs cfg.inheritUserEnvironment (
         let
           # Match dataDir's convention. We can't read users.users.<name>.home

@@ -6,6 +6,7 @@ interface PreviewFrontOptions {
   daemonPort: number;
   gatewaySocketPath: string;
   controlOrigin: string;
+  additionalControlOrigins?: readonly string[];
 }
 
 function assertPort(port: number): void {
@@ -43,11 +44,16 @@ export function createPreviewFrontConfig({
   daemonPort,
   gatewaySocketPath,
   controlOrigin,
+  additionalControlOrigins = [],
 }: PreviewFrontOptions) {
   assertPort(listenPort);
   assertPort(daemonPort);
   if (listenPort === daemonPort) throw new Error("Preview front and daemon ports must differ");
-  const authorities = controlAuthorities(parseControlOrigin(controlOrigin).origin, [listenPort]);
+  const authorities = controlAuthorities(
+    parseControlOrigin(controlOrigin).origin,
+    [listenPort],
+    additionalControlOrigins,
+  );
   const authorityPattern = `(?i)^(?:${authorities
     .map((authority) => authority.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
     .join("|")})$`;

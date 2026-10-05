@@ -30,7 +30,11 @@ export async function openConfiguredPreviewFeature(options: ConfiguredPreviewOpt
   ) {
     throw new Error("Invalid service preview transport configuration");
   }
-  const infrastructurePorts = [transport.frontPort, listenTarget.port];
+  const infrastructurePorts = [
+    transport.frontPort,
+    ...(transport.additionalFrontPorts ?? []),
+    listenTarget.port,
+  ];
   if (serviceProxyListenTarget?.type === "tcp")
     infrastructurePorts.push(serviceProxyListenTarget.port);
   const policy = await readPreviewFeaturePolicy(options.paseoHome);

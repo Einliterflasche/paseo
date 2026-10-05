@@ -63,6 +63,9 @@ Add a `serviceProxy` block under `daemon` in `~/.paseo/config.json`:
 
 ## DNS and reverse proxy setup
 
+For the daemon web UI and authenticated Services previews through Cloudflare, follow [Cloudflare Tunnel](cloudflare-tunnel.md).
+The wildcard setup below concerns legacy public service aliases.
+
 For generated URLs to be reachable, you need wildcard DNS pointing to the machine running the Paseo daemon.
 
 **Example:** to expose services at `https://dev--miniweb.paseoapps.my.domain.com` where the daemon host is `10.1.1.1`:

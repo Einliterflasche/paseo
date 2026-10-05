@@ -12,6 +12,47 @@ describe("optional preview transport environment", () => {
     expect(resolvePreviewTransportEnvironment({})).toBeUndefined();
   });
 
+  it("keeps additional control origins separate from the canonical preview origin", () => {
+    const transport = {
+      PASEO_SERVICES_FRONT_PORT: "6767",
+      PASEO_SERVICES_GATEWAY_SOCKET: "/tmp/preview.sock",
+      PASEO_SERVICES_CONTROL_ORIGIN: controlOrigin,
+    };
+    expect(
+      resolvePreviewTransportEnvironment({
+        ...transport,
+        PASEO_SERVICES_ADDITIONAL_CONTROL_ORIGINS: "https://new.test,https://another.test:8443",
+        PASEO_SERVICES_ADDITIONAL_FRONT_PORTS: "6769",
+      }),
+    ).toEqual({
+      status: "configured",
+      frontPort: 6767,
+      gatewaySocketPath: transport.PASEO_SERVICES_GATEWAY_SOCKET,
+      controlOrigin,
+      additionalControlOrigins: ["https://new.test", "https://another.test:8443"],
+      additionalFrontPorts: [6769],
+    });
+    for (const value of ["", "http://new.test", "https://new.test/", "https://new.test,", "*"])
+      expect(
+        resolvePreviewTransportEnvironment({
+          ...transport,
+          PASEO_SERVICES_ADDITIONAL_CONTROL_ORIGINS: value,
+        }),
+      ).toEqual({ status: "invalid" });
+    expect(
+      resolvePreviewTransportEnvironment({
+        PASEO_SERVICES_ADDITIONAL_CONTROL_ORIGINS: "https://new.test",
+      }),
+    ).toEqual({ status: "invalid" });
+    for (const value of ["", "0", "65536", "6769,", "6e3", "6769.0"])
+      expect(
+        resolvePreviewTransportEnvironment({
+          ...transport,
+          PASEO_SERVICES_ADDITIONAL_FRONT_PORTS: value,
+        }),
+      ).toEqual({ status: "invalid" });
+  });
+
   it.each([
     { PASEO_SERVICES_FRONT_PORT: "8443" },
     { PASEO_SERVICES_GATEWAY_SOCKET: "/tmp/preview.sock" },
