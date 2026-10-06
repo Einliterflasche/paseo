@@ -107,9 +107,16 @@ export type SubmittedMessage = z.infer<typeof SubmittedMessageSchema>;
 export function mergeHistoricalSubmissions(
   existing: readonly SubmittedMessage[],
   rows: readonly AgentTimelineRow[],
+  canonicalRows: readonly AgentTimelineRow[],
 ): SubmittedMessage[] {
   const result = [...existing];
-  for (const row of rows) {
+  const positions = new Map<string, number>();
+  for (const row of canonicalRows) {
+    if (row.item.type !== "user_message") continue;
+    for (const id of [row.item.messageId, row.item.clientMessageId, row.providerMessageId])
+      if (id) positions.set(id, row.seq);
+  }
+  for (const row of [...rows].sort((left, right) => left.seq - right.seq)) {
     if (row.item.type !== "user_message") throw new Error("Expected accepted input");
     const item = row.item;
     const matches = result.filter(
@@ -140,9 +147,15 @@ export function mergeHistoricalSubmissions(
       providerMessageId: row.providerMessageId,
     };
     if (previous) result[result.indexOf(previous)] = message;
-    else result.push(message);
+    else {
+      const next = result.findIndex((accepted) => {
+        const seq = positions.get(accepted.item.clientMessageId ?? accepted.item.messageId ?? "");
+        return seq !== undefined && seq > row.seq;
+      });
+      result.splice(next < 0 ? result.length : next, 0, message);
+    }
   }
-  return result.sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
+  return result;
 }
 type TimelineEvent = Extract<AgentStreamEvent, { type: "timeline" }>;
 type SubmittedHistoryEvent = TimelineEvent & { providerMessageId?: string };

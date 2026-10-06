@@ -4,7 +4,7 @@ import type { SessionInboundMessage, SessionOutboundMessage } from "@getpaseo/pr
 import { TimelineRequestError } from "@getpaseo/client/internal/daemon-client";
 import type { ProjectedTimelineForwardFetchPlan } from "./timeline-sync-plan";
 import {
-  consumeForcedTimelineTailReplacement,
+  markForcedTimelineTailReplacement,
   createViewedTimelineSync,
   type TimelineResponsePayload,
   type ViewedTimelineStatus,
@@ -252,7 +252,7 @@ class TimelineWorld {
   }
 
   applyTimelineResponse(payload: TimelineResponsePayload): TimelineResponsePayload {
-    return consumeForcedTimelineTailReplacement(payload, this.forcedTimelineTailReplacements);
+    return markForcedTimelineTailReplacement(payload, this.forcedTimelineTailReplacements);
   }
 
   nextCacheRequest(): Promise<string> {

@@ -28,6 +28,8 @@ import {
   type HostRuntimeStorage,
 } from "./host-runtime";
 import type { ReplicaRow, ReplicaRowStore } from "./replica-cache/row-store";
+import type { TimelineResponsePayload } from "@/timeline/viewed-timeline-sync";
+import { selectAgentTimelineState } from "@/stores/session-store";
 
 import { subscriptionFixture } from "./subscription-fixture";
 import { readDesktopManagedLocalCredential } from "@/desktop/daemon/local-credential";
@@ -425,6 +427,131 @@ function makeHost(input?: Partial<HostProfile>): HostProfile {
     updatedAt: input?.updatedAt ?? new Date(0).toISOString(),
   };
 }
+
+it("fences an in-flight host tail before applying a same-epoch replacement", async () => {
+  const host = makeHost({ serverId: "historical-host" });
+  const started = new Deferred<void>();
+  const response = new Deferred<TimelineResponsePayload>();
+  const fakeClient = Object.assign(new FakeDaemonClient(), {
+    fetchAgentTimeline: async () => {
+      started.resolve();
+      return response.promise;
+    },
+  });
+  fakeClient.setConnectionState({ status: "connected" });
+  const store = new HostRuntimeStore({
+    storage: createMemoryHostRuntimeStorage(),
+    deps: {
+      createClient: () => fakeClient as unknown as DaemonClient,
+      connectToDaemon: async () => ({
+        client: fakeClient as unknown as DaemonClient,
+        serverId: host.serverId,
+        hostname: null,
+      }),
+      getClientId: async () => "historical-test",
+    },
+  });
+  store.syncHosts([host]);
+  await waitForHostOnline(store, host.serverId);
+  const owner = store.createViewedTimelineOwner(host.serverId, {
+    observe: () => ({ ready: Promise.resolve(), release: async () => undefined }),
+    readCursor: () => undefined,
+    fetchPage: async () => ({ hasNewer: false, endCursor: null }),
+    fetchLatestTail: async () => ({ hasNewer: false, endCursor: null }),
+    reportError: () => undefined,
+    schedule: () => () => undefined,
+  });
+  useSessionStore.getState().setViewedTimelineSync(host.serverId, owner);
+  const report = {
+    kind: "user_message" as const,
+    id: "historical-report",
+    text: "Original report",
+    timestamp: new Date("2026-10-05T20:11:01.479Z"),
+    timelineCursor: { epoch: "retained", seq: 5938 },
+  };
+  useSessionStore.getState().applyAgentTimelineResponseState(host.serverId, "manager", {
+    items: [],
+    head: [report],
+    range: { epoch: "retained", startSeq: 5938, endSeq: 5938 },
+    older: "available",
+    newer: false,
+    synchronized: true,
+    acknowledgedClientMessageIds: [],
+  });
+  const before = selectAgentTimelineState(
+    useSessionStore.getState().sessions[host.serverId],
+    "manager",
+  );
+  const page: TimelineResponsePayload = {
+    requestId: "old-request",
+    agentId: "manager",
+    agent: null,
+    epoch: "retained",
+    direction: "tail",
+    projection: "projected",
+    reset: false,
+    staleCursor: false,
+    gap: false,
+    hasOlder: false,
+    hasNewer: false,
+    error: null,
+    window: { minSeq: 5938, maxSeq: 5938, nextSeq: 5939 },
+    startCursor: { epoch: "retained", seq: 5938 },
+    endCursor: { epoch: "retained", seq: 5938 },
+    entries: [
+      {
+        provider: "mock",
+        seqStart: 5938,
+        seqEnd: 5938,
+        sourceSeqRanges: [{ startSeq: 5938, endSeq: 5938 }],
+        collapsed: [],
+        timestamp: report.timestamp.toISOString(),
+        item: {
+          type: "user_message",
+          text: report.text,
+          messageId: report.id,
+          clientMessageId: report.id,
+        },
+      },
+    ],
+  };
+  try {
+    const pending = store.fetchAgentTimeline(host.serverId, "manager", { direction: "tail" });
+    await started.promise;
+    owner.replaceTimelineEpoch("manager", "retained");
+    response.resolve(page);
+    await pending;
+    expect(
+      selectAgentTimelineState(useSessionStore.getState().sessions[host.serverId], "manager"),
+    ).toEqual(before);
+    expect(
+      useSessionStore.getState().sessions[host.serverId]?.agentStreamHead.get("manager"),
+    ).toEqual([report]);
+    owner.applyTimelineResponse({
+      ...page,
+      requestId: "corrected-request",
+      entries: page.entries?.map((entry) =>
+        Object.assign({}, entry, {
+          item: Object.assign({}, entry.item, { sender: { kind: "agent", agentId: "reviewer" } }),
+        }),
+      ),
+    });
+    expect(
+      useSessionStore.getState().sessions[host.serverId]?.agentStreamHead.get("manager") ?? [],
+    ).toEqual([]);
+    expect(
+      selectAgentTimelineState(useSessionStore.getState().sessions[host.serverId], "manager"),
+    ).toMatchObject({
+      status: "synced",
+      items: [
+        expect.objectContaining({ id: report.id, sender: { kind: "agent", agentId: "reviewer" } }),
+      ],
+    });
+  } finally {
+    owner.dispose();
+    store.syncHosts([]);
+  }
+});
 
 function makeOffer(input?: Partial<ConnectionOffer>): ConnectionOffer {
   return {

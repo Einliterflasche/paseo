@@ -1739,7 +1739,7 @@ export class AgentManager {
       const rows = this.timelineStore.getRows(agentId);
       const updates = prepareHistoricalSenderAttribution({ ...options, rows, sources });
       const previous = this.submittedMessages.get(agentId) ?? [];
-      const messages = mergeHistoricalSubmissions(previous, updates);
+      const messages = mergeHistoricalSubmissions(previous, updates, rows);
       const changed = updates.filter(
         (update) => update.item !== rows.find((row) => row.seq === update.seq)?.item,
       ).length;
@@ -1758,7 +1758,16 @@ export class AgentManager {
           (message) =>
             !updates.some((row) => row.item === message.item) && !previous.includes(message),
         );
-        this.submittedMessages.set(agentId, [...previous, ...arrivals]);
+        // Pending ordinary snapshot writes share this array. Restore it before they serialize.
+        messages.splice(0, messages.length, ...previous, ...arrivals);
+        this.submittedMessages.set(agentId, messages);
+        // A queued snapshot can start before this catch runs. Finish with the restored list.
+        await registry.setSubmittedMessages(agentId, messages).catch((rollbackError) => {
+          this.logger.error(
+            { err: rollbackError, agentId },
+            "Failed to save restored accepted inputs",
+          );
+        });
         throw error;
       }
       const retained = this.recoveryInventory.get(agentId);
@@ -3928,12 +3937,13 @@ export class AgentManager {
     agentId: string,
     options?: HydrateTimelineOptions,
   ): Promise<void> {
-    const agent = this.requireSessionAgent(agentId);
-    await this.hydrateTimelineFromLegacyProviderHistory(agent, options);
+    return this.runLifecycleMutation(agentId, () =>
+      this.hydrateTimelineFromLegacyProviderHistory(this.requireSessionAgent(agentId), options),
+    );
   }
 
   async rewind(agentId: string, messageId: string, mode: RewindMode): Promise<void> {
-    return this.admissions.run(async () => {
+    return this.runLifecycleMutation(agentId, async () => {
       const agent = this.requireSessionAgent(agentId);
       const submittedRow = this.timelineStore
         .getRows(agentId)
@@ -3967,7 +3977,7 @@ export class AgentManager {
               message.providerMessageId === providerMessageId,
           );
           if (target >= 0) this.submittedMessages.set(agentId, messages.slice(0, target));
-          await this.hydrateTimelineFromProvider(agentId, {
+          await this.hydrateTimelineFromLegacyProviderHistory(agent, {
             force: true,
             broadcast: true,
             broadcastTimeline: false,

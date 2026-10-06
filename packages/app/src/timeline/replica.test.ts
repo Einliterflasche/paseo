@@ -82,6 +82,149 @@ function applySynced(agentId: string, seq: number): void {
 
 afterEach(() => useSessionStore.getState().clearSession(SERVER_ID));
 
+it.each(["TIMELINE_BUSY", "error", "old-tail", "old-tail-after-success"])(
+  "keeps same-epoch historical replacement pending through %s",
+  (variation) => {
+    useSessionStore.getState().initializeSession(SERVER_ID, null);
+    const report: StreamItem = {
+      kind: "user_message",
+      id: "accepted-report",
+      text: "Original report",
+      timestamp: new Date("2026-10-05T20:11:01.479Z"),
+      timelineCursor: { epoch: "epoch-1", seq: 5938 },
+    };
+    const cached = [item("stale-cached-row", "Older cached row", 5900), report];
+    const human: StreamItem = {
+      ...report,
+      id: "human",
+      text: "Human input",
+      sender: { kind: "human" },
+      timelineCursor: { epoch: "epoch-1", seq: 5940 },
+    };
+    useSessionStore.getState().applyAgentTimelineResponseState(SERVER_ID, AGENT_ID, {
+      items: [human],
+      head: cached,
+      range: { epoch: "epoch-1", startSeq: 5900, endSeq: 5940 },
+      older: "available",
+      newer: false,
+      synchronized: true,
+      acknowledgedClientMessageIds: [],
+    });
+    let stored: CachedTimeline | undefined;
+    const owner = createOwner({
+      readTimeline: async () => undefined,
+      commitTimeline: (_serverId, _agentId, timeline) => {
+        stored = timeline;
+      },
+    });
+    const response: Parameters<ViewedTimelineOwner["applyTimelineResponse"]>[0] = {
+      requestId: "corrected-tail",
+      agentId: AGENT_ID,
+      agent: null,
+      epoch: "epoch-1",
+      direction: "tail",
+      projection: "projected",
+      reset: false,
+      staleCursor: false,
+      gap: false,
+      hasOlder: true,
+      hasNewer: false,
+      error: null,
+      window: { minSeq: 1, maxSeq: 5940, nextSeq: 5941 },
+      startCursor: { epoch: "epoch-1", seq: 5938 },
+      endCursor: { epoch: "epoch-1", seq: 5940 },
+      entries: [
+        {
+          provider: "mock",
+          seqStart: 5938,
+          seqEnd: 5938,
+          sourceSeqRanges: [{ startSeq: 5938, endSeq: 5938 }],
+          collapsed: [],
+          timestamp: report.timestamp.toISOString(),
+          item: {
+            type: "user_message",
+            text: report.text,
+            messageId: report.id,
+            clientMessageId: report.id,
+            sender: { kind: "agent", agentId: "reviewer" },
+          },
+        },
+        {
+          provider: "mock",
+          seqStart: 5940,
+          seqEnd: 5940,
+          sourceSeqRanges: [{ startSeq: 5940, endSeq: 5940 }],
+          collapsed: [],
+          timestamp: human.timestamp.toISOString(),
+          item: {
+            type: "user_message",
+            text: human.text,
+            messageId: human.id,
+            clientMessageId: human.id,
+            sender: { kind: "human" },
+          },
+        },
+      ],
+    };
+    const oldGeneration = variation.startsWith("old-tail")
+      ? (owner.getTimelineGeneration?.(AGENT_ID) ?? 0)
+      : undefined;
+    owner.replaceTimelineEpoch(AGENT_ID, "epoch-1");
+    const obsoleteResponse = {
+      ...response,
+      requestId: "already-in-flight",
+      entries: response.entries?.map((entry) =>
+        entry.seqEnd === 5938 ? { ...entry, item: { ...entry.item, sender: undefined } } : entry,
+      ),
+    };
+    if (variation === "old-tail") {
+      owner.applyTimelineResponse(obsoleteResponse, oldGeneration);
+    } else if (!variation.startsWith("old-tail")) {
+      owner.applyTimelineResponse({
+        ...response,
+        requestId: "failed-first-tail",
+        entries: [],
+        error: "Timeline temporarily unavailable",
+        ...(variation === "TIMELINE_BUSY" ? { errorCode: "TIMELINE_BUSY" as const } : {}),
+      });
+    }
+    expect(useSessionStore.getState().sessions[SERVER_ID]?.agentStreamHead.get(AGENT_ID)).toEqual(
+      cached,
+    );
+    owner.applyTimelineResponse(response);
+    const corrected = selectAgentTimelineState(
+      useSessionStore.getState().sessions[SERVER_ID],
+      AGENT_ID,
+    );
+    expect(corrected).toMatchObject({
+      status: "synced",
+      range: { epoch: "epoch-1", startSeq: 5938, endSeq: 5940 },
+    });
+    expect(corrected.status === "cold" ? [] : corrected.items).toEqual([
+      expect.objectContaining({
+        id: report.id,
+        text: report.text,
+        timestamp: report.timestamp,
+        sender: { kind: "agent", agentId: "reviewer" },
+        timelineCursor: report.timelineCursor,
+      }),
+      expect.objectContaining(human),
+    ]);
+    expect(
+      useSessionStore.getState().sessions[SERVER_ID]?.agentStreamHead.get(AGENT_ID) ?? [],
+    ).toEqual([]);
+    expect(stored?.items).toEqual(corrected.status === "cold" ? [] : corrected.items);
+    if (variation === "old-tail-after-success") {
+      owner.applyTimelineResponse(obsoleteResponse, oldGeneration);
+      expect(
+        selectAgentTimelineState(useSessionStore.getState().sessions[SERVER_ID], AGENT_ID),
+      ).toEqual(corrected);
+      expect(stored?.items).toEqual(corrected.status === "cold" ? [] : corrected.items);
+    }
+    owner.dispose();
+  },
+);
+
 it("replaces cached historical rows in the same epoch without replaying arrivals", () => {
   useSessionStore.getState().initializeSession(SERVER_ID, null);
   const report: StreamItem = {

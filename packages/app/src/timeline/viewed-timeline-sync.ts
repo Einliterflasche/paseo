@@ -177,12 +177,12 @@ export type TimelineResponsePayload = Extract<
   { type: "fetch_agent_timeline_response" }
 >["payload"];
 
-export function consumeForcedTimelineTailReplacement(
+export function markForcedTimelineTailReplacement(
   payload: TimelineResponsePayload,
   replacements: Set<string>,
 ): TimelineResponsePayload {
   if (payload.direction !== "tail") return payload;
-  if (!replacements.delete(payload.agentId)) return payload;
+  if (!replacements.has(payload.agentId)) return payload;
   return { ...payload, reset: true };
 }
 
@@ -360,7 +360,8 @@ export type ViewedTimelineOwnerPorts = Omit<
 >;
 
 export interface ViewedTimelineOwner extends ViewedTimelineSync {
-  applyTimelineResponse(payload: TimelineResponsePayload): void;
+  getTimelineGeneration(agentId: string): number;
+  applyTimelineResponse(payload: TimelineResponsePayload, generation?: number): void;
   enqueueStreamEvent(agentId: string, event: AgentStreamReducerEvent): void;
   flushStreamAgent(agentId: string): void;
 }
@@ -373,6 +374,12 @@ export function createViewedTimelineOwner(input: {
   ports: ViewedTimelineOwnerPorts;
 }): ViewedTimelineOwner {
   const forcedTailReplacements = new Set<string>();
+  const generations = new Map<string, number>();
+  const getTimelineGeneration = (agentId: string) => generations.get(agentId) ?? 0;
+  const markReplacement = (agentId: string) => {
+    generations.set(agentId, getTimelineGeneration(agentId) + 1);
+    forcedTailReplacements.add(agentId);
+  };
   const sync = createViewedTimelineSync({
     ...input.ports,
     fetchPage: (agentId, request) =>
@@ -380,13 +387,9 @@ export function createViewedTimelineOwner(input: {
         agentId,
         forcedTailReplacements.has(agentId) ? planTimelineTailFetch() : request,
       ),
-    fetchLatestTail: async (agentId) => {
-      forcedTailReplacements.add(agentId);
-      try {
-        return await input.ports.fetchLatestTail(agentId);
-      } finally {
-        forcedTailReplacements.delete(agentId);
-      }
+    fetchLatestTail: (agentId) => {
+      markReplacement(agentId);
+      return input.ports.fetchLatestTail(agentId);
     },
     prepare: (agentId) => input.replica.prepare(agentId),
     readCursor: (agentId) => input.replica.readCursor(agentId) ?? input.ports.readCursor(agentId),
@@ -403,12 +406,17 @@ export function createViewedTimelineOwner(input: {
   });
   return {
     ...sync,
+    getTimelineGeneration,
     replaceTimelineEpoch(agentId, epoch) {
-      forcedTailReplacements.add(agentId);
+      markReplacement(agentId);
       sync.replaceTimelineEpoch(agentId, epoch);
     },
-    applyTimelineResponse(receivedPayload) {
-      const payload = consumeForcedTimelineTailReplacement(receivedPayload, forcedTailReplacements);
+    applyTimelineResponse(
+      receivedPayload,
+      generation = getTimelineGeneration(receivedPayload.agentId),
+    ) {
+      if (generation !== getTimelineGeneration(receivedPayload.agentId)) return;
+      const payload = markForcedTimelineTailReplacement(receivedPayload, forcedTailReplacements);
       const accepted = applyAuthoritativeTimelineResponse({
         serverId: input.serverId,
         payload,
@@ -416,7 +424,10 @@ export function createViewedTimelineOwner(input: {
         recoverGap: (agentId, cursor) => sync.recoverGap(agentId, cursor),
         drainQueuedAgentMessage: input.drainQueuedAgentMessage,
       });
-      if (accepted) input.replica.timelineUpdated(payload.agentId);
+      if (accepted) {
+        if (payload.direction === "tail") forcedTailReplacements.delete(payload.agentId);
+        input.replica.timelineUpdated(payload.agentId);
+      }
     },
     enqueueStreamEvent(agentId, event) {
       streamQueue.enqueue(agentId, event);

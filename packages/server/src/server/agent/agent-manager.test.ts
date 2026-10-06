@@ -1,6 +1,6 @@
 import { expect, test, vi } from "vitest";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, promises as fs } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
@@ -16,6 +16,7 @@ import {
 import { AgentStorage } from "./agent-storage.js";
 import {
   prepareHistoricalSenderAttribution,
+  mergeHistoricalSubmissions,
   reconcileSubmittedHistory,
   type SubmittedMessage,
 } from "./submitted-messages.js";
@@ -11424,7 +11425,7 @@ test("historical attribution accepts a completed tool update only once", () => {
   expect(() => prepareHistoricalSenderAttribution(fixture)).toThrow();
 });
 
-async function historicalRepairManager() {
+async function historicalRepairManager(client: AgentClient = fakeCodexEmitting({})) {
   const workdir = mkdtempSync(join(tmpdir(), "historical-sender-repair-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
   const seed = new AgentManager({
@@ -11469,7 +11470,7 @@ async function historicalRepairManager() {
   checkpoint.timelines[source.id] = { epoch: "source-epoch", nextSeq: 2778, rows: [call] };
   const attention = vi.fn();
   const manager = new AgentManager({
-    clients: { codex: fakeCodexEmitting({}) },
+    clients: { codex: client },
     registry: storage,
     logger,
     onAgentAttention: attention,
@@ -11600,6 +11601,316 @@ test("historical repair rejects a stale epoch and failed save without publishing
     expect(await manager.getCanonicalTimelineRows(request.agentId)).toEqual(original);
     failure.mockRestore();
     expect(await manager.attributeHistoricalSenders(request)).toMatchObject({ changed: 1 });
+  } finally {
+    await manager.closeAgentsForShutdown();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+class HistoricalRepairSession extends TestAgentSession {
+  override readonly capabilities = { ...TEST_CAPABILITIES, supportsRewindConversation: true };
+  readonly rewinds: string[] = [];
+  history: AgentTimelineItem[] = [];
+
+  async revertConversation({ messageId }: { messageId: string }): Promise<void> {
+    this.rewinds.push(messageId);
+    this.history = [
+      { type: "user_message", text: "Different human input", messageId: "different-human" },
+    ];
+  }
+
+  override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+    for (const item of this.history) yield { type: "timeline", provider: "codex", item };
+  }
+}
+
+class HistoricalRepairClient extends TestAgentClient {
+  session: HistoricalRepairSession | undefined;
+  override async resumeSession(
+    _handle: AgentPersistenceHandle,
+    config?: Partial<AgentSessionConfig>,
+  ): Promise<AgentSession> {
+    this.session = new HistoricalRepairSession({
+      provider: "codex",
+      cwd: config?.cwd ?? process.cwd(),
+    });
+    return this.session;
+  }
+}
+
+function holdHistoricalAtomicWrite(workdir: string, agentId: string, fail = false) {
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const rename = fs.rename.bind(fs);
+  let held = false;
+  const spy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+    if (
+      !held &&
+      typeof to === "string" &&
+      to.startsWith(join(workdir, "agents")) &&
+      to.endsWith(`${agentId}.json`)
+    ) {
+      held = true;
+      entered.resolve();
+      await release.promise;
+      if (fail) throw new Error("Injected atomic rename failure");
+    }
+    await rename(from, to);
+  });
+  return {
+    entered: entered.promise,
+    release: () => release.resolve(),
+    restore: () => spy.mockRestore(),
+  };
+}
+
+test.each(["rewind", "history"])(
+  "historical repair serializes pending normal storage with %s replacement",
+  async (operation) => {
+    const client = new HistoricalRepairClient();
+    const { manager, storage, request, workdir } = await historicalRepairManager(client);
+    await ensureAgentLoaded(request.agentId, {
+      agentManager: manager,
+      agentStorage: storage,
+      logger,
+    });
+    await manager.flush();
+    const before = await manager.getCanonicalTimelineRows(request.agentId);
+    const held = holdHistoricalAtomicWrite(workdir, request.agentId);
+    const events: AgentManagerEvent[] = [];
+    const unsubscribe = manager.subscribe((event) => events.push(event), { replayState: false });
+    let repair: Promise<unknown> | undefined;
+    let replacement: Promise<void> | undefined;
+    try {
+      repair = manager.attributeHistoricalSenders(request);
+      await held.entered;
+      let finished = false;
+      if (operation === "rewind")
+        replacement = manager.rewind(
+          request.agentId,
+          request.evidence[0]!.messageId,
+          "conversation",
+        );
+      else {
+        client.session!.history = [
+          { type: "user_message", text: "Different human input", messageId: "different-human" },
+        ];
+        replacement = manager.hydrateTimelineFromProvider(request.agentId, { force: true });
+      }
+      void replacement.then(() => {
+        finished = true;
+        return undefined;
+      });
+      // A queued operation gets an event-loop turn while the real atomic write remains held.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(finished).toBe(false);
+      expect(client.session!.rewinds).toEqual([]);
+      expect(manager.fetchTimeline(request.agentId).epoch).toBe(request.epoch);
+      expect(await manager.getCanonicalTimelineRows(request.agentId)).toEqual(before);
+      held.release();
+      await expect(repair).resolves.toMatchObject({ epoch: request.epoch, changed: 1 });
+      await replacement;
+      await manager.flush();
+      const after = await manager.getCanonicalTimelineRows(request.agentId);
+      const newHuman = after.find(
+        (row) => row.item.type === "user_message" && row.item.messageId === "different-human",
+      );
+      expect(newHuman?.item).toEqual({
+        type: "user_message",
+        text: "Different human input",
+        messageId: "different-human",
+      });
+      expect(manager.fetchTimeline(request.agentId).epoch).not.toBe(request.epoch);
+      const saved =
+        (await new AgentStorage(join(workdir, "agents"), logger).get(request.agentId))
+          ?.submittedMessages ?? [];
+      if (operation === "rewind") {
+        expect(saved).toEqual([]);
+        expect(
+          after.some(
+            (row) =>
+              row.item.type === "user_message" &&
+              row.item.messageId === request.evidence[0]!.messageId,
+          ),
+        ).toBe(false);
+      } else
+        expect(saved[0]?.item.sender).toEqual({
+          kind: "agent",
+          agentId: request.evidence[0]!.sourceAgentId,
+        });
+      expect(
+        events.filter((event) => event.type === "timeline_replacement").map((event) => event.epoch),
+      ).toEqual(
+        operation === "rewind"
+          ? [request.epoch, manager.fetchTimeline(request.agentId).epoch]
+          : [request.epoch],
+      );
+    } finally {
+      held.release();
+      await Promise.allSettled([repair, replacement]);
+      held.restore();
+      unsubscribe();
+      await manager.closeAgentsForShutdown();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each([false, true])(
+  "historical repair retains fresh provider input during normal atomic save (failure=%s)",
+  async (failure) => {
+    const client = new HistoricalRepairClient();
+    const { manager, storage, request, workdir } = await historicalRepairManager(client);
+    await ensureAgentLoaded(request.agentId, {
+      agentManager: manager,
+      agentStorage: storage,
+      logger,
+    });
+    await manager.flush();
+    const held = holdHistoricalAtomicWrite(workdir, request.agentId, failure);
+    let repair: Promise<{ value?: unknown; error?: unknown }> | undefined;
+    try {
+      repair = manager.attributeHistoricalSenders(request).then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      );
+      await held.entered;
+      client.session!.pushEvent({
+        type: "timeline",
+        provider: "codex",
+        item: {
+          type: "user_message",
+          text: "Fresh human input",
+          clientMessageId: "fresh-accepted",
+          messageId: "fresh-provider",
+        },
+      });
+      await vi.waitFor(() =>
+        expect(manager.fetchTimeline(request.agentId).rows).toContainEqual(
+          expect.objectContaining({
+            providerMessageId: "fresh-provider",
+            item: expect.objectContaining({
+              clientMessageId: "fresh-accepted",
+              sender: { kind: "human" },
+            }),
+          }),
+        ),
+      );
+      held.release();
+      const result = await repair;
+      if (failure) expect(result.error).toEqual(new Error("Injected atomic rename failure"));
+      else expect(result.value).toMatchObject({ changed: 1, epoch: request.epoch });
+      await manager.flush();
+      const saved =
+        (await new AgentStorage(join(workdir, "agents"), logger).get(request.agentId))
+          ?.submittedMessages ?? [];
+      expect(saved.filter((message) => message.item.clientMessageId === "fresh-accepted")).toEqual([
+        expect.objectContaining({
+          providerMessageId: "fresh-provider",
+          item: {
+            type: "user_message",
+            text: "Fresh human input",
+            messageId: "fresh-accepted",
+            clientMessageId: "fresh-accepted",
+            sender: { kind: "human" },
+          },
+        }),
+      ]);
+      expect(
+        saved.some((message) => message.item.messageId === request.evidence[0]!.messageId),
+      ).toBe(!failure);
+      const item = manager
+        .fetchTimeline(request.agentId)
+        .rows.find((row) => row.seq === 5938)?.item;
+      expect(item?.type === "user_message" ? item.sender : null).toEqual(
+        failure ? undefined : { kind: "agent", agentId: request.evidence[0]!.sourceAgentId },
+      );
+    } finally {
+      held.release();
+      await repair;
+      held.restore();
+      await manager.closeAgentsForShutdown();
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
+
+test("historical merge preserves nonmonotonic human acceptance order through save and native reconciliation", async () => {
+  const { manager, storage, request, workdir } = await historicalRepairManager();
+  try {
+    const first: SubmittedMessage = {
+      item: {
+        type: "user_message",
+        text: "First human",
+        messageId: "human-first",
+        clientMessageId: "human-first",
+        sender: { kind: "human" },
+      },
+      timestamp: "2026-10-05T20:01:00.000Z",
+      providerMessageId: "native-first",
+    };
+    const second: SubmittedMessage = {
+      item: {
+        type: "user_message",
+        text: "Second human",
+        messageId: "human-second",
+        clientMessageId: "human-second",
+        sender: { kind: "human" },
+      },
+      timestamp: "2026-10-05T20:00:00.000Z",
+      providerMessageId: "native-second",
+    };
+    const original = [first, second];
+    const rows = await manager.getCanonicalTimelineRows(request.agentId);
+    const canonical = [{ seq: 5936, ...first }, ...rows, { seq: 5939, ...second }];
+    const updates = prepareHistoricalSenderAttribution({
+      agentId: request.agentId,
+      rows,
+      evidence: request.evidence,
+      sources: new Map([
+        [
+          request.evidence[0]!.sourceAgentId,
+          await manager.getCanonicalTimelineRows(request.evidence[0]!.sourceAgentId),
+        ],
+      ]),
+    });
+    const merged = mergeHistoricalSubmissions(original, updates, canonical);
+    expect(merged.filter((message) => message.item.sender?.kind === "human")).toEqual(original);
+    expect(merged.map((message) => message.item.messageId)).toEqual([
+      first.item.messageId,
+      request.evidence[0]!.messageId,
+      second.item.messageId,
+    ]);
+    await storage.setSubmittedMessages(request.agentId, merged);
+    const saved = (await new AgentStorage(join(workdir, "agents"), logger).get(request.agentId))!
+      .submittedMessages!;
+    expect(saved.filter((message) => message.item.sender?.kind === "human")).toEqual(original);
+    const history = saved.map((message) => ({
+      type: "timeline" as const,
+      provider: "codex" as const,
+      item: {
+        type: "user_message" as const,
+        text: "Provider normalized",
+        messageId: message.providerMessageId,
+      },
+    }));
+    const replayed = reconcileSubmittedHistory(history, saved, "codex");
+    const humans = replayed.filter(
+      (event) => event.item.type === "user_message" && event.item.sender?.kind === "human",
+    );
+    expect(
+      humans.map((event) => ({
+        item: event.item,
+        timestamp: event.timestamp,
+        providerMessageId: event.providerMessageId,
+      })),
+    ).toEqual(
+      original.map((message) => ({
+        item: message.item,
+        timestamp: message.timestamp,
+        providerMessageId: message.providerMessageId,
+      })),
+    );
   } finally {
     await manager.closeAgentsForShutdown();
     rmSync(workdir, { recursive: true, force: true });
