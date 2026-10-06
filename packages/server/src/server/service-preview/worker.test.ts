@@ -1,5 +1,5 @@
 import { once } from "node:events";
-import { mkdtemp, readdir } from "node:fs/promises";
+import { mkdtemp, readdir, readFile } from "node:fs/promises";
 import {
   createServer,
   request as httpRequest,
@@ -18,7 +18,8 @@ import { ServicePreviewPrepareResponseMessageSchema } from "../messages.js";
 import { PreviewBroker } from "./broker.js";
 import { PreviewRoutes } from "./routes.js";
 import { PREVIEW_SOURCE_CAPABILITY, PreviewSources } from "./sources.js";
-import { startPreviewGatewayWorker } from "./worker.js";
+import { startPreviewGatewayWorker, type PreviewWorkerDiagnostic } from "./worker.js";
+import { previewWorkerErrorCode } from "./worker-protocol.js";
 
 const origin = "https://control.test";
 const prefix = "/__paseo_services/apps/atlas/";
@@ -73,7 +74,7 @@ function observeWebSocket(socket: WebSocket) {
   return { socket, messages, closed, ready: ready.promise };
 }
 
-async function fixture() {
+async function fixture(onDiagnostic?: (event: PreviewWorkerDiagnostic) => void) {
   const directory = await mkdtemp(join(tmpdir(), "paseo-gw-wire-"));
   const socketPath = join(directory, "gateway.sock");
   const observed: Array<{
@@ -84,6 +85,7 @@ async function fixture() {
     authorization: string | undefined;
   }> = [];
   const failures: unknown[] = [];
+  const diagnostics: PreviewWorkerDiagnostic[] = [];
   const tcp = new Set<Socket>();
   const clients: WebSocket[] = [];
   const appSockets: ReturnType<typeof observeWebSocket>[] = [];
@@ -164,6 +166,10 @@ async function fixture() {
     broker,
     socketPath,
     controlCookieNames: ["paseo-control"],
+    onDiagnostic(event) {
+      diagnostics.push(event);
+      onDiagnostic?.(event);
+    },
     onFailure: (error) => {
       failures.push(error);
     },
@@ -317,6 +323,7 @@ async function fixture() {
     socketPath,
     upstreamPort: address.port,
     failures,
+    diagnostics,
     connections: () => connections,
   };
 }
@@ -395,6 +402,7 @@ describe("isolated forked preview gateway", () => {
     const sources = new PreviewSources(origin);
     const routes = new PreviewRoutes({ excludedPorts: [] });
     const failures: unknown[] = [];
+    const diagnostics: PreviewWorkerDiagnostic[] = [];
     const broker = new PreviewBroker({ sources, routes, onFailure() {} });
     const nodeExecutable = join(directory, "nonexistent-node");
     const worker = startPreviewGatewayWorker({
@@ -402,6 +410,9 @@ describe("isolated forked preview gateway", () => {
       socketPath: join(directory, "gateway.sock"),
       controlCookieNames: [],
       nodeExecutable,
+      onDiagnostic(event) {
+        diagnostics.push(event);
+      },
       onFailure(error) {
         failures.push(error);
       },
@@ -419,6 +430,14 @@ describe("isolated forked preview gateway", () => {
     expect(broker.isClosed).toBe(true);
     expect(failures).toHaveLength(1);
     expect(failures[0]).toMatchObject({ code: "ENOENT", path: nodeExecutable });
+    expect(diagnostics.find((event) => event.event === "process-error")).toEqual({
+      event: "process-error",
+      pid: null,
+      parentPid: process.pid,
+      startTicks: null,
+      ready: false,
+      code: "ENOENT",
+    });
     expect(await readdir(directory)).toEqual([]);
   });
 
@@ -432,10 +451,14 @@ describe("isolated forked preview gateway", () => {
     const routes = new PreviewRoutes({ excludedPorts: [] });
     const broker = new PreviewBroker({ sources, routes, onFailure() {} });
     const failures: unknown[] = [];
+    const diagnostics: PreviewWorkerDiagnostic[] = [];
     const worker = startPreviewGatewayWorker({
       broker,
       socketPath,
       controlCookieNames: [],
+      onDiagnostic(event) {
+        diagnostics.push(event);
+      },
       onFailure(error) {
         failures.push(error);
       },
@@ -460,6 +483,82 @@ describe("isolated forked preview gateway", () => {
     });
     expect(body).toBe("existing-owner");
     expect(failures).toEqual([]);
+    expect(diagnostics.find((event) => event.event === "startup-failed")).toMatchObject({
+      pid: worker.pid,
+      parentPid: process.pid,
+      ready: false,
+      step: "listen",
+      code: "EADDRINUSE",
+    });
+    expect(diagnostics.find((event) => event.event === "exit")).toMatchObject({
+      pid: worker.pid,
+      ready: false,
+      exitCode: 1,
+      signal: null,
+    });
+  });
+
+  it("records an identified ready gateway loss and rejects its retired grant in a fresh owner", async () => {
+    const host = await fixture();
+    const { cookie } = await host.open();
+    const hmr = host.websocket(cookie);
+    await hmr.ready;
+    const ready = host.diagnostics.find((event) => event.event === "ready");
+    expect(ready).toMatchObject({ pid: host.worker.pid, parentPid: process.pid, ready: true });
+    if (process.platform === "linux") {
+      const stat = await readFile(`/proc/${host.worker.pid}/stat`, "utf8");
+      expect(ready?.startTicks).toBe(
+        stat
+          .slice(stat.lastIndexOf(") ") + 2)
+          .trim()
+          .split(/\s+/)[19],
+      );
+    }
+    process.kill(host.worker.pid!, "SIGKILL");
+    await host.worker.closed;
+    expect(await hmr.closed).toBe(1006);
+    expect(host.broker.isClosed).toBe(true);
+    expect(host.diagnostics.find((event) => event.event === "exit")).toEqual({
+      event: "exit",
+      pid: host.worker.pid!,
+      parentPid: process.pid,
+      startTicks: ready!.startTicks,
+      ready: true,
+      exitCode: null,
+      signal: "SIGKILL",
+    });
+    expect(() =>
+      startPreviewGatewayWorker({
+        broker: host.broker,
+        socketPath: host.socketPath,
+        controlCookieNames: [],
+        onFailure() {},
+      }),
+    ).toThrow("preview-broker-already-attached");
+    expect(await (await fetch(`http://127.0.0.1:${host.upstreamPort}${prefix}`)).text()).toBe(html);
+    const replacement = await fixture();
+    expect((await replacement.request(prefix, { headers: appHeaders(cookie) })).status).toBe(403);
+    const fresh = await replacement.open();
+    expect((await replacement.request(prefix, { headers: appHeaders(fresh.cookie) })).status).toBe(
+      200,
+    );
+    expect((await replacement.request(prefix, { headers: appHeaders(cookie) })).status).toBe(403);
+  });
+
+  it("keeps diagnostic failures outside the feature lifetime and excludes arbitrary error text", async () => {
+    const host = await fixture(() => {
+      throw new Error("diagnostic sink unavailable");
+    });
+    const { cookie } = await host.open();
+    expect((await host.request(prefix, { headers: appHeaders(cookie) })).status).toBe(200);
+    host.worker.close();
+    await host.worker.closed;
+    expect(host.broker.isClosed).toBe(true);
+    expect(host.diagnostics.some((event) => event.event === "exit")).toBe(true);
+    expect(
+      previewWorkerErrorCode({ code: "private-placeholder", message: "private-placeholder" }),
+    ).toBe("UNKNOWN");
+    expect(previewWorkerErrorCode(new Error("private-placeholder"))).toBe("UNKNOWN");
   });
 
   it("serves HTML, assets and one chunked form body and forwards the Vite HMR protocol", async () => {

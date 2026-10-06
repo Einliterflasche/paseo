@@ -6,6 +6,7 @@ import type { WorkspaceScriptRuntimeStore } from "../workspace-script-runtime-st
 import { openPreviewFeature } from "./feature.js";
 import { readPreviewFeaturePolicy } from "./policy.js";
 import type { PreviewTransportConfiguration } from "./transport-config.js";
+import type { PreviewWorkerDiagnostic } from "./worker.js";
 
 interface ConfiguredPreviewOptions {
   transport: PreviewTransportConfiguration;
@@ -17,6 +18,7 @@ interface ConfiguredPreviewOptions {
   runtime: WorkspaceScriptRuntimeStore;
   endpoints: ServiceProxySubsystem;
   onFailure(error: unknown): void | Promise<void>;
+  onDiagnostic?(event: PreviewWorkerDiagnostic): void;
 }
 
 /** The caller keeps ordinary Paseo available if this opt-in feature cannot start. */
@@ -54,5 +56,6 @@ export async function openConfiguredPreviewFeature(options: ConfiguredPreviewOpt
     runtime: options.runtime,
     endpoints: options.endpoints,
     onFailure: options.onFailure,
+    onDiagnostic: options.onDiagnostic,
   });
 }

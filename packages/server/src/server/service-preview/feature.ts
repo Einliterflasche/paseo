@@ -11,7 +11,7 @@ import { getScriptConfigs, isServiceScript, readPaseoConfig } from "../../utils/
 import { PreviewRegistrationStore } from "./registrations.js";
 import { PreviewRoutes } from "./routes.js";
 import { PreviewSources } from "./sources.js";
-import { startPreviewGatewayWorker } from "./worker.js";
+import { startPreviewGatewayWorker, type PreviewWorkerDiagnostic } from "./worker.js";
 import { probeHttpCapability } from "./http-capability.js";
 
 interface PreviewFeatureOptions {
@@ -28,6 +28,7 @@ interface PreviewFeatureOptions {
     "getWorkspaceHealthTargets" | "subscribeWorkspaceServices"
   >;
   onFailure(error: unknown): void | Promise<void>;
+  onDiagnostic?(event: PreviewWorkerDiagnostic): void;
 }
 
 /** Opt-in feature owner; creating it never installs or changes public ingress. */
@@ -214,6 +215,7 @@ export async function openPreviewFeature(options: PreviewFeatureOptions) {
       socketPath: options.socketPath,
       controlCookieNames: options.controlCookieNames,
       onFailure,
+      onDiagnostic: options.onDiagnostic,
     });
     await worker.ready;
     void worker.closed.then(close);

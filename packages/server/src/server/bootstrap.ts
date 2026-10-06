@@ -24,6 +24,7 @@ import { z } from "zod";
 import { createBranchChangeRouteHandler } from "./script-route-branch-handler.js";
 import { createPreviewIngress, type PreviewIngressTarget } from "./service-preview/ingress.js";
 import { openConfiguredPreviewFeature } from "./service-preview/configured-feature.js";
+import { previewWorkerErrorCode } from "./service-preview/worker-protocol.js";
 import type { PreviewTransportConfiguration } from "./service-preview/transport-config.js";
 import { admitControlRequest, controlAuthorities } from "./service-preview/control-transport.js";
 
@@ -1843,8 +1844,9 @@ export async function createPaseoDaemon(
     workspaces: FileBackedWorkspaceRegistry,
   ) {
     if (!config.servicePreviewTransport) return null;
+    logger.info("Service preview initialization starting");
     try {
-      return await openConfiguredPreviewFeature({
+      const feature = await openConfiguredPreviewFeature({
         transport: config.servicePreviewTransport,
         paseoHome: config.paseoHome,
         auth: config.auth,
@@ -1853,12 +1855,20 @@ export async function createPaseoDaemon(
         workspaces,
         runtime: scriptRuntimeStore,
         endpoints: serviceProxy,
-        onFailure: () => logger.error("Service preview component failed"),
+        onFailure: (error) =>
+          logger.error({ code: previewWorkerErrorCode(error) }, "Service preview component failed"),
+        onDiagnostic: (previewGateway) =>
+          logger.info({ previewGateway }, "Service preview gateway lifecycle"),
       });
-    } catch {
+      logger.info({ enabled: feature !== null }, "Service preview initialization completed");
+      return feature;
+    } catch (error) {
       // Invalid feature state stays on disk and the reserved ingress stays
       // closed. Ordinary sessions can still reach this daemon.
-      logger.error("Service previews unavailable; inspect transport and policy settings");
+      logger.error(
+        { code: previewWorkerErrorCode(error) },
+        "Service previews unavailable; inspect transport and policy settings",
+      );
       return null;
     }
   }

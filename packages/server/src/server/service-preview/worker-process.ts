@@ -7,11 +7,16 @@ import type { PreviewGatewayMessage } from "./channel.js";
 import { createPreviewGateway } from "./gateway.js";
 import { createPreviewIngress } from "./ingress.js";
 import { createPreviewIpcChannel } from "./ipc-channel.js";
-import { PreviewWorkerStartSchema, type PreviewWorkerStart } from "./worker-protocol.js";
+import {
+  PreviewWorkerStartSchema,
+  previewWorkerErrorCode,
+  type PreviewWorkerStart,
+} from "./worker-protocol.js";
 
 const lifetime = new AbortController();
 let started = false;
 let closeGateway = () => {};
+let startupStep: "oom-preference" | "gateway" | "listen" = "oom-preference";
 
 function close(): void {
   if (lifetime.signal.aborted) return;
@@ -22,6 +27,7 @@ function close(): void {
 
 async function start(config: PreviewWorkerStart): Promise<void> {
   preferServiceOomKill();
+  startupStep = "gateway";
   const channel = createPreviewIpcChannel<PreviewGatewayMessage>({
     signal: lifetime.signal,
     send(frame, completed) {
@@ -74,6 +80,7 @@ async function start(config: PreviewWorkerStart): Promise<void> {
   }
   // A caller-owned unique Unix socket avoids a selectable infrastructure TCP
   // endpoint. Never unlink an existing pathname to make startup succeed.
+  startupStep = "listen";
   server.listen({ path: config.socketPath });
   await once(server, "listening");
   server.on("error", close);
@@ -93,7 +100,20 @@ process.on("message", (raw: unknown) => {
     return;
   }
   started = true;
-  void start(config.data).catch(() => {
+  void start(config.data).catch((error: unknown) => {
+    try {
+      process.send?.(
+        {
+          type: "preview-startup-failed",
+          channelId: config.data.channelId,
+          step: startupStep,
+          code: previewWorkerErrorCode(error),
+        },
+        () => {},
+      );
+    } catch {
+      /* A lost IPC channel must not prevent the original startup teardown. */
+    }
     process.exitCode = 1;
     close();
   });
