@@ -83,7 +83,6 @@ describe("Codex executable discovery", () => {
   });
 });
 
-import { CodexAppServerClient } from "./codex/app-server-transport.js";
 import {
   createFakeCodexAppServer,
   type FakeCodexAppServer,
@@ -1279,40 +1278,6 @@ describe("Codex app-server provider", () => {
     expect((startCall!.params as Record<string, unknown>).ephemeral).toBeUndefined();
   });
 
-  test("disposes an unresponsive app-server child with SIGKILL", async () => {
-    vi.useFakeTimers();
-    const child = new EventEmitter() as ChildProcessWithoutNullStreams;
-    child.stdin = new PassThrough() as ChildProcessWithoutNullStreams["stdin"];
-    child.stdout = new PassThrough() as ChildProcessWithoutNullStreams["stdout"];
-    child.stderr = new PassThrough() as ChildProcessWithoutNullStreams["stderr"];
-    child.exitCode = null;
-    child.signalCode = null;
-    child.kill = vi.fn((signal) => {
-      if (signal === "SIGKILL") {
-        child.signalCode = "SIGKILL";
-        child.emit("exit", null, "SIGKILL");
-        child.stdout.end();
-        child.stderr.end();
-        child.emit("close", null, "SIGKILL");
-      }
-      return true;
-    }) as ChildProcessWithoutNullStreams["kill"];
-    const client = new CodexAppServerClient(child, createTestLogger());
-
-    try {
-      const disposePromise = client.dispose();
-      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
-
-      await vi.advanceTimersByTimeAsync(2_000);
-      expect(child.kill).toHaveBeenCalledWith("SIGKILL");
-
-      await vi.advanceTimersByTimeAsync(1_000);
-      await expect(disposePromise).resolves.toBeUndefined();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
   test("round-trips server-initiated command approvals through the real app-server transport", async () => {
     const appServer = createFakeCodexAppServer({
       initialize: () => ({}),
@@ -1873,7 +1838,10 @@ describe("Codex app-server provider", () => {
       "thread resume failed",
     );
 
-    expect(killSpy).toHaveBeenCalledWith("SIGTERM");
+    // The fake child has no pid. ProcessTreeOwner.acquire() in src/utils/tree-kill.ts
+    // treats that as a process the OS never created: it stops it with one plain kill()
+    // and never escalates signals.
+    expect(killSpy.mock.calls).toEqual([[]]);
     appServer.assertNoErrors();
   });
 
@@ -1890,7 +1858,8 @@ describe("Codex app-server provider", () => {
       provider.resumeSession(archivedThreadHandle(), undefined, undefined, { purpose: "history" }),
     ).rejects.toThrow("thread history is unavailable");
 
-    expect(killSpy).toHaveBeenCalledWith("SIGTERM");
+    // A pid-less fake child is stopped with one plain kill(), as in the test above.
+    expect(killSpy.mock.calls).toEqual([[]]);
     appServer.assertNoErrors();
   });
 

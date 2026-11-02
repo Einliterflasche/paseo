@@ -50,6 +50,41 @@ describe("Codex app-server transport", () => {
     expect(attempts).toBe(3);
   });
 
+  test("disposes an unresponsive app-server child with SIGKILL", async () => {
+    // Process-tree ownership signals the real process it inspected, so this needs a
+    // live child: one that ignores SIGTERM and keeps running until SIGKILL.
+    const child = spawn(
+      process.execPath,
+      [
+        "-e",
+        String.raw`
+      process.on("SIGTERM", () => process.stderr.write("ignored SIGTERM\n"));
+      setInterval(() => {}, 1000);
+      process.stderr.write("ready\n");
+    `,
+      ],
+      { stdio: "pipe" },
+    );
+    let stderr = "";
+    const ready = new Promise<void>((resolve) => {
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+        if (stderr.includes("ready\n")) resolve();
+      });
+    });
+    const client = new CodexAppServerClient(child, createTestLogger());
+    try {
+      await ready;
+
+      await expect(client.dispose()).resolves.toBeUndefined();
+
+      expect(stderr).toBe("ready\nignored SIGTERM\n");
+      expect(child.signalCode).toBe("SIGKILL");
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }
+  });
+
   test("an unrelated completed turn cannot certify a lost process with an unanswered start", async () => {
     const child = spawn(
       process.execPath,
