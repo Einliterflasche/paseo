@@ -3938,9 +3938,13 @@ export class AgentManager {
     agentId: string,
     options?: HydrateTimelineOptions,
   ): Promise<void> {
-    return this.runLifecycleMutation(agentId, () =>
-      this.hydrateTimelineFromLegacyProviderHistory(this.requireSessionAgent(agentId), options),
-    );
+    this.requireSessionAgent(agentId);
+    return this.runLifecycleMutation(agentId, async () => {
+      // A close or archive queued ahead of this request ended the runtime it was
+      // asked to hydrate, so no live session is left to read history from.
+      const agent = this.agents.get(agentId);
+      if (agent) await this.hydrateTimelineFromLegacyProviderHistory(agent, options);
+    });
   }
 
   async rewind(agentId: string, messageId: string, mode: RewindMode): Promise<void> {

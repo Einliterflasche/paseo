@@ -60,17 +60,31 @@ export async function ensureUnarchivedAgentLoaded(
   return agent;
 }
 
+function joinPendingAgentInitialization(
+  agentId: string,
+  deps: EnsureAgentLoadedDeps,
+): Promise<ManagedAgent> | undefined {
+  const pending = pendingAgentInitializations.get(agentId);
+  if (!pending) return undefined;
+  pending.options.broadcastTimeline ||= deps.broadcastTimeline === true;
+  return pending.promise;
+}
+
 export async function ensureAgentLoaded(
   agentId: string,
   deps: EnsureAgentLoadedDeps,
 ): Promise<ManagedAgent> {
+  // An in-flight initialization already passed both close barriers. Its history
+  // hydration runs in this agent's lifecycle lane, so join it before waiting on
+  // that lane. Waiting first would let the hydration finish without this load's
+  // broadcast request.
+  const joined = joinPendingAgentInitialization(agentId, deps);
+  if (joined) return joined;
+
   await deps.agentManager.waitForAgentClose?.(agentId);
 
-  const inflight = pendingAgentInitializations.get(agentId);
-  if (inflight) {
-    inflight.options.broadcastTimeline ||= deps.broadcastTimeline === true;
-    return inflight.promise;
-  }
+  const inflight = joinPendingAgentInitialization(agentId, deps);
+  if (inflight) return inflight;
 
   const existing = deps.agentManager.getAgent(agentId);
   if (existing) {
@@ -82,11 +96,8 @@ export async function ensureAgentLoaded(
   // before storage-backed resume begins.
   await deps.agentManager.waitForAgentClose?.(agentId);
 
-  const laterInflight = pendingAgentInitializations.get(agentId);
-  if (laterInflight) {
-    laterInflight.options.broadcastTimeline ||= deps.broadcastTimeline === true;
-    return laterInflight.promise;
-  }
+  const laterInflight = joinPendingAgentInitialization(agentId, deps);
+  if (laterInflight) return laterInflight;
 
   const pendingOptions = {
     broadcastTimeline: deps.broadcastTimeline === true,
