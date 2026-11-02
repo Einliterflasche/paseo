@@ -5448,6 +5448,40 @@ export class Session {
     return this.isProviderVisibleToClient(payload.provider) ? payload : null;
   }
 
+  /**
+   * Opening an agent loads its session, because only a live session reports its modes and
+   * features. Installed checkpoint history stays readable without a provider while recovery
+   * holds admission, and when its saved native session cannot be resumed. Opening only
+   * resumes a saved native session: without one, the loader would start a fresh
+   * conversation and discard the installed history.
+   */
+  private async loadTimelineAgentPayload(agentId: string): Promise<AgentSnapshotPayload | null> {
+    const loader = {
+      agentManager: this.agentManager,
+      agentStorage: this.agentStorage,
+      logger: this.sessionLogger,
+    };
+    if (!this.agentManager.hasInstalledHistory(agentId)) {
+      return this.buildAgentPayload(await ensureAgentLoaded(agentId, loader));
+    }
+    if (
+      !this.agentManager.getAgent(agentId) &&
+      this.agentManager.recoveryPhase === "running" &&
+      toAgentPersistenceHandle(
+        this.agentManager.getRegisteredProviderIds(),
+        (await this.agentStorage.get(agentId))?.persistence,
+      )
+    ) {
+      await ensureAgentLoaded(agentId, loader).catch((error: unknown) => {
+        this.sessionLogger.warn(
+          { err: error, agentId },
+          "Serving installed history without a native session",
+        );
+      });
+    }
+    return this.getAgentPayloadById(agentId);
+  }
+
   private async resolveDelegationRootWorkspaceId(agentId: string): Promise<string | null> {
     const seen = new Set<string>();
     let currentAgentId = agentId;
@@ -7828,15 +7862,7 @@ export class Session {
       : undefined;
 
     try {
-      const agentPayload = this.agentManager.hasInstalledHistory(msg.agentId)
-        ? await this.getAgentPayloadById(msg.agentId)
-        : await this.buildAgentPayload(
-            await ensureAgentLoaded(msg.agentId, {
-              agentManager: this.agentManager,
-              agentStorage: this.agentStorage,
-              logger: this.sessionLogger,
-            }),
-          );
+      const agentPayload = await this.loadTimelineAgentPayload(msg.agentId);
       if (!agentPayload) throw new Error(`Agent not found: ${msg.agentId}`);
 
       const fetchedControlTimeline = this.agentManager.fetchTimeline(msg.agentId, {

@@ -165,6 +165,73 @@ test("two real process replacements preserve the prefix and never duplicate or r
   expect(await dispatches(home)).toEqual(calls);
 }, 30_000);
 
+/** Restoration installs an idle agent's history without resuming its native session. */
+async function restartWithIdleAgent(behavior?: string) {
+  const home = await mkdtemp(join(tmpdir(), "paseo-restored-idle-"));
+  const old = await launch(home, undefined, behavior);
+  const agent = await old.client.createAgent({
+    provider: "codex",
+    cwd: home,
+    modeId: "full-access",
+  });
+  await old.client.sendAgentMessage(agent.id, "finish", { messageId: "idle-1" });
+  await old.client.waitForFinish(agent.id, 5000);
+  const before = await old.client.fetchAgentTimeline(agent.id, { limit: 0 });
+  expect(before.agent?.features).toHaveLength(1);
+  expect(before.agent?.availableModes).not.toHaveLength(0);
+  const checkpoint = await old.client.prepareRestart();
+  const exited = once(old.child, "exit");
+  await old.client.restartServer();
+  await exited;
+  await old.client.close();
+
+  const next = await launch(home, old.port, behavior);
+  expect(next.client.getLastServerInfoMessage()).toMatchObject({
+    restartRecoveryState: "running",
+    restartRecoveryGeneration: checkpoint.generationId,
+  });
+  return { home, agentId: agent.id, before, next };
+}
+
+test("opening an idle restored agent exposes its live controls over the saved history", async () => {
+  const { home, agentId, before, next } = await restartWithIdleAgent();
+  const opened = await next.client.fetchAgentTimeline(agentId, { limit: 0 });
+  expect({
+    features: opened.agent?.features,
+    availableModes: opened.agent?.availableModes,
+    currentModeId: opened.agent?.currentModeId,
+  }).toEqual({
+    features: before.agent?.features,
+    availableModes: before.agent?.availableModes,
+    currentModeId: "full-access",
+  });
+  expect(opened.epoch).toBe(before.epoch);
+  expect(opened.entries).toEqual(before.entries);
+  expect(await dispatches(home)).toEqual([
+    expect.objectContaining({ text: "finish", resumed: false, messageId: "idle-1" }),
+  ]);
+}, 30_000);
+
+test("an idle restored agent whose native session cannot resume keeps its saved history readable", async () => {
+  const { agentId, before, next } = await restartWithIdleAgent("fail-resume");
+  const opened = await next.client.fetchAgentTimeline(agentId, { limit: 0 });
+  expect(opened.epoch).toBe(before.epoch);
+  expect(opened.entries).toEqual(before.entries);
+  expect(opened.agent).toMatchObject({ id: agentId, availableModes: [] });
+}, 30_000);
+
+test("opening an idle restored agent without a native session handle never replaces its saved history", async () => {
+  const { home, agentId, before, next } = await restartWithIdleAgent("without-session-handle");
+  expect(before.agent?.persistence ?? null).toBeNull();
+  const opened = await next.client.fetchAgentTimeline(agentId, { limit: 0 });
+  expect(opened.epoch).toBe(before.epoch);
+  expect(opened.entries).toEqual(before.entries);
+  expect(opened.agent).toMatchObject({ id: agentId, availableModes: [] });
+  expect(await dispatches(home)).toEqual([
+    expect.objectContaining({ text: "finish", resumed: false, messageId: "idle-1" }),
+  ]);
+}, 30_000);
+
 test("failed checkpoint keeps the real daemon alive and never produces a ready generation", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-controlled-failure-"));
   const current = await launch(home);

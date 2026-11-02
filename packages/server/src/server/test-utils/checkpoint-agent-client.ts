@@ -6,7 +6,11 @@ import { createTestAgentClient } from "./fake-agent-client.js";
 /** Deterministic provider boundary; the daemon, sockets, and checkpoint files remain real. */
 export function createCheckpointAgentClient(
   logFile?: string,
-  testOptions?: { keepResumedActive?: boolean },
+  testOptions?: {
+    keepResumedActive?: boolean;
+    failResume?: boolean;
+    withoutSessionHandle?: boolean;
+  },
 ): AgentClient {
   const base = createTestAgentClient("codex", { supportsMcpServers: true });
   const attach = (session: AgentSession, resumed: boolean): AgentSession => {
@@ -103,6 +107,12 @@ export function createCheckpointAgentClient(
       }
       active = undefined;
     };
+    if (testOptions?.withoutSessionHandle && !resumed) {
+      // Like a Claude session whose first turn ended before the SDK reported its session ID.
+      const runtimeInfo = session.getRuntimeInfo.bind(session);
+      session.describePersistence = () => null;
+      session.getRuntimeInfo = async () => ({ ...(await runtimeInfo()), sessionId: null });
+    }
     session.streamHistory = async function* () {
       if (resumed)
         throw new Error("Checkpoint history must never be overwritten by native hydration");
@@ -115,7 +125,10 @@ export function createCheckpointAgentClient(
     provider: base.provider,
     capabilities: base.capabilities,
     createSession: async (...args) => attach(await base.createSession(...args), false),
-    resumeSession: async (...args) => attach(await base.resumeSession(...args), true),
+    resumeSession: async (...args) => {
+      if (testOptions?.failResume) throw new Error("Native session cannot be resumed");
+      return attach(await base.resumeSession(...args), true);
+    },
     fetchCatalog: (...args) => base.fetchCatalog(...args),
     isAvailable: () => base.isAvailable(),
   };

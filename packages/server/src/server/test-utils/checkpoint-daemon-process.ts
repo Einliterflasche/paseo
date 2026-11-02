@@ -24,6 +24,8 @@ const daemon = await createPaseoDaemon(
     agentClients: {
       codex: createCheckpointAgentClient(join(home, "provider-dispatches.jsonl"), {
         keepResumedActive: behavior === "keep-resumed-active",
+        failResume: behavior === "fail-resume",
+        withoutSessionHandle: behavior === "without-session-handle",
       }),
     },
     onLifecycleIntent: () => {

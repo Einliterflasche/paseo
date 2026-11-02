@@ -54,8 +54,9 @@ retaining listeners for late output and settlement. The daemon reports paused on
 after execution is confirmed stopped. Failed or uncertain teardown stays visibly
 blocked, with affected agents identified. An operator retry first rechecks stopping;
 it cannot capture or resume work until teardown and event drain are confirmed.
-History reads use installed canonical state without starting provider sessions. Internal
-helpers return typed results; only the checkpoint store can produce readiness.
+While admission is closed, history reads use installed canonical state without starting
+provider sessions. Internal helpers return typed results; only the checkpoint store can
+produce readiness.
 Never report success after a failed save or silently force replacement.
 
 A retry operates on the current stopped inventory, including late output and agents
@@ -226,8 +227,14 @@ for every provider to launch. Expose restoring/paused state so an intermediate
 Use `ensureAgentLoaded` and existing native resume with the saved handles. Seed
 exact epochs/sequences and set `historyPrimed` for checkpoint-owned history;
 `agent-loading.ts` must not force native hydration over it. Agents without a
-checkpoint retain native loading. An unusable native session leaves its saved
-history and blocked task visible; never silently create a fresh conversation.
+checkpoint retain native loading. Restoration resumes only continued work. After the
+daemon is running, opening an idle restored agent resumes its saved native session,
+because only a live session reports its modes and features. Opening never starts a
+first session. An agent without a saved native session shows only its installed history.
+Codex and Claude read the whole native transcript on resume. They keep that parsed copy
+while a restored session stays open, because checkpoint history replaces native replay.
+An unusable native session leaves its saved history and blocked task visible. Never
+silently create a fresh conversation.
 
 Continue interrupted attempts through the existing `<paseo-system>` envelope,
 including the active input and all unsettled accepted steers in order. Keep the
