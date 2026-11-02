@@ -118,8 +118,10 @@ export async function runRestartCommand(
           throw new Error("Connected peer identity changed");
         const status = await replacement.getDaemonStatus({ timeout: Math.min(1_000, remaining()) });
         const info = replacement.getLastServerInfoMessage();
-        assertRecoveryHealthy(info);
-        if (status.pid !== workerPid && isRestoredGeneration(info, generationId)) {
+        // The previous worker stays paused on the prepared checkpoint until it exits.
+        const replaced = status.pid !== workerPid;
+        if (replaced) assertRecoveryHealthy(info);
+        if (replaced && isRestoredGeneration(info, generationId)) {
           await checkSupervisor();
           return {
             type: "single" as const,
@@ -140,6 +142,7 @@ export async function runRestartCommand(
             },
           };
         }
+        lastError = describeObservedWorker(status.pid, replaced, info);
       } finally {
         await replacement.close();
       }
@@ -223,6 +226,12 @@ function assertRecoveryHealthy(info: RestartInfo): void {
       code: "RESTART_RECOVERY_FAILED",
       message: info.restartRecoveryError ?? "Restoration paused; checkpoint retained.",
     };
+}
+
+function describeObservedWorker(pid: number, replaced: boolean, info: RestartInfo): string {
+  const state = info?.restartRecoveryState ?? "no recovery state";
+  const generation = info?.restartRecoveryGeneration ?? "none";
+  return `${replaced ? "Replacement" : "Previous"} worker ${pid} reports ${state} on generation ${generation}`;
 }
 
 function isRestoredGeneration(info: RestartInfo, generationId: string | undefined): boolean {

@@ -89,6 +89,33 @@ describe("controlled restart CLI", () => {
     expect(before.calls.restartServer).toHaveBeenCalledOnce();
   });
 
+  it("waits while the previous worker is still paused on the checkpoint during handover", async () => {
+    const before = peer(10);
+    const draining = peer(10, "prepared", "paused");
+    const after = peer(11, "prepared");
+    const { deps } = dependencies(before.client, draining.client, after.client);
+    const result = await runRestartCommand({ ...options, timeout: "1" }, {} as never, deps);
+    expect(result.data).toMatchObject({
+      action: "restarted",
+      generationId: "prepared",
+      previousWorkerPid: 10,
+      workerPid: 11,
+    });
+    expect(draining.calls.close).toHaveBeenCalledOnce();
+  });
+
+  it("reports the stalled previous worker when no replacement takes over", async () => {
+    const before = peer(10);
+    const stalled = peer(10, "prepared", "paused");
+    const { deps } = dependencies(before.client, stalled.client);
+    await expect(runRestartCommand(options, {} as never, deps)).rejects.toMatchObject({
+      code: "RESTART_NOT_CONFIRMED",
+      message: expect.stringContaining(
+        "Last observation: Previous worker 10 reports paused on generation prepared",
+      ),
+    });
+  });
+
   it("retains the failed checkpoint and surfaces paused restoration", async () => {
     const before = peer(10);
     const after = peer(11, "prepared", "paused");
