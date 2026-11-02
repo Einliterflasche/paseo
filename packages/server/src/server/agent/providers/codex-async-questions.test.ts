@@ -368,8 +368,11 @@ test("Stop dismisses async questions before cancellation and keeps them dismisse
         metadata = first.session.describePersistence()!.metadata;
       }
     });
-    await first.session.interrupt();
+    // Interrupt resolves only after Codex reports the interrupted turn as stopped.
+    const interrupted = first.session.interrupt();
+    await first.appServer.waitForRequest("turn/interrupt");
     await first.finish("interrupted");
+    await interrupted;
     expect(first.session.getPendingPermissions()).toEqual([]);
     expect(metadata?.asyncQuestions).toEqual([
       expect.objectContaining({ resolution: "dismissed" }),

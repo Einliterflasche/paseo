@@ -658,8 +658,9 @@ test("session close disposes a provider that arrives from an in-flight reconnect
   session.subscribe((event) => {
     events.push({ type: "agent_stream", agentId: "test-agent", event });
   });
-  const lateExit = new Promise<void>((resolve) => {
-    lateAppServer.child.once("exit", () => resolve());
+  let lateExited = false;
+  lateAppServer.child.once("exit", () => {
+    lateExited = true;
   });
 
   try {
@@ -668,11 +669,14 @@ test("session close disposes a provider that arrives from an in-flight reconnect
 
     const turnStart = session.startTurn("continue after reconnect");
     await reconnectSpawned;
-    await session.close();
+    // Close joins a spawn it accepted earlier and disposes that provider before it
+    // resolves, so the gated spawn has to finish while close is still waiting.
+    const closing = session.close();
     releaseReconnect?.();
+    await closing;
+    expect(lateExited).toBe(true);
 
     await expect(turnStart).rejects.toThrow("Codex app-server session is closed");
-    await expect(lateExit).resolves.toBeUndefined();
     expect(events.filter((event) => event.event.type === "turn_failed")).toHaveLength(0);
 
     await expect(session.connect()).rejects.toThrow("Codex app-server session is closed");
