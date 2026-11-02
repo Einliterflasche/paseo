@@ -33,6 +33,18 @@ function assistant(id: string, second: number, turnId: string): StreamItem {
   return { kind: "assistant_message", id, text: id, timestamp: at(second), turnId };
 }
 
+function notice(id: string, second: number, turnId?: string): StreamItem {
+  return {
+    kind: "notification",
+    sourceType: "notification",
+    id,
+    timestamp: at(second),
+    level: "info",
+    message: id,
+    ...(turnId ? { turnId } : {}),
+  };
+}
+
 function runningTool(id: string, second: number, turnId: string): StreamItem {
   return {
     kind: "tool_call",
@@ -90,6 +102,59 @@ describe("canonical turn membership", () => {
     expect(continuesTurn(runningTool("first", 1, "turn-1"), assistant("next", 2, "turn-1"))).toBe(
       true,
     );
+  });
+
+  it("keeps the footer on the turn when a notification arrives while the agent is idle", () => {
+    const items = [
+      user("prompt", 1, "turn-1"),
+      assistant("reply", 3, "turn-1"),
+      notice("idle notice", 12),
+    ];
+
+    expect(continuesTurn(items[1], items[2])).toBe(false);
+    expect(continuesResponse(items[1], items[2])).toBe(false);
+    const { layout } = layoutFor(items, false);
+    expect(completedFooterIds(layout)).toEqual(["reply"]);
+    const replyRow = layout.history.find((row) => row.item.id === "reply");
+    expect(replyRow?.completedFooter?.timing).toEqual({ completedAt: at(3), durationMs: 2000 });
+    expect(layout.auxiliaryTurnFooter).toBeNull();
+  });
+
+  it("starts an agent-report turn at the report, not at an idle notification before it", () => {
+    const report: StreamItem = {
+      kind: "user_message",
+      id: "report",
+      text: "report",
+      timestamp: at(20),
+      sender: { kind: "agent", agentId: "child" },
+      turnId: "turn-2",
+    };
+    const items = [
+      user("prompt", 1, "turn-1"),
+      assistant("reply", 3, "turn-1"),
+      notice("idle notice", 10),
+      report,
+      assistant("follow-up", 25, "turn-2"),
+    ];
+
+    expect(continuesTurn(items[2], items[3])).toBe(false);
+    const { layout } = layoutFor(items, false);
+    expect(completedFooterIds(layout)).toEqual(["reply", "follow-up"]);
+    const replyRow = layout.history.find((row) => row.item.id === "reply");
+    expect(replyRow?.completedFooter?.timing).toEqual({ completedAt: at(3), durationMs: 2000 });
+    expect(layout.auxiliaryTurnFooter?.timing).toEqual({ completedAt: at(25), durationMs: 5000 });
+  });
+
+  it("keeps the footer below a notification that arrived during the turn", () => {
+    const items = [
+      user("prompt", 1, "turn-1"),
+      assistant("reply", 3, "turn-1"),
+      notice("turn notice", 4, "turn-1"),
+    ];
+
+    const { layout } = layoutFor(items, false);
+    expect(completedFooterIds(layout)).toEqual(["reply"]);
+    expect(layout.auxiliaryTurnFooter?.timing).toEqual({ completedAt: at(4), durationMs: 3000 });
   });
 
   it("renders adjacent turns without visible prompts as one response", () => {
