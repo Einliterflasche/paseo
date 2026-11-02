@@ -308,6 +308,7 @@ export const ko: TranslationResources = {
       open: "에이전트 기능 열기",
       on: "켜짐",
       off: "꺼짐",
+      unavailable: "사용 불가",
     },
     mode: {
       title: "모드",

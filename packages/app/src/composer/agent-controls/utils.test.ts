@@ -3,6 +3,7 @@ import {
   getFeatureHighlightColor,
   getFeatureTooltip,
   getAgentControlHintKey,
+  getToggleValueLabelKey,
   normalizeModelId,
   resolveAgentModelSelection,
 } from "./utils";
@@ -36,7 +37,31 @@ describe("feature metadata helpers", () => {
   it("maps feature highlight colors by feature id", () => {
     expect(getFeatureHighlightColor("fast_mode")).toBe("yellow");
     expect(getFeatureHighlightColor("plan_mode")).toBe("blue");
+    expect(getFeatureHighlightColor("daybreak")).toBe("blue");
     expect(getFeatureHighlightColor("other")).toBe("default");
+  });
+
+  it("shows a disabled toggle as off with its reason, keeping the saved value", () => {
+    const daybreak = {
+      type: "toggle" as const,
+      id: "daybreak",
+      label: "Daybreak",
+      tooltip: "Toggle Daybreak",
+      value: true,
+    };
+    const unavailable = {
+      ...daybreak,
+      disabledReason: "Daybreak is not available for GPT-6.1-sol",
+    };
+
+    expect(getFeatureTooltip(daybreak)).toBe("Toggle Daybreak");
+    expect(getToggleValueLabelKey(daybreak)).toBe("agentControls.features.on");
+    expect(getToggleValueLabelKey({ ...daybreak, value: false })).toBe(
+      "agentControls.features.off",
+    );
+    expect(getFeatureTooltip(unavailable)).toBe("Daybreak is not available for GPT-6.1-sol");
+    expect(getToggleValueLabelKey(unavailable)).toBe("agentControls.features.unavailable");
+    expect(unavailable.value).toBe(true);
   });
 });
 

@@ -78,6 +78,10 @@ start with `fork patch: `. Publish rebased history to `origin/main` with
 `--force-with-lease`, preserving collaborators' unexpected changes.
 Never push our patches to the upstream remote.
 
+On each upstream update and each Codex CLI update, refresh the Codex Daybreak
+model list. [Codex Daybreak](codex-daybreak.md) gives the steps. The toggle is
+enabled only for the models in that list.
+
 ## Deployment baseline
 
 The live daemon is managed by `/etc/nixos/configuration.nix`, with its source

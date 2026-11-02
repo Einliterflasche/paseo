@@ -306,6 +306,7 @@ export const zhCN: TranslationResources = {
       open: "打开 Agent features",
       on: "开启",
       off: "关闭",
+      unavailable: "不可用",
     },
     mode: {
       title: "Mode",

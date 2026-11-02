@@ -42,6 +42,8 @@ function respond(method, params) {
       return { thread: { id: params.threadId } };
     case "thread/read":
       return { thread: { id: params.threadId, turns: [] } };
+    case "thread/metadata/update":
+      return { thread: { id: params.threadId, daybreakEnabled: params.daybreakEnabled ?? null } };
     case "turn/start": {
       const turnId = randomUUID();
       setTimeout(() => {

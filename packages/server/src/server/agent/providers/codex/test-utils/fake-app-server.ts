@@ -171,6 +171,10 @@ export function createFakeCodexAppServer(
     "thread/start": () => ({ thread: { id: "thread-1" } }),
     "thread/loaded/list": () => ({ data: [] }),
     "thread/resume": () => ({}),
+    "thread/metadata/update": (params) => {
+      const update = toJsonObject(params);
+      return { thread: { id: update.threadId, daybreakEnabled: update.daybreakEnabled ?? null } };
+    },
     "turn/start": () => ({}),
     "thread/fork": (params) => ({
       thread: {

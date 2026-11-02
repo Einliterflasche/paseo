@@ -7,6 +7,7 @@ import type {
 import type { ProviderSelectorProvider } from "@/provider-selection/provider-selection";
 import { formatAgentModeLabel, formatThinkingOptionLabel } from "@/agent-controls/labels";
 import {
+  DAYBREAK_FEATURE_ID,
   FAST_MODE_FEATURE_ID,
   isPlanningAgentMode,
   PLAN_MODE_FEATURE_ID,
@@ -20,6 +21,7 @@ const GROUP_RANK = {
   modes: 1.2,
   planMode: 1.3,
   fastMode: 1.4,
+  daybreak: 1.5,
 } as const;
 
 export interface AgentControlContributionLabels {
@@ -221,7 +223,7 @@ function buildModeGroup(source: AgentControlContributionSource): CommandCenterCh
 
 function toggleChoices(input: {
   source: AgentControlContributionSource;
-  key: "plan" | "fast";
+  key: "plan" | "fast" | "daybreak";
   icon: CommandCenterIcon;
   isOn: boolean;
   turnOn(): void | Promise<void>;
@@ -303,6 +305,33 @@ function buildFastModeGroup(source: AgentControlContributionSource): CommandCent
   };
 }
 
+// The label is the feature's product name. Choices cannot be disabled, so an
+// unavailable Daybreak offers none.
+function buildDaybreakGroup(source: AgentControlContributionSource): CommandCenterChoiceGroup {
+  const feature = source.features.list.find(
+    (candidate) => candidate.id === DAYBREAK_FEATURE_ID && candidate.type === "toggle",
+  );
+  const choices =
+    feature?.type === "toggle" && feature.disabledReason === undefined
+      ? toggleChoices({
+          source,
+          key: "daybreak",
+          icon: source.icons.feature(feature),
+          isOn: feature.value,
+          turnOn: () => source.features.set(DAYBREAK_FEATURE_ID, true),
+          turnOff: () => source.features.set(DAYBREAK_FEATURE_ID, false),
+        })
+      : [];
+  const label = feature?.label ?? "";
+  return {
+    id: "daybreak",
+    rank: GROUP_RANK.daybreak,
+    label,
+    keywords: [label],
+    choices,
+  };
+}
+
 export function buildAgentControlContributions(
   source: AgentControlContributionSource,
 ): CommandCenterContribution[] {
@@ -313,6 +342,7 @@ export function buildAgentControlContributions(
       buildModeGroup(source),
       buildPlanModeGroup(source),
       buildFastModeGroup(source),
+      buildDaybreakGroup(source),
     );
   }
   return buildContributions(groups);

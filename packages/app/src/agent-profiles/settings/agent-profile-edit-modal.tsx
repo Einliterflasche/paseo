@@ -473,22 +473,24 @@ function AgentProfileFeatureRow({
     );
   }
 
+  const unavailable = feature.disabledReason !== undefined;
+  const description = feature.disabledReason ?? feature.description;
   return (
     <View style={rowStyle} testID={`agent-profile-feature-row-${feature.id}`}>
       <View style={styles.featureMeta}>
         <Text style={styles.featureLabel} numberOfLines={1}>
           {feature.label}
         </Text>
-        {feature.description ? (
+        {description ? (
           <Text style={styles.featureDescription} numberOfLines={2}>
-            {feature.description}
+            {description}
           </Text>
         ) : null}
       </View>
       <Switch
-        value={feature.value === true}
+        value={feature.value === true && !unavailable}
         onValueChange={handleToggle}
-        disabled={disabled}
+        disabled={disabled || unavailable}
         accessibilityLabel={feature.label}
         testID={`agent-profile-feature-switch-${feature.id}`}
       />

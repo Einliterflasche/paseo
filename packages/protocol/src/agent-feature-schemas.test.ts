@@ -65,6 +65,19 @@ describe("agent feature schemas", () => {
     },
   );
 
+  it("preserves a toggle's disabled reason and accepts toggles without one", () => {
+    const toggle = {
+      type: "toggle",
+      id: "daybreak",
+      label: "Daybreak",
+      icon: "hat-glasses",
+      value: true,
+    };
+    const disabled = { ...toggle, disabledReason: "Daybreak is not available for GPT-6.1-sol" };
+    expect(AgentFeatureSchema.parse(disabled)).toEqual(disabled);
+    expect(AgentFeatureSchema.parse(toggle)).toEqual(toggle);
+  });
+
   it("rejects invalid features", () => {
     const invalidDiscriminator = AgentFeatureSchema.safeParse({
       type: "slider",

@@ -56,6 +56,7 @@ import type { AgentProviderDefinition } from "@getpaseo/protocol/provider-manife
 import {
   getFeatureHighlightColor,
   getFeatureTooltip,
+  getToggleValueLabelKey,
   getAgentControlHintKey,
   resolveAgentModelSelection,
 } from "@/composer/agent-controls/utils";
@@ -1327,25 +1328,31 @@ function DesktopFeatureItem({
 
   if (feature.type === "toggle") {
     const FeatureIcon = getAgentFeatureIcon(feature.icon);
+    // A disabled button takes no pointer events on web, so an unavailable toggle sits in a
+    // plain View that carries the hover showing why.
+    const unavailable = feature.disabledReason !== undefined;
+    const trigger = (
+      <AgentControlTrigger
+        icon={FeatureIcon}
+        iconColor={getFeatureIconColor(
+          feature.id,
+          feature.value && !unavailable,
+          theme.colors.palette,
+          theme.colors.foregroundMuted,
+        )}
+        surface="toolbar"
+        label={feature.label}
+        showToolbarLabel={false}
+        disabled={disabled || unavailable}
+        onPress={handleTogglePress}
+        accessibilityLabel={getFeatureTooltip(feature)}
+        testID={`agent-feature-${feature.id}`}
+      />
+    );
     return (
       <Tooltip delayDuration={0} enabledOnDesktop enabledOnMobile={false}>
         <TooltipTrigger asChild triggerRefProp="ref">
-          <AgentControlTrigger
-            icon={FeatureIcon}
-            iconColor={getFeatureIconColor(
-              feature.id,
-              feature.value,
-              theme.colors.palette,
-              theme.colors.foregroundMuted,
-            )}
-            surface="toolbar"
-            label={feature.label}
-            showToolbarLabel={false}
-            disabled={disabled}
-            onPress={handleTogglePress}
-            accessibilityLabel={getFeatureTooltip(feature)}
-            testID={`agent-feature-${feature.id}`}
-          />
+          {unavailable ? <View collapsable={false}>{trigger}</View> : trigger}
         </TooltipTrigger>
         <TooltipContent side="top" align="center" offset={8}>
           <Text style={styles.tooltipText}>{getFeatureTooltip(feature)}</Text>
@@ -1452,15 +1459,15 @@ function SheetFeatureItem({
           icon={FeatureIcon}
           iconColor={getFeatureIconColor(
             feature.id,
-            feature.value,
+            feature.value && feature.disabledReason === undefined,
             theme.colors.palette,
             theme.colors.foregroundMuted,
           )}
           surface="sheet"
           label={feature.label}
-          value={feature.value ? t("agentControls.features.on") : t("agentControls.features.off")}
+          value={t(getToggleValueLabelKey(feature))}
           open={openSelector === featureSelector}
-          disabled={disabled}
+          disabled={disabled || feature.disabledReason !== undefined}
           onPress={handleSelectPress}
           accessibilityLabel={getFeatureTooltip(feature)}
           testID={`agent-feature-${feature.id}`}

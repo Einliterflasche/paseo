@@ -136,6 +136,8 @@ export interface AgentFeatureToggle {
   description?: string;
   tooltip?: string;
   icon?: string;
+  /** Present while the toggle cannot change or take effect; `value` keeps the saved choice. */
+  disabledReason?: string;
   value: boolean;
 }
 

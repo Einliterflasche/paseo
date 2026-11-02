@@ -2617,6 +2617,7 @@ export class AgentManager {
       await agent.session.setFeature(featureId, value);
       await this.drainSessionEvents(agentId);
       agent.config.featureValues = { ...agent.config.featureValues, [featureId]: value };
+      this.refreshSessionPersistence(agent);
       this.touchUpdatedAt(agent);
       this.emitState(agent);
     });

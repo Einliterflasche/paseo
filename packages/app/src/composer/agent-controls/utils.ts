@@ -1,7 +1,15 @@
-import type { AgentFeature, AgentModelDefinition } from "@getpaseo/protocol/agent-types";
+import type {
+  AgentFeature,
+  AgentFeatureToggle,
+  AgentModelDefinition,
+} from "@getpaseo/protocol/agent-types";
 import { i18n } from "@/i18n/i18next";
 import { formatThinkingOptionLabel } from "@/agent-controls/labels";
-import { FAST_MODE_FEATURE_ID, PLAN_MODE_FEATURE_ID } from "@/agent-controls/policy";
+import {
+  DAYBREAK_FEATURE_ID,
+  FAST_MODE_FEATURE_ID,
+  PLAN_MODE_FEATURE_ID,
+} from "@/agent-controls/policy";
 
 export type ExplainedAgentControl = "mode" | "model" | "thinking";
 export type FeatureHighlightColor = "blue" | "default" | "green" | "yellow";
@@ -9,6 +17,10 @@ export type AgentControlHintKey =
   | "agentControls.hints.thinking"
   | "agentControls.hints.model"
   | "agentControls.hints.mode";
+export type ToggleValueLabelKey =
+  | "agentControls.features.on"
+  | "agentControls.features.off"
+  | "agentControls.features.unavailable";
 
 export function getAgentControlHintKey(selector: ExplainedAgentControl): AgentControlHintKey {
   switch (selector) {
@@ -31,8 +43,16 @@ export function normalizeModelId(modelId: string | null | undefined): string | n
   return normalized;
 }
 
-export function getFeatureTooltip(feature: Pick<AgentFeature, "label" | "tooltip">): string {
-  return feature.tooltip ?? feature.label;
+export function getFeatureTooltip(
+  feature: Pick<AgentFeature, "label" | "tooltip"> & { disabledReason?: string },
+): string {
+  return feature.disabledReason ?? feature.tooltip ?? feature.label;
+}
+
+// Rows without a tooltip say why a disabled toggle is greyed out instead of its saved value.
+export function getToggleValueLabelKey(feature: AgentFeatureToggle): ToggleValueLabelKey {
+  if (feature.disabledReason !== undefined) return "agentControls.features.unavailable";
+  return feature.value ? "agentControls.features.on" : "agentControls.features.off";
 }
 
 export function getFeatureHighlightColor(featureId: string): FeatureHighlightColor {
@@ -42,6 +62,7 @@ export function getFeatureHighlightColor(featureId: string): FeatureHighlightCol
     case "auto_accept":
       return "green";
     case PLAN_MODE_FEATURE_ID:
+    case DAYBREAK_FEATURE_ID:
       return "blue";
     default:
       return "default";

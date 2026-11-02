@@ -320,6 +320,7 @@ export const fr: TranslationResources = {
       open: "Fonctionnalités de l'agent ouvert",
       on: "Sur",
       off: "Désactivé",
+      unavailable: "Indisponible",
     },
     mode: {
       title: "Mode",

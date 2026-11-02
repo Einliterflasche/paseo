@@ -81,10 +81,16 @@ import { withTimeout } from "../../../utils/promise-timeout.js";
 import { extractCodexTerminalSessionId, nonEmptyString } from "./tool-call-mapper-utils.js";
 import {
   buildCodexFeatures,
+  CODEX_DAYBREAK_FEATURE,
+  codexDaybreakUnavailableFor,
   CodexServiceTierSchema,
+  isCodexDaybreakModel,
+  readCodexDaybreak,
   readCodexServiceTier,
+  type CodexDaybreakModel,
   type CodexServiceTier,
 } from "./codex-feature-definitions.js";
+import { CodexDaybreakNotices } from "./codex/daybreak-notice.js";
 import {
   CodexAppServerClient,
   CodexAppServerRpcError,
@@ -3474,6 +3480,9 @@ export class CodexAppServerAgentSession implements AgentSession {
   private persistedHistory: PersistedTimelineEntry[] = [];
   private loadingPersistedHistory = false;
   private persistedProviderSubagentEvents: AgentStreamEvent[] = [];
+  // The saved Daybreak choice; null until Paseo or the resumed thread has one.
+  private daybreak: boolean | null;
+  private readonly daybreakNotices: CodexDaybreakNotices;
   private pendingPermissions = new Map<string, AgentPermissionRequest>();
   private mcpElicitationPermissionIds = new Map<number, string>();
   private pendingPermissionHandlers = new Map<string, CodexPendingPermissionHandler>();
@@ -3564,6 +3573,8 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (this.config.featureValues?.plan_mode) {
       this.planModeEnabled = true;
     }
+    this.daybreak = this.savedDaybreak();
+    this.daybreakNotices = new CodexDaybreakNotices(resumeHandle?.metadata?.daybreakNotices);
 
     if (this.resumeHandle?.sessionId) {
       this.currentThreadId = this.resumeHandle.sessionId;
@@ -3581,6 +3592,9 @@ export class CodexAppServerAgentSession implements AgentSession {
       serviceTier: this.serviceTier ?? "default",
       planModeEnabled: this.planModeEnabled,
       planModeAvailable: this.hasPlanCollaborationMode(),
+      daybreak: this.supportsDaybreak()
+        ? { enabled: this.daybreak === true, model: this.daybreakModel() }
+        : null,
     });
   }
 
@@ -3850,13 +3864,70 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.resolvedCollaborationMode = this.resolveCollaborationMode();
   }
 
-  private currentServiceTiers(): CodexServiceTier[] {
-    const selectedModel = this.config.model
+  private selectedCatalogModel(): CodexModel | undefined {
+    return this.config.model
       ? this.speedModels.find(
           (model) => model.id === this.config.model || model.model === this.config.model,
         )
       : (this.speedModels.find((model) => model.isDefault) ?? this.speedModels[0]);
-    return selectedModel?.serviceTiers ?? [];
+  }
+
+  private currentServiceTiers(): CodexServiceTier[] {
+    return this.selectedCatalogModel()?.serviceTiers ?? [];
+  }
+
+  private daybreakModel(): CodexDaybreakModel | null {
+    const catalogModel = this.selectedCatalogModel();
+    const id = this.config.model ?? catalogModel?.id;
+    if (!id) return null;
+    const label = catalogModel?.displayName
+      ? normalizeCodexModelLabel(catalogModel.displayName)
+      : id;
+    return { id, label };
+  }
+
+  // Daybreak requires OpenAI, whose endpoint a custom Codex provider replaces.
+  private supportsDaybreak(): boolean {
+    return !this.deps.customCodexConfig;
+  }
+
+  // A provider without Daybreak ignores a saved choice, so it never sends Daybreak fields.
+  private savedDaybreak(): boolean | null {
+    return this.supportsDaybreak() ? readCodexDaybreak(this.config.featureValues) : null;
+  }
+
+  // The thread only stores the choice; a turn requests Daybreak through its program.
+  private cyberAccessProgram(): "daybreakBlue" | undefined {
+    return this.daybreak === true && isCodexDaybreakModel(this.daybreakModel())
+      ? "daybreakBlue"
+      : undefined;
+  }
+
+  // Paseo's saved choice wins over the thread's; a session without one adopts the thread's.
+  private async reconcileThreadDaybreak(response: unknown): Promise<void> {
+    if (!this.supportsDaybreak()) return;
+    const threadChoice = toObjectRecord(toObjectRecord(response)?.thread)?.daybreakEnabled;
+    if (this.daybreak === null) {
+      if (typeof threadChoice === "boolean") this.daybreak = threadChoice;
+      return;
+    }
+    if (threadChoice !== this.daybreak) await this.saveThreadDaybreak();
+  }
+
+  private async saveThreadDaybreak(): Promise<void> {
+    if (!this.client || !this.currentThreadId || this.ephemeral || this.daybreak === null) return;
+    try {
+      await this.client.request("thread/metadata/update", {
+        threadId: this.currentThreadId,
+        daybreakEnabled: this.daybreak,
+      });
+    } catch (error) {
+      // Turns carry the program from Paseo's choice, and the next resume saves it again.
+      this.logger.warn(
+        { err: error, threadId: this.currentThreadId },
+        "Failed to save the Daybreak choice on the Codex thread",
+      );
+    }
   }
 
   private reconcileServiceTier(): void {
@@ -4010,8 +4081,9 @@ export class CodexAppServerAgentSession implements AgentSession {
         this.rememberCodexUserMessageTurn(entry.item.messageId, entry.providerTurnId);
       }
     }
-    this.persistedHistory = timeline;
-    this.historyPending = timeline.length > 0;
+    // This history replaces the chat timeline, and the thread lacks Paseo's Daybreak notices.
+    this.persistedHistory = this.daybreakNotices.merge(timeline);
+    this.historyPending = this.persistedHistory.length > 0;
   }
 
   private async loadPersistedSubAgentHistories(
@@ -4083,6 +4155,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       }
       const response = await this.client.request("thread/resume", params);
       this.rememberResolvedSandboxPolicy(response);
+      await this.reconcileThreadDaybreak(response);
     } catch (error) {
       const threadId = this.currentThreadId;
       const message = error instanceof Error ? error.message : String(error);
@@ -4096,6 +4169,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         }
         const response = await this.client.request("thread/resume", params);
         this.rememberResolvedSandboxPolicy(response);
+        await this.reconcileThreadDaybreak(response);
         this.logger.info({ threadId }, "Unarchived Codex thread to restore active Paseo agent");
         return;
       }
@@ -4205,6 +4279,10 @@ export class CodexAppServerAgentSession implements AgentSession {
       params.effort = thinkingOptionId;
     }
     params.serviceTier = this.serviceTier ?? "default";
+    const cyberAccessProgram = this.cyberAccessProgram();
+    if (cyberAccessProgram) {
+      params.cyberAccessProgram = cyberAccessProgram;
+    }
     if (this.resolvedCollaborationMode) {
       params.collaborationMode = {
         mode: this.resolvedCollaborationMode.mode,
@@ -4293,6 +4371,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         modeId: this.currentMode ?? null,
         effort: thinkingOptionId ?? null,
         serviceTier: this.serviceTier,
+        cyberAccessProgram: this.cyberAccessProgram() ?? null,
         cwd: this.config.cwd ?? null,
         approvalPolicy: approvalPolicy ?? null,
         sandboxPolicyType: sandboxPolicyType ?? null,
@@ -4681,6 +4760,23 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.applyFeatureValue("plan_mode", Boolean(value));
       return;
     }
+    if (featureId === CODEX_DAYBREAK_FEATURE.id && this.supportsDaybreak()) {
+      if (typeof value !== "boolean") {
+        throw new Error(`Codex Daybreak must be on or off, not '${String(value)}'`);
+      }
+      if (value === this.daybreak) return;
+      const wasOn = this.daybreak === true;
+      this.daybreak = value;
+      if (value !== wasOn) {
+        this.emitEvent({
+          type: "timeline",
+          provider: CODEX_PROVIDER,
+          ...this.daybreakNotices.record(value, codexDaybreakUnavailableFor(this.daybreakModel())),
+        });
+      }
+      await this.saveThreadDaybreak();
+      return;
+    }
     throw new Error(`Unknown Codex feature: ${featureId}`);
   }
 
@@ -4952,6 +5048,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         systemPrompt: this.config.systemPrompt,
         mcpServers: this.config.mcpServers,
         asyncQuestions: this.asyncQuestions.serialize(),
+        daybreakNotices: this.daybreakNotices.serialize(),
       },
     };
   }
@@ -4980,6 +5077,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       setThreadId: async (threadId) => {
         this.currentThreadId = threadId;
         this.cachedRuntimeInfo = null;
+        await this.saveThreadDaybreak();
         this.persistedHistory = [];
         this.historyPending = false;
         await this.loadPersistedHistory(this.client);
@@ -5400,6 +5498,10 @@ export class CodexAppServerAgentSession implements AgentSession {
       ...(innerConfig ? { config: innerConfig } : {}),
       ...(this.ephemeral ? { ephemeral: true } : {}),
     };
+    // Codex rejects a Daybreak choice on ephemeral threads; their turns still carry the program.
+    if (this.daybreak !== null && !this.ephemeral) {
+      params.daybreakEnabled = this.daybreak;
+    }
     if (this.hasWorkflowModeOverride) {
       params.approvalsReviewer = preset.approvalsReviewer;
     }

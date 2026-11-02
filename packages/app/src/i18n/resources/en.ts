@@ -305,6 +305,7 @@ export const en = {
       open: "Open agent features",
       on: "On",
       off: "Off",
+      unavailable: "Unavailable",
     },
     mode: {
       title: "Mode",

@@ -311,6 +311,7 @@ export const ja: TranslationResources = {
       open: "エージェント機能を開く",
       on: "オン",
       off: "オフ",
+      unavailable: "利用不可",
     },
     mode: {
       title: "モード",

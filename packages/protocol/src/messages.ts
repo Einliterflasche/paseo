@@ -292,6 +292,7 @@ export const AgentFeatureToggleSchema = z.object({
   description: z.string().optional(),
   tooltip: z.string().optional(),
   icon: z.string().optional(),
+  disabledReason: z.string().optional(),
   value: z.boolean(),
 });
 

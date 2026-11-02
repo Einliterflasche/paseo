@@ -306,6 +306,7 @@ export const ar: TranslationResources = {
       open: "ميزات الوكيل المفتوح",
       on: "على",
       off: "عن",
+      unavailable: "غير متاح",
     },
     mode: {
       title: "وضع",

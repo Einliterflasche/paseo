@@ -362,6 +362,52 @@ describe("Command Center agent-control contributions", () => {
     expect(unavailable.filter((contribution) => contribution.group === "fast-mode")).toEqual([]);
   });
 
+  it("publishes Daybreak under its label only while the toggle is available", () => {
+    const calls: [string, unknown][] = [];
+    const daybreak: AgentFeature = {
+      type: "toggle",
+      id: "daybreak",
+      label: "Daybreak",
+      icon: "hat-glasses",
+      value: false,
+    };
+    const contributions = buildAgentControlContributions(
+      makeSource({
+        provider: "codex",
+        features: {
+          list: [daybreak],
+          set: (id, value) => {
+            calls.push([id, value]);
+          },
+        },
+      }),
+    ).filter((contribution) => contribution.group === "daybreak");
+
+    expect(contributions.map(selected)).toEqual([false, true]);
+    expect(contributions.map((contribution) => contribution.presentation)).toMatchObject([
+      { path: ["Daybreak", "On"], testId: "command-center-daybreak-host:agent:on" },
+      { path: ["Daybreak", "Off"], testId: "command-center-daybreak-host:agent:off" },
+    ]);
+    contributions[0].run();
+    expect(calls).toEqual([["daybreak", true]]);
+
+    const unavailable = buildAgentControlContributions(
+      makeSource({
+        provider: "codex",
+        features: {
+          list: [
+            {
+              ...daybreak,
+              value: true,
+              disabledReason: "Daybreak is not available for GPT-6.1-sol",
+            },
+          ],
+        },
+      }),
+    );
+    expect(unavailable.filter((contribution) => contribution.group === "daybreak")).toEqual([]);
+  });
+
   it("centralizes query-only group ordering between built-in result sections", () => {
     const contributions = buildAgentControlContributions(
       makeSource({
@@ -376,7 +422,7 @@ describe("Command Center agent-control contributions", () => {
           selectedId: "default",
           defaultModeId: "default",
         },
-        features: { list: [toggleFeature("fast_mode")] },
+        features: { list: [toggleFeature("fast_mode"), toggleFeature("daybreak")] },
       }),
     );
     const ranks = new Map<string, number>();
@@ -391,6 +437,7 @@ describe("Command Center agent-control contributions", () => {
       ["modes", 1.2],
       ["plan-mode", 1.3],
       ["fast-mode", 1.4],
+      ["daybreak", 1.5],
     ]);
     for (const rank of ranks.values()) expect(rank).toBeLessThan(2);
     expect(new Set(contributions.map((contribution) => contribution.id)).size).toBe(

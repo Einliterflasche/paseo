@@ -315,6 +315,7 @@ export const ru: TranslationResources = {
       open: "Открыть настройки функций агента",
       on: "Включено",
       off: "Выключено",
+      unavailable: "Недоступно",
     },
     mode: {
       title: "Режим",

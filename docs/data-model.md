@@ -147,15 +147,16 @@ hydration rules.
 
 **Toggle:**
 
-| Field         | Type       |
-| ------------- | ---------- |
-| `type`        | `"toggle"` |
-| `id`          | `string`   |
-| `label`       | `string`   |
-| `description` | `string?`  |
-| `tooltip`     | `string?`  |
-| `icon`        | `string?`  |
-| `value`       | `boolean`  |
+| Field            | Type       |
+| ---------------- | ---------- |
+| `type`           | `"toggle"` |
+| `id`             | `string`   |
+| `label`          | `string`   |
+| `description`    | `string?`  |
+| `tooltip`        | `string?`  |
+| `icon`           | `string?`  |
+| `disabledReason` | `string?`  |
+| `value`          | `boolean`  |
 
 **Select:**
 
