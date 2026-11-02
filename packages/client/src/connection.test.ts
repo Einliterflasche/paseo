@@ -11,6 +11,7 @@ function connection(
     broadcasts?: boolean;
     browserHost?: { hostKind: string; supportedCommands: string[] };
     acknowledgeTimelineReads?: boolean;
+    acknowledgeReleases?: boolean;
   } = {},
 ) {
   const sent: Array<{
@@ -83,7 +84,10 @@ function connection(
           }),
         );
       }
-      if (frame.message?.type === "subscription.release.request") {
+      if (
+        frame.message?.type === "subscription.release.request" &&
+        options.acknowledgeReleases !== false
+      ) {
         receive(
           JSON.stringify({
             type: "session",
@@ -131,7 +135,7 @@ function connection(
     client,
     sent,
     open: () => open(),
-    disconnect: () => closed(),
+    disconnect: (event?: unknown) => closed(event),
     receive: (message: unknown) => receive(JSON.stringify({ type: "session", message })),
   };
 }
@@ -392,6 +396,26 @@ test("failed terminal bootstrap reports the domain error without reconnecting or
   } finally {
     await h.client.close();
   }
+});
+
+test("a release cut off by a restarting host does not fail the client's close", async () => {
+  const h = connection({ acknowledgeReleases: false });
+  const connected = h.client.connect();
+  h.open();
+  await connected;
+  const observation = h.client.observeEvents(["project.update"]);
+  await observation.ready;
+  const releasing = observation.release();
+  await expect
+    .poll(() => h.sent.some((frame) => frame.message?.type === "subscription.release.request"))
+    .toBe(true);
+  // A worker replaced after acknowledging restart closes without a status code.
+  h.disconnect({ code: 1005 });
+  await expect(releasing).rejects.toMatchObject({
+    code: "DAEMON_CONNECTION_LOST",
+    message: "Transport closed (code 1005)",
+  });
+  await expect(h.client.close()).resolves.toBeUndefined();
 });
 
 test("older hosts share event demand on one connection and release only their own listeners", async () => {

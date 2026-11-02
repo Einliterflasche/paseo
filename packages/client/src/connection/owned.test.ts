@@ -7,13 +7,14 @@ interface Snapshot {
   requestId: string;
 }
 
-function connection() {
+function connection(options: { release?: (id: string) => Promise<void> } = {}) {
   const released: string[] = [];
   const failures: unknown[] = [];
   const requests: Array<(id: string) => void> = [];
   const subscriptions = new OwnedSubscriptions({
     release: async (id) => {
       released.push(id);
+      await options.release?.(id);
     },
     failed: (error) => {
       failures.push(error);
@@ -126,4 +127,23 @@ test("a late listener after bounded replay overflow gets a fresh snapshot", asyn
   expect(first).toEqual(["old", "fresh"]);
   expect(late).toEqual(["fresh", "update"]);
   await handle.release();
+});
+
+test("closing during an unconfirmed release leaves that failure to the release caller", async () => {
+  let fail!: (error: Error) => void;
+  const c = connection({
+    release: () =>
+      new Promise((_resolve, reject) => {
+        fail = reject;
+      }),
+  });
+  const handle = c.observe();
+  c.requests[0]!("server-owned");
+  await handle.ready;
+  const releasing = handle.release();
+  await expect.poll(() => c.released).toEqual(["server-owned"]);
+  const closing = c.subscriptions.close();
+  fail(new Error("Daemon client closed"));
+  await expect(releasing).rejects.toThrow("Daemon client closed");
+  await expect(closing).resolves.toBeUndefined();
 });

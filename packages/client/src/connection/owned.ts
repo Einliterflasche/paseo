@@ -144,9 +144,13 @@ export class OwnedSubscriptions {
         if (id) this.routes.delete(id);
         reject(new Error("Subscription released"));
         teardown = (async () => {
-          await pending;
-          await releaseId();
-          this.registrations.delete(registration);
+          try {
+            await pending;
+            await releaseId();
+          } finally {
+            // The handle is gone even when a closing connection cannot confirm the release.
+            this.registrations.delete(registration);
+          }
         })();
         return teardown;
       },
@@ -217,8 +221,9 @@ export class OwnedSubscriptions {
     for (const registration of this.registrations) registration.disconnected();
   }
 
+  /** Ends every lifetime. A release failure belongs to the release() caller, not to close. */
   async close(): Promise<void> {
-    await Promise.all([...this.registrations].map((registration) => registration.release()));
+    await Promise.allSettled([...this.registrations].map((registration) => registration.release()));
   }
 }
 
