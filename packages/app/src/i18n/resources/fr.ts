@@ -117,6 +117,12 @@ export const fr: TranslationResources = {
   },
   common: {
     hostRecovery: {
+      restartAnyway: "Redémarrer quand même",
+      restarting: "Redémarrage…",
+      restartWarning:
+        "Redémarrer {{hostName}} sans terminer la récupération ? L’historique non enregistré et le travail en attente peuvent être perdus. Les tâches enregistrées ne reprendront pas automatiquement. Certains outils peuvent continuer à fonctionner si Paseo ne peut pas les arrêter.",
+      restartUnconfirmed:
+        "Le redémarrage n’est pas confirmé. Reconnectez-vous à l’hôte et consultez son état avant de réessayer.",
       title: "La récupération est en pause sur {{hostName}}",
       description:
         "Paseo a suspendu le travail des agents pour protéger l’historique enregistré. L’opérateur de l’hôte doit résoudre l’erreur de récupération avant de poursuivre.",

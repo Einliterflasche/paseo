@@ -36,6 +36,11 @@ the checkpoint completes is outside the no-loss guarantee. Continuous crash-safe
 transcript persistence is not required for this implementation. Keep the work
 inside the existing daemon/lifecycle; do not introduce another background process.
 
+On 2026-11-03 Raphael requested an explicit `Restart anyway` action in the recovery error banner.
+This emergency action accepts the forced termination limitation above.
+It must work independently of the failed orderly operation and keep retained recovery files.
+Its boundaries and architecture belong in [restart recovery](restart-recovery-plan.md#explicit-emergency-replacement).
+
 Begin a controlled restart immediately by default, including while agents are working. A brief
 client disconnect and reconnect is acceptable. Interrupted work must resume
 automatically in the same conversation without Raphael sending a continuation

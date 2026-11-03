@@ -219,6 +219,40 @@ export class CheckpointStore<T> {
     return { generationId, snapshot };
   }
 
+  /** Retain old data but prevent an emergency-abandoned generation from ever dispatching again. */
+  async fenceEmergencyReplay(restartId: string): Promise<void> {
+    let generationId: string | null;
+    try {
+      generationId = await this.readReadyGenerationId();
+    } catch (error) {
+      // A corrupt pointer already prevents ordinary boot from replaying anything.
+      if (error instanceof CheckpointLoadError && error.reason === "ready_pointer_corrupt") return;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EISDIR" || code === "ENOTDIR") return;
+      throw error;
+    }
+    if (!generationId) return;
+    const generationDir = path.join(this.root, generationId);
+    let handle: FileHandle;
+    try {
+      handle = await fs.open(path.join(generationDir, CLAIMED_FILE), "wx", PRIVATE_FILE_MODE);
+    } catch (error) {
+      // Existing claims already prevent replay. A missing directory cannot be loaded.
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EEXIST" || code === "ENOENT") return;
+      throw error;
+    }
+    try {
+      await handle.writeFile(
+        JSON.stringify({ abandonedAt: new Date().toISOString(), emergencyRestartId: restartId }),
+      );
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await fsyncDirectory(generationDir);
+  }
+
   /**
    * Validates the ready generation, writes its claimed marker, and only then returns the
    * snapshot. The marker is committed before the caller can act on the result, so a crash

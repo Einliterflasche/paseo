@@ -14,6 +14,7 @@ import { createServer as createHTTPServer, type IncomingMessage } from "http";
 import { constants, existsSync, unlinkSync } from "fs";
 import { open, stat } from "fs/promises";
 import { randomUUID } from "node:crypto";
+import { EmergencyRestart } from "./restart/emergency-restart.js";
 import { hostname as getHostname } from "node:os";
 import type { Socket } from "node:net";
 import path from "node:path";
@@ -541,6 +542,7 @@ export type DaemonLifecycleIntent =
       type: "restart";
       prepareOnly?: boolean;
       retryRecovery?: boolean;
+      restartAnyway?: { expectedError: string; expectedGenerationId: string | null };
       acknowledgeCrash?: CrashRecoveryAcknowledgment;
       acknowledgmentRequester?: CrashAcknowledgmentRequester;
       clientId: string;
@@ -613,7 +615,10 @@ export interface PaseoDaemonConfig {
   };
   providerOverrides?: Record<string, ProviderOverride>;
   log?: PersistedConfig["log"];
-  onLifecycleIntent?: (intent: DaemonLifecycleIntent) => void;
+  onLifecycleIntent?: (intent: DaemonLifecycleIntent) => void | Promise<void>;
+  restartAnywaySupported?: boolean;
+  /** One-use supervisor handoff. Never inherited by agent processes. */
+  restartAnywayId?: string;
   pushNotificationSender?: PushNotificationSender;
   managedProcesses?: ManagedProcessRegistry;
   configReload?: {
@@ -636,6 +641,7 @@ export interface PaseoDaemon {
   start(): Promise<void>;
   stop(): Promise<void>;
   prepareRestart(): Promise<{ generationId: string }>;
+  restartAnywayFailed(error: Error): void;
   getRestartStatus(): {
     state: "running" | "preparing" | "paused" | "restoring";
     generationId?: string;
@@ -1622,9 +1628,20 @@ export async function createPaseoDaemon(
     },
   });
   agentManager.bindRecoveryLifecycle(restartController);
+  const emergencyRestart = new EmergencyRestart({
+    home: config.paseoHome,
+    agentManager,
+    controller: restartController,
+    logger,
+    supported: config.restartAnywaySupported === true,
+    replace: config.onLifecycleIntent,
+  });
+  await emergencyRestart.installHistory(config.restartAnywayId);
   const initializeScheduleRecovery = async () => {
     try {
-      const checkpoint = await restartController.claim();
+      const checkpoint = await restartController.claim({
+        restartAnyway: config.restartAnywayId,
+      });
       if (checkpoint) await restartController.install(checkpoint);
       return checkpoint;
     } catch (error) {
@@ -1974,6 +1991,8 @@ export async function createPaseoDaemon(
                 externallyDispatched: previewIngress !== null,
                 startPaused: true,
                 getRestartStatus: () => restartController.status,
+                restartAnywaySupported: config.restartAnywaySupported === true,
+                restartAnywayId: config.restartAnywayId,
               },
               workspaceAutoName,
               daemonAuth,
@@ -1985,6 +2004,7 @@ export async function createPaseoDaemon(
               daemonVersion,
               async (intent) => {
                 if (intent.type === "restart") {
+                  if (intent.restartAnyway) return emergencyRestart.request(intent);
                   if (intent.acknowledgeCrash) {
                     if (!intent.acknowledgmentRequester)
                       throw new Error(
@@ -2210,6 +2230,9 @@ export async function createPaseoDaemon(
     serviceProxy,
     scriptRuntimeStore,
     browserToolsBroker,
+    restartAnywayFailed: (error: Error) => {
+      emergencyRestart.failed(error);
+    },
     prepareRestart: () => restartController.prepare(),
     getRestartStatus: () => restartController.status,
     start,

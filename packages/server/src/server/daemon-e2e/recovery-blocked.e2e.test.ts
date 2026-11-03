@@ -165,3 +165,111 @@ test("a corrupt ready pointer leaves a reachable paused daemon and preserves the
   expect(blocked.child.exitCode).toBeNull();
   expect(await readFile(pointer, "utf8")).toBe("{incomplete ready pointer");
 }, 15_000);
+
+test("Restart anyway replaces a production worker with corrupt recovery and reconnects the same client", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-restart-anyway-process-"));
+  await mkdir(join(home, "restart-checkpoints"));
+  const pointer = join(home, "restart-checkpoints", "ready.json");
+  const corrupt = "{incomplete ready pointer";
+  await writeFile(pointer, corrupt);
+  const runner = join(home, "supervisor.mjs");
+  const supervisorUrl = new URL("../../../scripts/supervisor.ts", import.meta.url).href;
+  const workerPath = fileURLToPath(new URL("../daemon-worker.ts", import.meta.url));
+  await writeFile(
+    runner,
+    `
+    import { runSupervisor } from ${JSON.stringify(supervisorUrl)};
+    const workerEnv = { ...process.env };
+    runSupervisor({
+      name: "EmergencyRestartTest", startupMessage: "starting",
+      resolveWorkerEntry: () => ${JSON.stringify(workerPath)},
+      workerArgs: ["--no-mcp", "--no-relay", "--no-web-ui"], workerEnv,
+      onWorkerReady: message => {
+        workerEnv.PASEO_LISTEN = message.listen;
+        process.send(message);
+      },
+    });
+  `,
+  );
+  const supervisor = fork(runner, [], {
+    execArgv: ["--import", "tsx"],
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+    env: {
+      ...Object.fromEntries(
+        Object.entries(process.env).filter(([key]) => !key.startsWith("PASEO_")),
+      ),
+      HOME: home,
+      USERPROFILE: home,
+      PASEO_HOME: home,
+      PASEO_LISTEN: "127.0.0.1:0",
+      PASEO_LOCAL_SPEECH_AUTO_DOWNLOAD: "0",
+      PASEO_DICTATION_ENABLED: "0",
+      PASEO_VOICE_MODE_ENABLED: "0",
+    },
+  });
+  let logs = "";
+  supervisor.stdout?.on("data", (chunk) => {
+    logs += String(chunk);
+  });
+  supervisor.stderr?.on("data", (chunk) => {
+    logs += String(chunk);
+  });
+  const workers: number[] = [];
+  onTestFinished(async () => {
+    for (const pid of workers) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        /* already stopped */
+      }
+    }
+    if (supervisor.exitCode === null && supervisor.signalCode === null) {
+      const exited = once(supervisor, "exit");
+      supervisor.kill("SIGKILL");
+      await exited;
+    }
+  });
+  const ready = await new Promise<{ listen: string }>((resolve, reject) => {
+    supervisor.once("message", (message) => resolve(message as { listen: string }));
+    supervisor.once("exit", (code) => reject(new Error(`Supervisor exited ${code}: ${logs}`)));
+    supervisor.once("error", reject);
+  });
+  const client = new DaemonClient({ url: `ws://${ready.listen}/ws` });
+  onTestFinished(() => client.close());
+  await client.connect();
+  await client.observeEvents(["status.server_info"]).ready;
+  const oldPid = (await client.getDaemonStatus()).pid;
+  workers.push(oldPid);
+  const error = client.getLastServerInfoMessage()!.restartRecoveryError!;
+  expect(client.getLastServerInfoMessage()).toMatchObject({
+    features: { restartAnyway: true },
+    restartRecoveryState: "paused",
+  });
+  await expect(client.restartAnyway("outdated error", null)).rejects.toThrow("Recovery changed");
+  expect((await client.getDaemonStatus()).pid).toBe(oldPid);
+  const request = await client.restartAnyway(error, null);
+  await expect
+    .poll(() => client.getLastServerInfoMessage()?.restartAnywayId, { timeout: 20_000 })
+    .toBe(request.restartId);
+  expect(client.getLastServerInfoMessage()?.restartRecoveryState, logs).toBe("running");
+  const newPid = (await client.getDaemonStatus()).pid;
+  workers.push(newPid);
+  expect(newPid).not.toBe(oldPid);
+  expect(await readFile(pointer, "utf8")).toBe(corrupt);
+  await expect(client.restartAnyway(error, null)).rejects.toThrow("Recovery changed");
+  // A later orderly restart uses a new checkpoint and consumes no emergency bypass.
+  const checkpoint = await client.prepareRestart();
+  await client.restartServer();
+  await expect
+    .poll(
+      () => ({
+        state: client.getLastServerInfoMessage()?.restartRecoveryState,
+        generation: client.getLastServerInfoMessage()?.restartRecoveryGeneration,
+        emergency: client.getLastServerInfoMessage()?.restartAnywayId,
+      }),
+      { timeout: 20_000 },
+    )
+    .toEqual({ state: "running", generation: checkpoint.generationId, emergency: undefined });
+  workers.push((await client.getDaemonStatus()).pid);
+  await client.shutdownServer();
+}, 60_000);

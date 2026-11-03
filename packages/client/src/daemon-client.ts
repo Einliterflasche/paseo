@@ -3649,6 +3649,7 @@ export class DaemonClient {
     options?: SendMessageOptions,
   ): Promise<void> {
     const messageId = options?.messageId ?? crypto.randomUUID();
+    const restartAnywayId = this.lastServerInfoMessage?.restartAnywayId;
     let requestId = this.createRequestId();
     // Parsing copies nested input once. Later caller mutations must not change a
     // retried request's fingerprint or attachment bytes under the same identity.
@@ -3691,7 +3692,7 @@ export class DaemonClient {
         if (!this.isRetryableSendAgentMessageError(error)) {
           throw error;
         }
-        await this.waitToRetrySendAgentMessage();
+        await this.waitToRetrySendAgentMessage(restartAnywayId);
         requestId = this.createRequestId();
       }
     }
@@ -3711,7 +3712,7 @@ export class DaemonClient {
    * daemon reports one) not mid-restart. Never polls — it is driven entirely by
    * connection-state and server_info events, so it cannot spin.
    */
-  private waitToRetrySendAgentMessage(): Promise<void> {
+  private waitToRetrySendAgentMessage(previousRestartAnywayId?: string): Promise<void> {
     if (this.connectionState.status === "disposed") {
       return Promise.reject(new Error("Daemon client is disposed"));
     }
@@ -3749,6 +3750,14 @@ export class DaemonClient {
         const reportsRecovery =
           info?.restartRecoveryState !== undefined || info?.features?.restartRecovery === true;
         if (owned && reportsRecovery && !freshStatus) return;
+        if (info?.restartAnywayId && info.restartAnywayId !== previousRestartAnywayId) {
+          finish(
+            new Error(
+              "The host restarted without recovery. Message delivery is uncertain. Review the conversation before sending again.",
+            ),
+          );
+          return;
+        }
         if (info?.restartRecoveryState === undefined || info.restartRecoveryState === "running")
           finish();
       };
@@ -4111,6 +4120,31 @@ export class DaemonClient {
         }
         return shutdown.data;
       },
+    });
+  }
+
+  async restartAnyway(
+    expectedError: string,
+    expectedGenerationId: string | null,
+  ): Promise<{ requestId: string; restartId: string }> {
+    // COMPAT(restartAnyway): added in fork v0.10.0, remove gate after 2027-05-03.
+    if (this.lastServerInfoMessage?.features?.restartAnyway !== true)
+      throw new Error("Update the host to use Restart anyway.");
+    const requestId = this.createRequestId();
+    return this.sendRequest({
+      requestId,
+      message: SessionInboundMessageSchema.parse({
+        type: "daemon.restart_anyway.request",
+        requestId,
+        expectedError,
+        expectedGenerationId,
+      }),
+      timeout: 10_000,
+      options: { skipQueue: true },
+      select: (message) =>
+        message.type === "daemon.restart_anyway.response" && message.payload.requestId === requestId
+          ? message.payload
+          : null,
     });
   }
 

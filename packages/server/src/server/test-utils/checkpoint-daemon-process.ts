@@ -6,6 +6,8 @@ import { createPaseoDaemon } from "../bootstrap.js";
 import { stopWithShutdownCheckpoint } from "../shutdown-checkpoint.js";
 import { createCheckpointAgentClient } from "./checkpoint-agent-client.js";
 
+const restartAnywayId = process.env.PASEO_RESTART_ANYWAY_ID;
+delete process.env.PASEO_RESTART_ANYWAY_ID;
 const [home, port = "0", behavior] = process.argv.slice(2);
 if (!home) throw new Error("An isolated test home is required");
 await mkdir(join(home, "static"), { recursive: true });
@@ -28,7 +30,13 @@ const daemon = await createPaseoDaemon(
         withoutSessionHandle: behavior === "without-session-handle",
       }),
     },
-    onLifecycleIntent: () => {
+    restartAnywaySupported: true,
+    restartAnywayId,
+    onLifecycleIntent: (intent) => {
+      if (intent.type === "restart" && intent.restartAnyway) {
+        setTimeout(() => process.exit(0), 50);
+        return;
+      }
       void daemon.stop().then(
         () => process.exit(0),
         (error) => {

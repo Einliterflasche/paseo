@@ -106,6 +106,11 @@ export const zhCN: TranslationResources = {
   },
   common: {
     hostRecovery: {
+      restartAnyway: "仍然重启",
+      restarting: "正在重启…",
+      restartWarning:
+        "是否在未完成恢复的情况下重启 {{hostName}}？未保存的历史记录和待处理的工作可能丢失。已保存的任务不会自动恢复。如果 Paseo 无法停止某些工具，它们可能继续运行。",
+      restartUnconfirmed: "尚未确认重启。请重新连接主机并查看当前状态，然后再试。",
       title: "{{hostName}} 的恢复已暂停",
       description:
         "Paseo 已暂停代理工作，以保护已保存的历史记录。主机管理员必须解决恢复错误后才能继续工作。",

@@ -110,6 +110,12 @@ export const ja: TranslationResources = {
   },
   common: {
     hostRecovery: {
+      restartAnyway: "強制的に再起動",
+      restarting: "再起動中…",
+      restartWarning:
+        "復旧を完了せずに {{hostName}} を再起動しますか？未保存の履歴や保留中の作業が失われる可能性があります。保存されたタスクは自動的に再開されません。Paseo が停止できないツールは動作を続ける場合があります。",
+      restartUnconfirmed:
+        "再起動を確認できません。ホストに再接続し、現在の状態を確認してから再試行してください。",
       title: "{{hostName}} の復元は一時停止中です",
       description:
         "保存済みの履歴を保護するため、Paseo はエージェントの作業を一時停止しました。作業を続けるには、ホストの管理者が復元エラーを解決する必要があります。",

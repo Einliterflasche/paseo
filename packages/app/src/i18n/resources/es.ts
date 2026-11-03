@@ -117,6 +117,12 @@ export const es: TranslationResources = {
   },
   common: {
     hostRecovery: {
+      restartAnyway: "Reiniciar de todos modos",
+      restarting: "Reiniciando…",
+      restartWarning:
+        "¿Reiniciar {{hostName}} sin completar la recuperación? Se pueden perder el historial sin guardar y el trabajo pendiente. Las tareas guardadas no se reanudarán automáticamente. Algunas herramientas pueden seguir ejecutándose si Paseo no puede detenerlas.",
+      restartUnconfirmed:
+        "El reinicio no está confirmado. Vuelve a conectarte al host y revisa su estado antes de intentarlo de nuevo.",
       title: "La recuperación está en pausa en {{hostName}}",
       description:
         "Paseo ha pausado el trabajo de los agentes para proteger el historial guardado. El operador del host debe resolver el error de recuperación antes de continuar.",

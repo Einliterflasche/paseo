@@ -1008,6 +1008,20 @@ export class AgentManager {
     if (entry.continue) this.suspendedForRestart.set(entry.record.id, entry.inputs);
   }
 
+  exportEmergencyHistory(): Pick<AgentCheckpoint, "timelines" | "children"> {
+    return {
+      timelines: this.timelineStore.exportAll(),
+      children: this.providerSubagents.exportSnapshot(),
+    };
+  }
+
+  installEmergencyHistory(snapshot: Pick<AgentCheckpoint, "timelines" | "children">): void {
+    for (const [id, timeline] of Object.entries(snapshot.timelines)) {
+      if (!this.timelineStore.has(id)) this.timelineStore.restoreSnapshot(id, timeline);
+    }
+    this.providerSubagents.restoreSnapshot(snapshot.children);
+  }
+
   async installRestartCheckpoint(snapshot: AgentCheckpoint): Promise<void> {
     await this.admissions.freeze();
     // Register the complete inventory before fallible persistence; capture cannot drop an

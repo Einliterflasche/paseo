@@ -49,7 +49,7 @@ async function runWorker(worker: string, publicationDelay = 0) {
       const timer = setTimeout(() => {
         child.kill("SIGKILL");
         reject(new Error(output));
-      }, 5_000);
+      }, 15_000);
       child.once("error", reject);
       child.once("close", (exitCode) => {
         clearTimeout(timer);
@@ -119,4 +119,36 @@ test("requested shutdown before first readiness exits successfully", async () =>
   `);
   expect(result.code).toBe(0);
   expect(result.events).toEqual([null]);
+});
+
+test("an explicit emergency restart replaces an uncooperative worker and passes its bypass only once", async () => {
+  const restartId = "12345678-1234-1234-1234-123456789abc";
+  const result = await runWorker(`
+    import { existsSync, readFileSync, writeFileSync } from "node:fs";
+    const marker = process.argv[1] + ".count";
+    const count = existsSync(marker) ? Number(readFileSync(marker, "utf8")) : 0;
+    writeFileSync(marker, String(count + 1));
+    if (count === 0) {
+      process.send({ type: "paseo:ready", listen: "blocked", serverId: "srv_test" });
+      process.send({ type: "paseo:restart-anyway", restartId: "${restartId}" });
+      process.send({ type: "paseo:restart-anyway", restartId: "${restartId}" });
+      // Deliberately ignore graceful shutdown and keep the worker alive.
+      setInterval(() => {}, 1000);
+    } else {
+      process.on("message", message => {
+        if (message.type === "paseo:graceful-shutdown") process.exit(0);
+      });
+      process.send({ type: "paseo:ready", listen: process.env.PASEO_RESTART_ANYWAY_ID ?? "ordinary", serverId: "srv_test" });
+      process.send({ type: count === 1 ? "paseo:restart" : "paseo:shutdown" });
+    }
+  `);
+  expect(result.code, result.output).toBe(0);
+  expect(result.events, result.output).toEqual([
+    "blocked",
+    null,
+    restartId,
+    null,
+    "ordinary",
+    null,
+  ]);
 });

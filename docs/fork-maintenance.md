@@ -206,6 +206,11 @@ This requests a checkpointed supervisor replacement; a successful request alone
 does not prove restoration is complete. Verify the reported generation is running
 after reconnect. For a new package or NixOS configuration, use the deployment wrapper.
 
+The human can explicitly select [Restart anyway](restart-recovery-plan.md#explicit-emergency-replacement)
+from a reachable host's error banner after accepting the recovery loss warning.
+This restarts the installed worker and does not activate a replacement package.
+Never select it automatically after a failed restart or deployment.
+
 An unsupported or unreachable daemon, failed checkpoint, or readiness error is a
 reason to inspect the logs and retained state. Never fall back to raw stop/start,
 signals, `--force`, a direct NixOS switch, or a reboot. A paused daemon may hold the

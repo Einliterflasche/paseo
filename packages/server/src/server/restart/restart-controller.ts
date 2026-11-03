@@ -37,6 +37,7 @@ export class RestartController<T> {
   private readonly controls = new Set<Promise<unknown>>();
   private readonly recoveryControlErrors: unknown[] = [];
   private finalizing = false;
+  private abandoned = false;
   private phase: RestartPhase = "running";
   private stage: RestartStage | undefined;
   private generationId: string | undefined;
@@ -78,6 +79,33 @@ export class RestartController<T> {
         ? { affectedAgentIds: this.options.affectedAgentIds?.() ?? [] }
         : {}),
     };
+  }
+
+  /** Explicit emergency replacement never joins the failed orderly operation. */
+  abandonForRestart(): void {
+    if (this.abandoned) return;
+    const { state, stage, error } = this.status;
+    if (
+      !error ||
+      (state !== "paused" &&
+        !(state === "restoring" && (stage === "stopping" || stage === "blocked")))
+    )
+      throw new Error("Restart anyway requires a current restart recovery error");
+    this.abandoned = true;
+    this.phase = "paused";
+    this.stage = "replacing";
+    this.changed();
+  }
+
+  reportEmergencyFailure(error: unknown): void {
+    this.phase = "paused";
+    this.stage = "blocked";
+    this.error = error instanceof Error ? error : new Error(String(error));
+    this.changed();
+  }
+
+  private assertRetained(): void {
+    if (this.abandoned) throw new Error("Restart anyway superseded this recovery attempt");
   }
 
   private changed(): void {
@@ -125,6 +153,8 @@ export class RestartController<T> {
   }
 
   prepare(): Promise<CheckpointCommitResult<T>> {
+    if (this.abandoned)
+      return Promise.reject(new Error("Restart anyway superseded this recovery attempt"));
     if (this.recovery !== "none") return Promise.reject(this.error ?? new RestartInProgressError());
     if (this.phase === "restoring") return Promise.reject(new RestartInProgressError());
     if (this.preparation) return this.preparation;
@@ -137,11 +167,15 @@ export class RestartController<T> {
       try {
         await freeze;
         await this.options.stop?.();
+        this.assertRetained();
         this.stage = "checkpointing";
         this.changed();
         while (this.controls.size) await Promise.allSettled(this.controls);
+        this.assertRetained();
         const snapshot = await this.options.capture();
+        this.assertRetained();
         const checkpoint = await this.options.store.commit(snapshot);
+        this.assertRetained();
         this.generationId = checkpoint.generationId;
         this.phase = "paused";
         this.stage = "ready";
@@ -161,6 +195,7 @@ export class RestartController<T> {
     if (!this.replacement) {
       this.replacement = this.prepare()
         .then(async (checkpoint) => {
+          this.assertRetained();
           this.stage = "replacing";
           this.changed();
           await replace(checkpoint);
@@ -174,7 +209,7 @@ export class RestartController<T> {
     await this.replacement;
   }
 
-  async claim(): Promise<CheckpointClaim<T> | null> {
+  async claim(options?: { restartAnyway?: string }): Promise<CheckpointClaim<T> | null> {
     this.handledFailure = null;
     // Freeze before any asynchronous disk read: the listener may already exist.
     this.phase = "restoring";
@@ -183,7 +218,9 @@ export class RestartController<T> {
     this.changed();
     try {
       await freeze;
-      const checkpoint = await this.options.store.loadAndClaim();
+      if (options?.restartAnyway)
+        await this.options.store.fenceEmergencyReplay(options.restartAnyway);
+      const checkpoint = options?.restartAnyway ? null : await this.options.store.loadAndClaim();
       if (checkpoint) {
         this.generationId = checkpoint.generationId;
         this.phase = "restoring";
@@ -267,6 +304,7 @@ export class RestartController<T> {
     // Controls accepted while durable completion is being written still own
     // provider teardown. Seal admission, join them, then retire closed handles.
     try {
+      this.assertRetained();
       await this.options.store.markRestored(this.generationId);
       this.finalizing = true;
       while (this.controls.size) await Promise.allSettled(this.controls);
@@ -277,6 +315,7 @@ export class RestartController<T> {
         );
       }
       await this.options.finalize?.();
+      this.assertRetained();
       this.phase = "running";
       this.stage = undefined;
       this.recovery = "none";
@@ -298,6 +337,7 @@ export class RestartController<T> {
   }
 
   private async stopAfterFailure(failure: unknown): Promise<void> {
+    if (this.abandoned) return;
     if (this.failureCleanup) return this.failureCleanup;
     if (this.handledFailure?.error === failure) return;
     this.handledFailure = { error: failure };
@@ -317,9 +357,11 @@ export class RestartController<T> {
       await freeze;
       await this.options.stop?.();
       while (this.controls.size) await Promise.allSettled(this.controls);
+      if (this.abandoned) return;
       this.phase = "paused";
       this.stage = undefined;
     } catch (stopError) {
+      if (this.abandoned) return;
       this.phase = "restoring";
       this.stage = "blocked";
       this.error = new AggregateError(
@@ -332,6 +374,7 @@ export class RestartController<T> {
 
   /** Retry current quiescent state, never install an old source over newer output. */
   retryRecovery(): Promise<void> {
+    if (this.abandoned) return Promise.reject(new RestartHandoffInProgressError());
     if (this.restoration) return this.restoration;
     const stoppingBlocked = this.phase === "restoring" && this.stage === "blocked";
     if (
@@ -349,6 +392,7 @@ export class RestartController<T> {
       try {
         await this.freeze();
         await this.options.stop?.();
+        this.assertRetained();
         this.stage = "checkpointing";
         this.changed();
         while (this.controls.size) await Promise.allSettled(this.controls);
@@ -405,6 +449,7 @@ export class RestartController<T> {
       try {
         await freeze;
         await this.options.stop?.();
+        this.assertRetained();
         this.stage = "checkpointing";
         this.changed();
         while (this.controls.size) await Promise.allSettled(this.controls);
@@ -433,7 +478,9 @@ export class RestartController<T> {
   }
 
   private async restoreCurrentSuccessor(): Promise<void> {
+    this.assertRetained();
     const snapshot = await this.options.capture();
+    this.assertRetained();
     if (this.acknowledgedReadyGeneration)
       await this.options.store.assertReadyGeneration(this.acknowledgedReadyGeneration);
     const successor = await this.options.store.commit(
@@ -454,6 +501,7 @@ export class RestartController<T> {
     this.stage = "starting";
     this.error = undefined;
     this.changed();
+    this.assertRetained();
     await this.options.resume?.(claimed.snapshot);
     await this.completeRestoration();
     this.crashAcknowledgment = null;

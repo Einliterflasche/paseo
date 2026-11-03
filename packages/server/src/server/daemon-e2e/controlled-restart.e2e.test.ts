@@ -14,6 +14,7 @@ async function launch(
   home: string,
   port?: number,
   behavior?: string,
+  restartAnywayId?: string,
 ): Promise<{ child: ChildProcess; client: DaemonClient; port: number }> {
   const child = fork(
     fileURLToPath(new URL("../test-utils/checkpoint-daemon-process.ts", import.meta.url)),
@@ -21,7 +22,7 @@ async function launch(
     {
       execArgv: ["--import", "tsx"],
       stdio: ["ignore", "pipe", "pipe", "ipc"],
-      env: { ...process.env, PASEO_SUPERVISED: "0" },
+      env: { ...process.env, PASEO_SUPERVISED: "0", PASEO_RESTART_ANYWAY_ID: restartAnywayId },
     },
   );
   let errors = "";
@@ -256,6 +257,25 @@ test("failed checkpoint keeps the real daemon alive and never produces a ready g
       .map((row) => (row.item.type === "assistant_message" ? row.item.text : ""))
       .join(""),
   ).toContain("late-close-output");
+  expect(await dispatches(home)).toHaveLength(1);
+  const oldExit = once(current.child, "exit");
+  const status = current.client.getLastServerInfoMessage()!;
+  const forced = await current.client.restartAnyway(
+    status.restartRecoveryError!,
+    status.restartRecoveryGeneration ?? null,
+  );
+  await oldExit;
+  const next = await launch(home, current.port, undefined, forced.restartId);
+  expect(next.client.getLastServerInfoMessage()).toMatchObject({
+    restartRecoveryState: "running",
+    restartAnywayId: forced.restartId,
+  });
+  const recovered = await next.client.fetchAgentTimeline(agent.id, {
+    direction: "tail",
+    limit: 0,
+    projection: "canonical",
+  });
+  expect(recovered).toMatchObject({ epoch: timeline.epoch, entries: timeline.entries });
   expect(await dispatches(home)).toHaveLength(1);
 }, 30_000);
 

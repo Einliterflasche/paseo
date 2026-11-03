@@ -10,6 +10,33 @@ afterEach(() => {
 });
 
 describe("host recovery status", () => {
+  it("publishes a replacement identity even when its recovery error stays the same", () => {
+    const store = useSessionStore.getState();
+    store.initializeSession(serverId, client);
+    const status = {
+      status: "server_info" as const,
+      serverId,
+      hostname: "Host",
+      version: "0.10.0",
+      restartRecoveryState: "paused" as const,
+      restartRecoveryError: "Startup failed",
+    };
+    store.updateSessionServerInfo(serverId, toDaemonServerInfo(status));
+    const previous = useSessionStore.getState().sessions[serverId]?.serverInfo;
+    store.updateSessionServerInfo(
+      serverId,
+      toDaemonServerInfo({ ...status, restartAnywayId: "replacement-1" }),
+    );
+    expect(useSessionStore.getState().sessions[serverId]?.serverInfo).not.toBe(previous);
+    expect(useSessionStore.getState().sessions[serverId]?.serverInfo?.restartAnywayId).toBe(
+      "replacement-1",
+    );
+    store.updateSessionServerInfo(serverId, toDaemonServerInfo(status));
+    expect(
+      useSessionStore.getState().sessions[serverId]?.serverInfo?.restartAnywayId,
+    ).toBeUndefined();
+  });
+
   it("projects paused recovery details from the daemon status and clears them after resuming", () => {
     const store = useSessionStore.getState();
     store.initializeSession(serverId, client);

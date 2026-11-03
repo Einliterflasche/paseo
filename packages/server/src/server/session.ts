@@ -583,9 +583,11 @@ export interface SessionOptions {
   getWebSocketRuntimeMetrics?: () => DaemonWebSocketRuntimeDiagnosticSnapshot | null;
 }
 
+export type SessionLifecycleResult = { generationId: string } | { restartId: string };
+
 export type SessionLifecycleHandler = (
   intent: SessionLifecycleIntent,
-) => void | Promise<void | { generationId: string }>;
+) => void | Promise<void | SessionLifecycleResult>;
 
 export type SessionLifecycleIntent =
   | {
@@ -598,6 +600,7 @@ export type SessionLifecycleIntent =
       type: "restart";
       prepareOnly?: boolean;
       retryRecovery?: boolean;
+      restartAnyway?: { expectedError: string; expectedGenerationId: string | null };
       acknowledgeCrash?: CrashRecoveryAcknowledgment;
       acknowledgmentRequester?: CrashAcknowledgmentRequester;
       clientId: string;
@@ -2702,6 +2705,8 @@ export class Session {
           msg.retryRecovery,
           msg.acknowledgeCrash,
         );
+      case "daemon.restart_anyway.request":
+        return this.handleRestartAnywayRequest(msg);
       case "shutdown_server_request":
         return this.handleShutdownServerRequest(msg.requestId);
       case "client_heartbeat":
@@ -3251,6 +3256,27 @@ export class Session {
     }
   }
 
+  private async handleRestartAnywayRequest(
+    msg: Extract<SessionInboundMessage, { type: "daemon.restart_anyway.request" }>,
+  ): Promise<void> {
+    const result = await this.emitLifecycleIntent({
+      type: "restart",
+      clientId: this.clientId,
+      requestId: msg.requestId,
+      reason: "restart_anyway",
+      restartAnyway: {
+        expectedError: msg.expectedError,
+        expectedGenerationId: msg.expectedGenerationId,
+      },
+    });
+    if (!result || !("restartId" in result))
+      throw new Error("Restart anyway did not return an attempt identity");
+    this.emit({
+      type: "daemon.restart_anyway.response",
+      payload: { requestId: msg.requestId, restartId: result.restartId },
+    });
+  }
+
   private async handleRestartServerRequest(
     requestId: string,
     reason?: string,
@@ -3283,7 +3309,10 @@ export class Session {
     });
     this.emit({
       type: "status",
-      payload: { ...payload, ...(result ? { generationId: result.generationId } : {}) },
+      payload: {
+        ...payload,
+        ...(result && "generationId" in result ? { generationId: result.generationId } : {}),
+      },
     });
   }
 
@@ -3309,7 +3338,7 @@ export class Session {
 
   private async emitLifecycleIntent(
     intent: SessionLifecycleIntent,
-  ): Promise<void | { generationId: string }> {
+  ): Promise<void | SessionLifecycleResult> {
     if (!this.onLifecycleIntent) throw new Error("Daemon lifecycle operations unavailable");
     return this.onLifecycleIntent(intent);
   }

@@ -4085,6 +4085,59 @@ test("sendAgentMessage does not retry while restart recovery is restoring, and r
   await expect(sendPromise).resolves.toBeUndefined();
 });
 
+test("an emergency replacement does not replay an uncertain message from the old worker", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "emergency-pending-send",
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connected = client.connect();
+  mock.triggerOpen({ features: {} });
+  await connected;
+  const status = {
+    status: "server_info" as const,
+    serverId: "host",
+    hostname: null,
+    version: null,
+  };
+  mock.triggerMessage(
+    wrapSessionMessage({ type: "status", payload: { ...status, restartRecoveryState: "paused" } }),
+  );
+  const sending = client.sendAgentMessage("agent-1", "possibly dispatched", {
+    messageId: "uncertain-id",
+  });
+  const rejected = expect(sending).rejects.toThrow("Message delivery is uncertain");
+  await flush();
+  const first = parseSentFrame(mock.sent[0]);
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "rpc_error",
+      payload: {
+        requestId: first.requestId,
+        requestType: "send_agent_message_request",
+        code: "restart_in_progress",
+        error: "Recovery is paused",
+      },
+    }),
+  );
+  await flush();
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "status",
+      payload: {
+        ...status,
+        restartRecoveryState: "running",
+        restartAnywayId: "emergency-replacement",
+      },
+    }),
+  );
+  await rejected;
+  expect(mock.sent).toHaveLength(1);
+});
+
 test("sendAgentMessage does not retry a rejected send (validation/ID conflict)", async () => {
   const mock = createMockTransport();
   const client = new DaemonClient({
@@ -4316,6 +4369,54 @@ test("prepareRestart is rejected by a daemon that does not advertise restartReco
     }),
   );
   await expect(plainRestart).resolves.toMatchObject({ requestId: "req-restart-plain" });
+});
+
+test("restartAnyway uses a separate request with the exact error and generation", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "emergency-test",
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connected = client.connect();
+  mock.triggerOpen({ features: { restartAnyway: true } });
+  await connected;
+  const pending = client.restartAnyway("Stop failed", "generation-1");
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request).toEqual({
+    type: "daemon.restart_anyway.request",
+    expectedError: "Stop failed",
+    expectedGenerationId: "generation-1",
+    requestId: expect.any(String),
+  });
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "daemon.restart_anyway.response",
+      payload: { requestId: request.requestId, restartId: "replacement-id" },
+    }),
+  );
+  await expect(pending).resolves.toEqual({
+    requestId: request.requestId,
+    restartId: "replacement-id",
+  });
+});
+
+test("restartAnyway does not send to a host without the capability", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "emergency-old-host",
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connected = client.connect();
+  mock.triggerOpen();
+  await connected;
+  await expect(client.restartAnyway("failure", null)).rejects.toThrow("Update the host");
+  expect(mock.sent).toEqual([]);
 });
 
 test("restartServer remains restart-only and sends restart_server_request", async () => {

@@ -1,0 +1,268 @@
+npm run build:server
+
+> paseo@0.10.0 build:server
+> npm run build:server-deps && npm run build --workspace=@getpaseo/server && npm run build --workspace=@getpaseo/cli
+
+
+> paseo@0.10.0 build:server-deps
+> npm run build:client && concurrently --kill-others-on-fail --names highlight,plugin,relay --prefix-colors yellow,green,blue "npm run build:highlight" "npm run build:plugin" "npm run build:relay"
+
+
+> paseo@0.10.0 build:client
+> npm run build --workspace=@getpaseo/client
+
+
+> @getpaseo/client@0.10.0 build
+> npm run build --workspace=@getpaseo/protocol && tsc -p tsconfig.json --incremental false
+
+
+> @getpaseo/protocol@0.10.0 prebuild
+> npm run generate:validators
+
+
+> @getpaseo/protocol@0.10.0 generate:validators
+> node scripts/generate-validation-aot.mjs
+
+generated src/generated/validation/ws-outbound.aot.ts from codegen/ws-outbound.compile.ts (WSOutboundMessageSchema)
+
+> @getpaseo/protocol@0.10.0 build
+> tsc -p tsconfig.json --incremental false
+
+[plugin]
+[plugin] > paseo@0.10.0 build:plugin
+[plugin] > npm run build --workspace=@getpaseo/plugin
+[plugin]
+[highlight]
+[highlight] > paseo@0.10.0 build:highlight
+[highlight] > npm run build --workspace=@getpaseo/highlight
+[highlight]
+[relay]
+[relay] > paseo@0.10.0 build:relay
+[relay] > npm run build --workspace=@getpaseo/relay
+[relay]
+[highlight]
+[highlight] > @getpaseo/highlight@0.10.0 build
+[highlight] > tsc -p tsconfig.json --incremental false
+[highlight]
+[plugin]
+[plugin] > @getpaseo/plugin@0.10.0 build
+[plugin] > tsc -p tsconfig.json --incremental false
+[plugin]
+[relay]
+[relay] > @getpaseo/relay@0.10.0 build
+[relay] > tsc -p tsconfig.json --incremental false
+[relay]
+[relay] npm run build:relay exited with code 0
+[highlight] npm run build:highlight exited with code 0
+[plugin] npm run build:plugin exited with code 0
+
+> @getpaseo/server@0.10.0 build
+> npm run build:lib && npm run build:scripts
+
+
+> @getpaseo/server@0.10.0 build:lib
+> tsc -p tsconfig.server.json --incremental false && node scripts/build-opencode-bridge-plugin.mjs && node -e "const fs=require('node:fs'); fs.mkdirSync('dist/server/server/speech/providers/local/sherpa/assets',{recursive:true}); fs.copyFileSync('src/server/speech/providers/local/sherpa/assets/silero_vad.onnx','dist/server/server/speech/providers/local/sherpa/assets/silero_vad.onnx'); fs.cpSync('src/terminal/shell-integration','dist/server/terminal/shell-integration',{recursive:true}); fs.cpSync('src/terminal/shell-integration','dist/src/terminal/shell-integration',{recursive:true}); fs.copyFileSync('src/terminal/terminal-ts-loader.mjs','dist/server/terminal/terminal-ts-loader.mjs'); fs.rmSync('dist/server/skills',{recursive:true,force:true}); fs.cpSync('../../skills','dist/server/skills',{recursive:true}); fs.rmSync('dist/server/builtin-plugins',{recursive:true,force:true}); fs.cpSync('../../plugins','dist/server/builtin-plugins',{recursive:true,filter:(source)=>!source.split(require('node:path').sep).some((segment)=>segment==='node_modules'||segment==='test')&&!/\.(test|spec)\.[cm]?[jt]sx?$/.test(source)&&!source.endsWith('.tsbuildinfo')});"
+
+
+> @getpaseo/server@0.10.0 build:scripts
+> tsc -p tsconfig.scripts.json --incremental false && node -e "const fs=require('node:fs'); fs.mkdirSync('dist/scripts',{recursive:true}); fs.copyFileSync('scripts/mcp-stdio-socket-bridge-cli.mjs','dist/scripts/mcp-stdio-socket-bridge-cli.mjs');"
+
+
+> @getpaseo/cli@0.10.0 build
+> tsc -p tsconfig.json --incremental false
+
+
+npm run typecheck
+
+> paseo@0.10.0 typecheck
+> npm run typecheck --workspaces --if-present
+
+
+> @getpaseo/builtin-plugins@0.0.0 typecheck
+> tsgo -p tsconfig.json --noEmit
+
+
+> @getpaseo/expo-two-way-audio@0.10.0 typecheck
+> tsgo --noEmit
+
+
+> @getpaseo/highlight@0.10.0 typecheck
+> tsgo --noEmit
+
+
+> @getpaseo/plugin@0.10.0 typecheck
+> tsgo --noEmit && tsgo -p tsconfig.examples.json --noEmit
+
+
+> @getpaseo/protocol@0.10.0 pretypecheck
+> npm run generate:validators
+
+
+> @getpaseo/protocol@0.10.0 generate:validators
+> node scripts/generate-validation-aot.mjs
+
+generated src/generated/validation/ws-outbound.aot.ts from codegen/ws-outbound.compile.ts (WSOutboundMessageSchema)
+
+> @getpaseo/protocol@0.10.0 typecheck
+> tsgo --noEmit
+
+
+> @getpaseo/client@0.10.0 typecheck
+> tsgo --noEmit
+
+
+> @getpaseo/server@0.10.0 typecheck
+> tsgo -p tsconfig.server.typecheck.json --noEmit
+
+
+> @getpaseo/app@0.10.0 typecheck
+> tsgo --noEmit
+
+
+> @getpaseo/relay@0.10.0 typecheck
+> tsgo --noEmit
+
+
+> @getpaseo/website@0.10.0 typecheck
+> tsgo --noEmit
+
+
+> @getpaseo/desktop@0.10.0 typecheck
+> tsgo --noEmit -p tsconfig.json
+
+
+> @getpaseo/cli@0.10.0 typecheck
+> tsgo --noEmit
+
+
+npm run lint
+
+> paseo@0.10.0 lint
+> oxlint
+
+Found 0 warnings and 0 errors.
+Finished in 1.8s on 4755 files with 177 rules using 10 threads.
+
+npm run format:check
+
+> paseo@0.10.0 format:check
+> oxfmt --check .
+
+Checking formatting...
+
+All matched files use the correct format.
+Finished in 2805ms on 5088 files using 10 threads.
+
+packages/server: npx vitest run src/server/restart/restart-controller.test.ts --bail=1
+
+ RUN  v4.1.6 /home/agent/code/paseo-project/main/packages/server
+
+
+ Test Files  1 passed (1)
+      Tests  19 passed (19)
+   Start at  11:53:08
+   Duration  2.70s (transform 671ms, setup 52ms, import 991ms, tests 1.49s, environment 0ms)
+
+
+packages/server: npx vitest run scripts/supervisor.readiness.test.ts --bail=1
+
+ RUN  v4.1.6 /home/agent/code/paseo-project/main/packages/server
+
+
+ Test Files  1 passed (1)
+      Tests  5 passed (5)
+   Start at  11:53:09
+   Duration  2.22s (transform 82ms, setup 93ms, import 31ms, tests 1.81s, environment 0ms)
+
+
+packages/server: npx vitest run src/server/daemon-e2e/recovery-blocked.e2e.test.ts --bail=1
+
+ RUN  v4.1.6 /home/agent/code/paseo-project/main/packages/server
+
+
+ Test Files  1 passed (1)
+      Tests  3 passed (3)
+   Start at  11:53:35
+   Duration  44.36s (transform 6.82s, setup 58ms, import 7.54s, tests 36.63s, environment 0ms)
+
+
+packages/server: npx vitest run src/server/daemon-e2e/controlled-restart.e2e.test.ts --bail=1
+
+ RUN  v4.1.6 /home/agent/code/paseo-project/main/packages/server
+
+
+ Test Files  1 passed (1)
+      Tests  7 passed (7)
+   Start at  11:51:20
+   Duration  66.88s (transform 10.63s, setup 60ms, import 12.99s, tests 53.69s, environment 0ms)
+
+
+packages/client: npx vitest run src/daemon-client.test.ts --bail=1
+
+ RUN  v4.1.7 /home/agent/code/paseo-project/main/packages/client
+
+
+ Test Files  1 passed (1)
+      Tests  180 passed (180)
+   Start at  11:49:40
+   Duration  8.17s (transform 6.09s, setup 0ms, import 6.89s, tests 1.15s, environment 0ms)
+
+
+packages/app: npx vitest run src/stores/session-store-recovery.test.ts --bail=1
+
+ RUN  v4.1.7 /home/agent/code/paseo-project/main/packages/app
+
+
+ Test Files  1 passed (1)
+      Tests  6 passed (6)
+   Start at  11:48:30
+   Duration  7.89s (transform 6.82s, setup 55ms, import 7.69s, tests 9ms, environment 0ms)
+
+
+packages/app: npx vitest run src/i18n/resources.test.ts --bail=1
+
+ RUN  v4.1.7 /home/agent/code/paseo-project/main/packages/app
+
+
+ Test Files  1 passed (1)
+      Tests  36 passed (36)
+   Start at  11:53:09
+   Duration  1.76s (transform 692ms, setup 93ms, import 701ms, tests 712ms, environment 0ms)
+
+
+npm run test:e2e --workspace=@getpaseo/app -- e2e/browser/daemon-lifecycle.spec.ts --grep "Restart anyway" --workers=1 (local Chromium override described in validation.txt)
+
+> @getpaseo/app@0.10.0 test:e2e
+> playwright test --project=browser --config ../../.tmp/restart-anyway.playwright.config.cjs e2e/browser/daemon-lifecycle.spec.ts --grep Restart anyway --workers=1
+
+[metro] Starting project at /home/agent/code/paseo-project/main/packages/app
+[metro] Using src/app as the root directory for Expo Router.
+[metro] Experimental Expo Autolinking module resolver is enabled.
+[metro] React Compiler enabled
+[metro] Starting Metro Bundler
+[metro] Waiting on http://localhost:43421
+[metro] Logs for your project will appear below.
+[metro] Web packages/app/index.ts ░░░░░░░░░░░░░░░░  0.0% (0/1)
+[metro] Web packages/app/index.ts ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░ 99.9% (5244/5244)
+[metro] Web Bundled 3914ms packages/app/index.ts (5244 modules)
+[e2e] Metro warmed on port 43421
+
+Running 1 test using 1 worker
+
+(node:2925815) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:2925815) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+[e2e] Worker 0 daemon started on port 35985, home: /tmp/paseo-e2e-worker-0-ZZzCF8
+[metro] Web packages/app/index.ts ░░░░░░░░░░░░░░░░  0.0% (0/1)
+[metro] Web Bundled 224ms packages/app/index.ts (1 module)
+[metro]  LOG  [web] Logs will appear in the browser console
+[metro] Web Bundled 93ms packages/app/src/attachments/web/indexeddb-attachment-store.ts (1 module)
+[metro] Web Bundled 213ms packages/app/index.ts (1 module)
+[metro] Web Bundled 6ms packages/app/src/attachments/web/indexeddb-attachment-store.ts (1 module)
+[metro]  LOG  [web] Logs will appear in the browser console
+  ✓  1 [browser] › e2e/browser/daemon-lifecycle.spec.ts:68:5 › Restart anyway escapes failed recovery from the host banner without reloading the app (17.3s)
+[e2e] Worker 0 daemon stopped
+[e2e] Metro stopped
+
+  1 passed (48.6s)

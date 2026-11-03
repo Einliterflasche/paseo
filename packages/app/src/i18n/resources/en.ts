@@ -105,6 +105,12 @@ export const en = {
   },
   common: {
     hostRecovery: {
+      restartAnyway: "Restart anyway",
+      restarting: "Restarting…",
+      restartWarning:
+        "Restart {{hostName}} without completing recovery? Unsaved history and pending work can be lost. Saved tasks will not resume automatically. Some tools can keep running if Paseo cannot stop them.",
+      restartUnconfirmed:
+        "The restart is not confirmed. Reconnect to the host and review its current state before trying again.",
       title: "Recovery is paused on {{hostName}}",
       description:
         "Paseo has paused agent work to protect saved history. The host operator must resolve the recovery error before work can continue.",

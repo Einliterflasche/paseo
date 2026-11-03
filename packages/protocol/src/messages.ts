@@ -1836,6 +1836,18 @@ export const RestartServerRequestMessageSchema = z.object({
   requestId: z.string(),
 });
 
+export const RestartAnywayRequestMessageSchema = z.object({
+  type: z.literal("daemon.restart_anyway.request"),
+  requestId: z.string(),
+  expectedError: z.string(),
+  expectedGenerationId: z.string().nullable(),
+});
+
+export const RestartAnywayResponseSchema = z.object({
+  type: z.literal("daemon.restart_anyway.response"),
+  payload: z.object({ requestId: z.string(), restartId: z.string() }),
+});
+
 export const ShutdownServerRequestMessageSchema = z.object({
   type: z.literal("shutdown_server_request"),
   requestId: z.string(),
@@ -3353,6 +3365,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   CancelAgentRequestMessageSchema,
   ShutdownServerRequestMessageSchema,
   RestartServerRequestMessageSchema,
+  RestartAnywayRequestMessageSchema,
   DaemonUpdateRequestMessageSchema,
   FetchAgentTimelineRequestMessageSchema,
   AgentTimelineSearchRequestMessageSchema,
@@ -3674,6 +3687,7 @@ export const ServerInfoStatusPayloadSchema = z
       .optional(),
     // COMPAT(restartRecovery): added in fork v0.8.0; remove optional parsing after 2027-03-16.
     restartRecoveryState: z.enum(["running", "preparing", "paused", "restoring"]).optional(),
+    restartAnywayId: z.string().optional(),
     restartRecoveryGeneration: z.string().optional(),
     restartRecoveryError: z.string().optional(),
     // COMPAT(restartRecoveryProgress): added in fork v0.8.0; remove optional parsing after 2027-03-19.
@@ -3712,6 +3726,8 @@ export const ServerInfoStatusPayloadSchema = z
         restartRecovery: z.boolean().optional(),
         // COMPAT(restartRecoveryRetry): added in fork v0.8.0; remove gate after 2027-03-19.
         restartRecoveryRetry: z.boolean().optional(),
+        // COMPAT(restartAnyway): added in fork v0.10.0, remove gate after 2027-05-03.
+        restartAnyway: z.boolean().optional(),
         restartCrashAcknowledgment: z.boolean().optional(),
         // COMPAT(hubAgentRpc): added in v0.8.0; remove gate after 2027-03-05.
         hubAgentRpc: z.boolean().optional(),
@@ -7291,6 +7307,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   LoopStopResponseSchema,
   DaemonUpdateProgressMessageSchema,
   DaemonUpdateResponseSchema,
+  RestartAnywayResponseSchema,
 ]);
 
 export type SessionOutboundMessage = z.infer<typeof SessionOutboundMessageSchema>;

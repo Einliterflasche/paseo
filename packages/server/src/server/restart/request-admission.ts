@@ -157,6 +157,7 @@ const COMMAND_ADMISSION = {
   refresh_providers_snapshot_request: "mutation",
   register_push_token: "mutation",
   restart_server_request: "control",
+  "daemon.restart_anyway.request": "control",
   resume_agent_request: "mutation",
   "schedule/create": "mutation",
   "schedule/delete": "mutation",

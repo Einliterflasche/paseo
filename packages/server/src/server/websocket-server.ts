@@ -181,6 +181,8 @@ interface WebSocketServerConfig {
   daemonStatusRpc?: boolean;
   relayConfig?: boolean;
   startPaused?: boolean;
+  restartAnywaySupported?: boolean;
+  restartAnywayId?: string;
   getRestartStatus?: () => {
     state: "running" | "preparing" | "paused" | "restoring";
     generationId?: string;
@@ -610,6 +612,8 @@ export class VoiceAssistantWebSocketServer {
   private readonly workspaceSetupRuntime: WorkspaceSetupRuntime;
   private readonly providerSnapshotManager: ProviderSnapshotManager;
   private onLifecycleIntent!: SessionLifecycleHandler | null;
+  private restartAnywaySupported = false;
+  private restartAnywayId: string | undefined;
   private onBranchChanged!:
     | ((workspaceId: string, oldBranch: string | null, newBranch: string | null) => void)
     | null;
@@ -718,6 +722,8 @@ export class VoiceAssistantWebSocketServer {
     this.advertiseDaemonStatusRpc = wsConfig.daemonStatusRpc !== false;
     this.advertiseRelayConfig = wsConfig.relayConfig !== false;
     this.previewBroker = wsConfig.previewBroker ?? null;
+    this.restartAnywaySupported = wsConfig.restartAnywaySupported ?? false;
+    this.restartAnywayId = wsConfig.restartAnywayId;
     this.getRestartStatus = wsConfig.getRestartStatus;
     this.connectionLifecycle = wsConfig.startPaused === true ? "starting" : "accepting";
     this.serverId = serverId;
@@ -1539,7 +1545,7 @@ export class VoiceAssistantWebSocketServer {
       },
       onLifecycleIntent: (intent) =>
         this.onLifecycleIntent?.(
-          intent.type === "restart" && intent.acknowledgeCrash
+          intent.type === "restart" && (intent.acknowledgeCrash || intent.restartAnyway)
             ? {
                 ...intent,
                 acknowledgmentRequester: {
@@ -1937,6 +1943,7 @@ export class VoiceAssistantWebSocketServer {
       ...(previews ? { servicePreviews: previews } : {}),
       ...(this.getRestartStatus
         ? {
+            restartAnywayId: this.restartAnywayId,
             restartRecoveryState: this.getRestartStatus().state,
             restartRecoveryGeneration: this.getRestartStatus().generationId,
             restartRecoveryError: this.getRestartStatus().error,
@@ -1957,6 +1964,7 @@ export class VoiceAssistantWebSocketServer {
       features: {
         usageSources: true,
         ownedSubscriptions: true,
+        ...(this.restartAnywaySupported ? { restartAnyway: true } : {}),
         agentRequestReceipts: true,
         workspaceRequestReceipts: true,
         creationLifecycle: true,

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, test } from "../support/fixtures";
@@ -64,3 +64,57 @@ async function createHomeWithSlowProvider(versionDelayMs: number): Promise<strin
   );
   return paseoHome;
 }
+
+test("Restart anyway escapes failed recovery from the host banner without reloading the app", async ({
+  page,
+}, testInfo) => {
+  const home = await mkdtemp(path.join(tmpdir(), "paseo-e2e-restart-anyway-"));
+  await mkdir(path.join(home, "restart-checkpoints"));
+  const pointer = path.join(home, "restart-checkpoints", "ready.json");
+  const corrupt = "{incomplete checkpoint";
+  await writeFile(pointer, corrupt);
+  const daemon = await startIsolatedHostDaemon(randomUUID(), { paseoHome: home });
+  try {
+    await openDaemonOverview(page, daemon);
+    const previousWorker = await readWorkerPid(daemon);
+    const button = page.getByTestId("host-restart-anyway");
+    await expect(button).toBeVisible();
+    await page.screenshot({
+      path: testInfo.outputPath("restart-anyway-desktop.png"),
+      fullPage: true,
+    });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(button).toBeVisible();
+    await page.screenshot({
+      path: testInfo.outputPath("restart-anyway-compact.png"),
+      fullPage: true,
+    });
+    page.once("dialog", async (dialog) => {
+      expect(dialog.message()).toContain("Saved tasks will not resume automatically");
+      await dialog.dismiss();
+    });
+    await button.click();
+    await expect(button).toBeEnabled();
+    expect(await readWorkerPid(daemon)).toBe(previousWorker);
+    await page.evaluate(() => {
+      (globalThis as { emergencyRestartPageMarker?: string }).emergencyRestartPageMarker =
+        "same-page";
+    });
+    page.once("dialog", (dialog) => dialog.accept());
+    await button.click();
+    await expect(button).toHaveCount(0, { timeout: 30_000 });
+    await expect.poll(() => readWorkerPid(daemon)).not.toBe(previousWorker);
+    expect(
+      await page.evaluate(
+        () => (globalThis as { emergencyRestartPageMarker?: string }).emergencyRestartPageMarker,
+      ),
+    ).toBe("same-page");
+    expect(await readFile(pointer, "utf8")).toBe(corrupt);
+    await page.screenshot({
+      path: testInfo.outputPath("restart-anyway-recovered.png"),
+      fullPage: true,
+    });
+  } finally {
+    await daemon.close();
+  }
+});

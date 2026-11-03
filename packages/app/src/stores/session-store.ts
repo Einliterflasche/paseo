@@ -286,6 +286,7 @@ export interface DaemonServerInfo {
   features?: ServerInfoStatusPayload["features"];
   servicePreviews?: ServerInfoStatusPayload["servicePreviews"];
   restartRecoveryState?: ServerInfoStatusPayload["restartRecoveryState"];
+  restartAnywayId?: string;
   restartRecoveryGeneration?: string;
   restartRecoveryError?: string;
   restartRecoveryStage?: ServerInfoStatusPayload["restartRecoveryStage"];
@@ -305,6 +306,7 @@ export function toDaemonServerInfo(serverInfo: ServerInfoStatusPayload): DaemonS
     ...(serverInfo.capabilities ? { capabilities: serverInfo.capabilities } : {}),
     ...(serverInfo.features ? { features: serverInfo.features } : {}),
     ...(serverInfo.servicePreviews ? { servicePreviews: serverInfo.servicePreviews } : {}),
+    ...(serverInfo.restartAnywayId ? { restartAnywayId: serverInfo.restartAnywayId } : {}),
     ...(serverInfo.restartRecoveryState
       ? { restartRecoveryState: serverInfo.restartRecoveryState }
       : {}),
@@ -719,8 +721,10 @@ function areRecoveryDetailsEqual(
   stage: DaemonServerInfo["restartRecoveryStage"],
   previousGeneration: string | undefined,
   affectedAgents: string[] | undefined,
+  restartAnywayId: string | undefined,
 ): boolean {
   return (
+    current?.restartAnywayId === restartAnywayId &&
     current?.restartRecoveryState === state &&
     current?.restartRecoveryGeneration === generation &&
     current?.restartRecoveryError === error &&
@@ -753,6 +757,7 @@ function isSessionServerInfoUnchanged(input: {
   nextCapabilities: ServerCapabilities | undefined;
   nextFeatures: ServerInfoStatusPayload["features"] | undefined;
   nextServerId: string;
+  nextRestartAnywayId: string | undefined;
   nextRestartRecoveryState: ServerInfoStatusPayload["restartRecoveryState"] | undefined;
   nextRestartRecoveryGeneration: string | undefined;
   nextRestartRecoveryError: string | undefined;
@@ -767,6 +772,7 @@ function isSessionServerInfoUnchanged(input: {
     nextDesktopManaged,
     nextCapabilities,
     nextFeatures,
+    nextRestartAnywayId,
     nextRestartRecoveryState,
     nextRestartRecoveryGeneration,
     nextRestartRecoveryError,
@@ -792,6 +798,7 @@ function isSessionServerInfoUnchanged(input: {
       nextRestartRecoveryStage,
       nextRestartRecoveryPreviousGeneration,
       nextRestartRecoveryAffectedAgents,
+      nextRestartAnywayId,
     )
   );
 }
@@ -948,6 +955,7 @@ export const useSessionStore = create<SessionStore>()(
               nextCapabilities,
               nextFeatures,
               nextServerId: info.serverId,
+              nextRestartAnywayId: info.restartAnywayId,
               nextRestartRecoveryState,
               nextRestartRecoveryGeneration,
               nextRestartRecoveryError,
@@ -976,6 +984,7 @@ export const useSessionStore = create<SessionStore>()(
                   ...(nextCapabilities ? { capabilities: nextCapabilities } : {}),
                   ...(nextFeatures ? { features: nextFeatures } : {}),
                   ...(info.servicePreviews ? { servicePreviews: info.servicePreviews } : {}),
+                  restartAnywayId: info.restartAnywayId,
                   ...(nextRestartRecoveryState
                     ? { restartRecoveryState: nextRestartRecoveryState }
                     : {}),

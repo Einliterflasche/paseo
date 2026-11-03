@@ -1,0 +1,24 @@
+Test date: 2026-11-03.
+
+The host ran Linux. The browser used the system Chromium executable.
+The compact screenshot uses a 390 by 844 browser viewport.
+Native iOS, native Android, and Electron were not exercised.
+
+The browser journey uses the production app and an isolated supervised daemon.
+It tests a corrupt ready pointer, the visible action, cancel, confirm, and automatic reconnect.
+Cancel retains the worker. Confirm replaces the worker and removes the error banner.
+The corrupt pointer remains intact. The app does not reload.
+
+The local Playwright override uses /run/current-system/sw/bin/chromium and disables video recording.
+This host does not contain Playwright's downloaded Chromium or ffmpeg binaries.
+The test otherwise uses the existing app configuration and fixtures.
+
+The Opus 5.5 launch failed because its OAuth login expired.
+Codex drafted the architecture, implemented the change, and reviewed the recovery boundaries.
+
+The retained logs record the commands and results below.
+
+All recorded checks passed. The focused files contain 256 passing tests.
+The separate browser journey also passed. No full test suite ran locally.
+
+The live daemon was not restarted or deployed during this work.

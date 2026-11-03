@@ -24,7 +24,7 @@ A graceful stop of a running daemon (SIGTERM to the supervisor, `systemctl stop`
 or `restart`, or a host shutdown that waits for the unit) commits a checkpoint
 first. A paused daemon may stop only when its prepared generation is ready.
 Failed checkpoints, checkpoint timeouts, and blocked or restoring recovery retain
-the daemon and block replacement. The supervisor and NixOS unit do not force-kill
+the daemon and block ordinary replacement. The supervisor and NixOS unit do not force-kill
 it after a deadline. Inspect the retained state and retry the checkpointed path.
 Unexpected crashes, SIGKILL, power loss, and client process death/reload are outside
 the guarantee. Updates must keep clients alive
@@ -57,7 +57,7 @@ it cannot capture or resume work until teardown and event drain are confirmed.
 While admission is closed, history reads use installed canonical state without starting
 provider sessions. Internal helpers return typed results; only the checkpoint store can
 produce readiness.
-Never report success after a failed save or silently force replacement.
+Never report controlled recovery success after a failed save or silently force replacement.
 
 A retry operates on the current stopped inventory, including late output and agents
 that were never opened. `paseo daemon restart --retry-recovery` commits and claims
@@ -65,6 +65,65 @@ a successor generation before continuing; it does not reinstall an older snapsho
 Cancellation stays available during restoration and stopping, but is rejected once
 the immutable handoff is checkpointing, ready, or replacing. External effects of
 already executed tools cannot be undone by recovery.
+
+## Explicit emergency replacement
+
+On 2026-11-03 Raphael requested a remote escape when orderly recovery fails.
+The red host recovery banner offers `Restart anyway` to users with `daemon.manage` on supported hosts.
+Its confirmation explains possible loss of unsaved history and pending work.
+It also explains that saved tasks do not resume automatically and some tools can remain running.
+This explicit action sits outside the controlled restart guarantee.
+Ordinary restart, shutdown, and deployment keep their checkpoint guards.
+
+The app sends a separate `daemon.restart_anyway.request`, with the displayed error and generation.
+The daemon rejects an outdated error or a request against a healthy host.
+Concurrent requests join one emergency attempt.
+A request acknowledgment identifies the attempt, not successful recovery.
+The replacement reports that identity as `server_info.restartAnywayId` after reconnect.
+The app keeps its current session and does not reload.
+An interrupted send stops automatic retries when it observes a new emergency identity.
+It reports uncertain delivery rather than replaying an input against incomplete recovery state.
+
+`restart/emergency-restart.ts` owns the escape and a separate attempt to save display history.
+It does not wait for checkpoint preparation, provider shutdown, or their failed promises.
+It allows one second for the separate history write before handing control to the supervisor.
+History export and JSON encoding still use the worker thread, so a completely frozen worker cannot accept this request.
+A write failure does not prevent replacement.
+Saved files under `PASEO_HOME/restart-anyway/` contain display history only.
+They carry no authority to replay inputs, notifications, schedules, or service launches.
+Late orderly callbacks cannot reopen admission or resume saved work after abandonment.
+
+The worker advertises this action only when its supervisor declares support.
+This prevents a new worker from sending an ignored request to an older supervisor.
+The existing supervisor attempts to kill the worker and its observed descendants.
+An uncertain descendant cleanup does not prevent this explicit escape.
+The supervisor requires the worker itself to exit before it starts another worker.
+Processes outside its observed tree or signal authority can remain running.
+It closes inherited output pipes rather than waiting for unknown descendants to release them.
+If worker termination fails, the supervisor reports the error to the reachable worker for another attempt.
+An external shutdown of the supervisor takes precedence over an emergency restart.
+This action cannot complete or bypass an outstanding NixOS deployment.
+
+The supervisor passes the emergency identity to one replacement only.
+The worker removes it from its environment before it starts agent processes.
+That replacement bypasses checkpoint claiming and installs any readable rescued display history.
+It retains the current agent registry and loads native sessions when users open them.
+It does not resume old agent inputs, finish notifications, managed services, or scheduled runs.
+Persisted interrupted schedules follow the existing crash reconciliation rules.
+Existing checkpoint data and claim markers remain untouched.
+Before opening admission, the replacement marks an unclaimed ready generation as abandoned.
+This prevents an unrelated crash from replaying work from before the emergency.
+A failure to persist this marker leaves recovery paused.
+A corrupt ready pointer already blocks ordinary replay and remains untouched.
+If history rescue fails, native provider history remains available on demand.
+Paseo-only rows and unsaved accepted inputs can be lost.
+
+A later orderly restart writes and restores a new checkpoint through the usual path.
+An unrelated crash receives no reusable emergency authorization.
+If the retained checkpoint is consumed or corrupt, ordinary boot stays visibly paused again.
+A dead supervisor, an unreachable host, or an unresponsive worker needs another route to the machine.
+Disk, permission, or bootstrap failures can still prevent startup.
+The button does not provide a guarantee against those failures.
 
 ## 1. Retain inputs and freeze admissions
 

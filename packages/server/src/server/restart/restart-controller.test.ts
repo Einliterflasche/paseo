@@ -3,8 +3,194 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "vitest";
 import { z } from "zod";
+import pino from "pino";
 import { CheckpointStore } from "./checkpoint-store.js";
 import { RestartController } from "./restart-controller.js";
+import { EmergencyRestart } from "./emergency-restart.js";
+
+test("emergency replacement joins duplicate requests and proceeds when its history directory is unwritable", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-emergency-save-failure-"));
+  const { writeFile } = await import("node:fs/promises");
+  await writeFile(join(home, "restart-anyway"), "retain this failed path");
+  const stopping = Promise.withResolvers<void>();
+  const controller = new RestartController({
+    store: new CheckpointStore(home, z.string().parse),
+    capture: async () => "must not checkpoint",
+    stop: () => {
+      stopping.resolve();
+      return new Promise<void>(() => {});
+    },
+  });
+  void controller.failRestoration(new Error("provider stop stalled"));
+  await stopping.promise;
+  let replacements = 0;
+  const replacing = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const emergency = new EmergencyRestart({
+    home,
+    controller,
+    supported: true,
+    logger: pino({ enabled: false }),
+    agentManager: {
+      exportEmergencyHistory: () => ({ timelines: {}, children: [] }),
+      installEmergencyHistory: () => {},
+    },
+    replace: async () => {
+      replacements++;
+      replacing.resolve();
+      await release.promise;
+    },
+  });
+  const intent = {
+    type: "restart" as const,
+    clientId: "operator",
+    requestId: "wire-id",
+    reason: "restart_anyway",
+    restartAnyway: { expectedError: controller.status.error!, expectedGenerationId: null },
+  };
+  const first = emergency.request(intent);
+  const duplicate = emergency.request(intent);
+  expect(duplicate).toBe(first);
+  await replacing.promise;
+  expect(replacements).toBe(1);
+  release.resolve();
+  expect(await duplicate).toEqual(await first);
+  expect(controller.status.stage).toBe("replacing");
+  expect(await readFile(join(home, "restart-anyway"), "utf8")).toBe("retain this failed path");
+});
+
+test("a failed emergency handoff stays visible and permits another explicit attempt", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-emergency-retry-"));
+  const controller = new RestartController({
+    store: new CheckpointStore(home, z.string().parse),
+    capture: async () => "unused",
+  });
+  await controller.failRestoration(new Error("initial failure"));
+  let replacements = 0;
+  const emergency = new EmergencyRestart({
+    home,
+    controller,
+    supported: true,
+    logger: pino({ enabled: false }),
+    agentManager: {
+      exportEmergencyHistory: () => ({ timelines: {}, children: [] }),
+      installEmergencyHistory: () => {},
+    },
+    replace: async () => {
+      if (++replacements === 1) throw new Error("supervisor unavailable");
+    },
+  });
+  const intent = {
+    type: "restart" as const,
+    clientId: "operator",
+    requestId: "wire-id",
+    reason: "restart_anyway",
+    restartAnyway: { expectedError: "initial failure", expectedGenerationId: null },
+  };
+  await expect(emergency.request(intent)).rejects.toThrow("supervisor unavailable");
+  expect(controller.status).toMatchObject({
+    state: "paused",
+    stage: "blocked",
+    error: "supervisor unavailable",
+  });
+  await expect(
+    emergency.request({
+      ...intent,
+      restartAnyway: { ...intent.restartAnyway, expectedError: "supervisor unavailable" },
+    }),
+  ).resolves.toHaveProperty("restartId");
+  expect(replacements).toBe(2);
+});
+
+test("restart anyway abandons a blocked stop without waiting or allowing late checkpoint work", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-restart-anyway-"));
+  const store = new CheckpointStore(home, z.string().parse);
+  let finishStop!: () => void;
+  let announceStop!: () => void;
+  const stopping = new Promise<void>((resolve) => {
+    announceStop = resolve;
+  });
+  const stop = new Promise<void>((resolve) => {
+    finishStop = resolve;
+  });
+  let captures = 0;
+  const controller = new RestartController({
+    store,
+    stop: () => {
+      announceStop();
+      return stop;
+    },
+    capture: async () => {
+      captures++;
+      return "stale";
+    },
+  });
+  const failed = controller.failRestoration(new Error("shutdown failed"));
+  await stopping;
+  controller.abandonForRestart();
+  finishStop();
+  await failed;
+  await expect(controller.prepare()).rejects.toThrow("Restart anyway");
+  expect(captures).toBe(0);
+  expect(controller.status.stage).toBe("replacing");
+  expect(await store.peekStatus()).toBeNull();
+});
+
+test("an explicit restart-anyway boot bypasses consumed state once and retains its files", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-restart-anyway-boot-"));
+  const store = new CheckpointStore(home, z.string().parse);
+  const saved = await store.commit("old work");
+  await store.loadAndClaim();
+  await store.markRestored(saved.generationId);
+  const pointer = await readFile(join(home, "restart-checkpoints/ready.json"), "utf8");
+  let initialized = 0;
+  let opened = 0;
+  const controller = new RestartController({
+    store,
+    capture: async () => "new work",
+    initialize: async () => {
+      initialized++;
+    },
+    open: () => {
+      opened++;
+    },
+  });
+  expect(await controller.claim({ restartAnyway: "explicit-emergency-attempt" })).toBeNull();
+  expect(controller.status.state).toBe("running");
+  expect(initialized).toBe(1);
+  expect(opened).toBe(1);
+  expect(await readFile(join(home, "restart-checkpoints/ready.json"), "utf8")).toBe(pointer);
+  await expect(new CheckpointStore(home, z.string().parse).loadAndClaim()).rejects.toMatchObject({
+    reason: "already_restored",
+  });
+});
+
+test("an emergency boot fences an unclaimed ready generation against stale replay after another crash", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-emergency-fence-"));
+  const store = new CheckpointStore(home, z.string().parse);
+  const original = await store.commit("old pending work");
+  const controller = new RestartController({ store, capture: async () => "new work" });
+  await controller.claim({ restartAnyway: "explicit-emergency-attempt" });
+  expect(controller.status.state).toBe("running");
+  const laterBoot = new CheckpointStore(home, z.string().parse);
+  await expect(laterBoot.loadAndClaim()).rejects.toMatchObject({
+    reason: "already_claimed",
+    generationId: original.generationId,
+  });
+  expect(
+    JSON.parse(
+      await readFile(
+        join(home, "restart-checkpoints", original.generationId, "snapshot.json"),
+        "utf8",
+      ),
+    ),
+  ).toBe("old pending work");
+  const successor = await controller.prepare();
+  expect(successor.generationId).not.toBe(original.generationId);
+  await expect(new CheckpointStore(home, z.string().parse).loadAndClaim()).resolves.toMatchObject({
+    snapshot: "new work",
+  });
+});
 
 test("capture failure never invokes replacement or publishes readiness", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-restart-negative-"));

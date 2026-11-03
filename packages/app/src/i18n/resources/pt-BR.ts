@@ -114,6 +114,12 @@ export const ptBR: TranslationResources = {
   },
   common: {
     hostRecovery: {
+      restartAnyway: "Reiniciar mesmo assim",
+      restarting: "Reiniciando…",
+      restartWarning:
+        "Reiniciar {{hostName}} sem concluir a recuperação? O histórico não salvo e o trabalho pendente podem ser perdidos. As tarefas salvas não serão retomadas automaticamente. Algumas ferramentas podem continuar em execução se o Paseo não conseguir pará-las.",
+      restartUnconfirmed:
+        "A reinicialização não foi confirmada. Reconecte-se ao host e confira o estado atual antes de tentar novamente.",
       title: "A recuperação está pausada em {{hostName}}",
       description:
         "O Paseo pausou o trabalho dos agentes para proteger o histórico salvo. O operador do host deve resolver o erro de recuperação antes de continuar.",
