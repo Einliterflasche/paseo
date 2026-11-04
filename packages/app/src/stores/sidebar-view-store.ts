@@ -122,7 +122,7 @@ export function migrateSidebarViewState(persistedState: unknown): SidebarViewPer
   const result = SidebarViewPersistedStateSchema.safeParse(persistedState);
   if (!result.success) {
     return {
-      groupMode: "project",
+      groupMode: "status",
       hostFilters: [],
       projectFilters: [],
       labelFilter: emptyLabelFilter(),
@@ -141,7 +141,7 @@ export function migrateSidebarViewState(persistedState: unknown): SidebarViewPer
   }
 
   return {
-    groupMode: state.groupMode === "status" ? "status" : "project",
+    groupMode: state.groupMode === "project" ? "project" : "status",
     hostFilters: readHostFilters(state),
     projectFilters: state.projectFilters ?? [],
     labelFilter: state.labelFilter
@@ -178,7 +178,7 @@ export function createSidebarViewStorage(
 export const useSidebarViewStore = create<SidebarViewStoreState>()(
   persist(
     (set) => ({
-      groupMode: "project",
+      groupMode: "status",
       hostFilters: [],
       projectFilters: [],
       labelFilter: emptyLabelFilter(),

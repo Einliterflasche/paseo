@@ -231,7 +231,7 @@ describe("sidebar view store", () => {
 
   it("never keeps project filters from state the schema rejects", () => {
     expect(migrateSidebarViewState({ projectFilters: "project-a" })).toEqual({
-      groupMode: "project",
+      groupMode: "status",
       hostFilters: [],
       projectFilters: [],
       labelFilter: { labels: [] },

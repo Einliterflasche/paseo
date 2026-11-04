@@ -130,12 +130,12 @@ describe("loadAppSettingsFromStorage", () => {
     expect((await loadAppSettingsFromStorage(deps)).sendBehavior).toBe("interrupt");
   });
 
-  it("defaults theme to auto when storage is empty", async () => {
+  it("defaults theme to Pure black when storage is empty", async () => {
     const deps = makeDeps();
 
     const result = await loadAppSettingsFromStorage(deps);
 
-    expect(result.theme).toBe("auto");
+    expect(result.theme).toBe("pureBlack");
   });
 
   it.each(THEME_OPTIONS)("loads the persisted $name theme", async ({ name }) => {
@@ -998,7 +998,7 @@ describe("appearance settings", () => {
     const result = await loadAppSettingsFromStorage(makeDeps());
 
     expect(result.syntaxTheme).toBe("catppuccin");
-    expect(result.theme).toBe("auto");
+    expect(result.theme).toBe("pureBlack");
   });
 
   it("migrates persisted One once and preserves a later One selection", async () => {
