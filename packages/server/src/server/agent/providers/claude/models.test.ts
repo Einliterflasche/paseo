@@ -39,7 +39,7 @@ async function createClaudeConfigDirWithRawSettings(settings: string): Promise<s
   return configDir;
 }
 
-function createCatalogClient(claudeCodeVersion = "2.1.284"): ClaudeAgentClient {
+function createCatalogClient(claudeCodeVersion = "2.1.322"): ClaudeAgentClient {
   return new ClaudeAgentClient({
     logger: createTestLogger(),
     resolveVersion: async () => claudeCodeVersion,
@@ -52,6 +52,7 @@ describe("getClaudeModels", () => {
     expect(models.map((m) => m.id)).toEqual([
       "claude-opus-5-5",
       "claude-opus-5",
+      "claude-fable-5-2",
       "claude-fable-5-1",
       "claude-fable-5",
       "claude-fable-5[1m]",
@@ -103,6 +104,7 @@ describe("getClaudeModels", () => {
       new Map([
         ["claude-opus-5-5", 1_000_000],
         ["claude-opus-5", 1_000_000],
+        ["claude-fable-5-2", 1_000_000],
         ["claude-fable-5-1", 1_000_000],
         ["claude-fable-5", 1_000_000],
         ["claude-fable-5[1m]", 1_000_000],
@@ -138,6 +140,9 @@ describe("getClaudeModels", () => {
 
     expect(getClaudeModels("2.1.283").map((model) => model.id)).not.toContain("claude-sonnet-5-5");
     expect(getClaudeModels("2.1.284").map((model) => model.id)).toContain("claude-sonnet-5-5");
+
+    expect(getClaudeModels("2.1.320").map((model) => model.id)).not.toContain("claude-fable-5-2");
+    expect(getClaudeModels("2.1.321").map((model) => model.id)).toContain("claude-fable-5-2");
   });
 
   it("derives thinking options from model effort capabilities", () => {
@@ -197,6 +202,22 @@ describe("getClaudeModels", () => {
     expect(models.get("claude-haiku-4-5")?.thinkingOptions).toBeUndefined();
   });
 
+  it("offers Fable 5.2 with adaptive thinking and fast mode support", () => {
+    const model = getClaudeModels("2.1.322").find(
+      (candidate) => candidate.id === "claude-fable-5-2",
+    );
+    expect(model?.thinkingOptions?.map((option) => option.id)).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      CLAUDE_ULTRACODE_THINKING_OPTION_ID,
+    ]);
+    expect(model?.defaultThinkingOptionId).toBe("high");
+    expect(claudeManifestModelSupportsFastMode("claude-fable-5-2")).toBe(true);
+  });
+
   it.each([
     ["claude-opus-5-5", false, "medium"],
     ["claude-opus-5-5-20260401", false, "medium"],
@@ -209,6 +230,7 @@ describe("getClaudeModels", () => {
     ["claude-sonnet-5-20260101", true, "high"],
     ["claude-fable-5", false, "high"],
     ["claude-fable-5-1", false, "high"],
+    ["claude-fable-5-2", false, "high"],
     ["claude-haiku-4-5", false, undefined],
     ["openrouter/anthropic/claude-opus-4-8", false, undefined],
     [null, false, undefined],
