@@ -116,7 +116,6 @@ import { usePanelStore } from "@/stores/panel-store";
 import { flushDraftPersistStorage } from "@/stores/draft-store";
 import { getNextThemePreference } from "@/styles/theme";
 import { useSessionStore } from "@/stores/session-store";
-import { HostRecoveryBanners } from "@/components/host-recovery-banner";
 import { installWebScrollbarStyles } from "@/styles/install-web-scrollbar-styles";
 import type { HostProfile } from "@/types/host-connection";
 import {
@@ -562,18 +561,12 @@ function AppContainer({ children, chromeEnabled: chromeEnabledOverride }: AppCon
           presentation={explorerSidebarPresentation === "dock" ? "dock" : "overlay"}
         >
           <WindowChromeRegion corners={chromeEnabled ? "both" : appChromeLayout.contentCorners}>
-            <View style={flexStyle}>
-              <HostRecoveryBanners />
-              {children}
-            </View>
+            <View style={flexStyle}>{children}</View>
           </WindowChromeRegion>
         </CompactExplorerSidebarHost>
       ) : (
         <WindowChromeRegion corners={appChromeLayout.contentCorners}>
-          <View style={flexStyle}>
-            <HostRecoveryBanners />
-            {children}
-          </View>
+          <View style={flexStyle}>{children}</View>
         </WindowChromeRegion>
       )}
     </View>

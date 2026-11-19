@@ -754,7 +754,6 @@ type RestartRequestedStatusPayload = z.infer<typeof RestartRequestedStatusPayloa
 type ShutdownRequestedStatusPayload = z.infer<typeof ShutdownRequestedStatusPayloadSchema>;
 export interface RestartServerOptions {
   timeout?: number;
-  prepareOnly?: boolean;
 }
 export interface ShutdownServerOptions {
   requestId?: string;
@@ -3649,7 +3648,6 @@ export class DaemonClient {
     options?: SendMessageOptions,
   ): Promise<void> {
     const messageId = options?.messageId ?? crypto.randomUUID();
-    const restartAnywayId = this.lastServerInfoMessage?.restartAnywayId;
     let requestId = this.createRequestId();
     // Parsing copies nested input once. Later caller mutations must not change a
     // retried request's fingerprint or attachment bytes under the same identity.
@@ -3692,7 +3690,7 @@ export class DaemonClient {
         if (!this.isRetryableSendAgentMessageError(error)) {
           throw error;
         }
-        await this.waitToRetrySendAgentMessage(restartAnywayId);
+        await this.waitToRetrySendAgentMessage();
         requestId = this.createRequestId();
       }
     }
@@ -3712,7 +3710,7 @@ export class DaemonClient {
    * daemon reports one) not mid-restart. Never polls — it is driven entirely by
    * connection-state and server_info events, so it cannot spin.
    */
-  private waitToRetrySendAgentMessage(previousRestartAnywayId?: string): Promise<void> {
+  private waitToRetrySendAgentMessage(): Promise<void> {
     if (this.connectionState.status === "disposed") {
       return Promise.reject(new Error("Daemon client is disposed"));
     }
@@ -3750,14 +3748,6 @@ export class DaemonClient {
         const reportsRecovery =
           info?.restartRecoveryState !== undefined || info?.features?.restartRecovery === true;
         if (owned && reportsRecovery && !freshStatus) return;
-        if (info?.restartAnywayId && info.restartAnywayId !== previousRestartAnywayId) {
-          finish(
-            new Error(
-              "The host restarted without recovery. Message delivery is uncertain. Review the conversation before sending again.",
-            ),
-          );
-          return;
-        }
         if (info?.restartRecoveryState === undefined || info.restartRecoveryState === "running")
           finish();
       };
@@ -4006,14 +3996,10 @@ export class DaemonClient {
     requestId?: string,
     options?: RestartServerOptions,
   ): Promise<RestartRequestedStatusPayload> {
-    if (options?.prepareOnly) {
-      this.requireRestartRecoverySupport();
-    }
     const resolvedRequestId = this.createRequestId(requestId);
     const message = SessionInboundMessageSchema.parse({
       type: "restart_server_request",
       ...(reason && reason.trim().length > 0 ? { reason } : {}),
-      ...(options?.prepareOnly ? { prepareOnly: true } : {}),
       requestId: resolvedRequestId,
     });
     return this.sendRequest({
@@ -4033,65 +4019,6 @@ export class DaemonClient {
           return null;
         }
         return restarted.data;
-      },
-    });
-  }
-
-  /**
-   * Requests checkpoint preparation without replacing the daemon: used by the
-   * Nix deployment wrapper, which only swaps the process after this resolves
-   * with the ready generation. Gate call sites on `server_info.features.restartRecovery`.
-   */
-  async prepareRestart(
-    reason?: string,
-    requestId?: string,
-  ): Promise<RestartRequestedStatusPayload> {
-    return this.restartServer(reason, requestId, { prepareOnly: true });
-  }
-
-  async retryRecovery(reason?: string): Promise<RestartRequestedStatusPayload> {
-    // COMPAT(restartRecoveryRetry): added in fork v0.8.0; remove after 2027-03-19.
-    if (this.lastServerInfoMessage?.features?.restartRecoveryRetry !== true) {
-      throw new Error("Update the host to retry a paused recovery attempt.");
-    }
-    const requestId = this.createRequestId();
-    return this.sendRequest({
-      requestId,
-      message: SessionInboundMessageSchema.parse({
-        type: "restart_server_request",
-        requestId,
-        reason,
-        retryRecovery: true,
-      }),
-      options: { skipQueue: true },
-      select: (message) => {
-        if (message.type !== "status") return null;
-        const result = RestartRequestedStatusPayloadSchema.safeParse(message.payload);
-        return result.success && result.data.requestId === requestId ? result.data : null;
-      },
-    });
-  }
-
-  async acknowledgeCrash(
-    generationId: string,
-    orphanExecutionReconciled: true,
-  ): Promise<RestartRequestedStatusPayload> {
-    // COMPAT(restartCrashAcknowledgment): added in fork v0.8.0; remove gate after 2027-03-19.
-    if (this.lastServerInfoMessage?.features?.restartCrashAcknowledgment !== true)
-      throw new Error("Update the host to acknowledge an unexpected crash.");
-    const requestId = this.createRequestId();
-    return this.sendRequest({
-      requestId,
-      message: SessionInboundMessageSchema.parse({
-        type: "restart_server_request",
-        requestId,
-        acknowledgeCrash: { generationId, orphanExecutionReconciled },
-      }),
-      options: { skipQueue: true },
-      select: (message) => {
-        if (message.type !== "status") return null;
-        const result = RestartRequestedStatusPayloadSchema.safeParse(message.payload);
-        return result.success && result.data.requestId === requestId ? result.data : null;
       },
     });
   }
@@ -4120,31 +4047,6 @@ export class DaemonClient {
         }
         return shutdown.data;
       },
-    });
-  }
-
-  async restartAnyway(
-    expectedError: string,
-    expectedGenerationId: string | null,
-  ): Promise<{ requestId: string; restartId: string }> {
-    // COMPAT(restartAnyway): added in fork v0.10.0, remove gate after 2027-05-03.
-    if (this.lastServerInfoMessage?.features?.restartAnyway !== true)
-      throw new Error("Update the host to use Restart anyway.");
-    const requestId = this.createRequestId();
-    return this.sendRequest({
-      requestId,
-      message: SessionInboundMessageSchema.parse({
-        type: "daemon.restart_anyway.request",
-        requestId,
-        expectedError,
-        expectedGenerationId,
-      }),
-      timeout: 10_000,
-      options: { skipQueue: true },
-      select: (message) =>
-        message.type === "daemon.restart_anyway.response" && message.payload.requestId === requestId
-          ? message.payload
-          : null,
     });
   }
 
@@ -6548,13 +6450,6 @@ export class DaemonClient {
     // COMPAT(daemonConfigReload): added in v0.4.0, remove gate after 2027-02-14.
     if (this.lastServerInfoMessage?.features?.daemonConfigReload !== true) {
       throw new Error("Update the host to reload daemon configuration.");
-    }
-  }
-
-  // COMPAT(restartRecovery): added in fork v0.8.0; remove gate after 2027-03-16.
-  private requireRestartRecoverySupport(): void {
-    if (this.lastServerInfoMessage?.features?.restartRecovery !== true) {
-      throw new Error("Update the host to prepare a controlled restart checkpoint.");
     }
   }
 

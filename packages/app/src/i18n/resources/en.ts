@@ -104,25 +104,6 @@ export const en = {
       "Could not confirm the action. Check the current service state before trying again.",
   },
   common: {
-    hostRecovery: {
-      restartAnyway: "Restart anyway",
-      restarting: "Restarting…",
-      restartWarning:
-        "Restart {{hostName}} without completing recovery? Unsaved history and pending work can be lost. Saved tasks will not resume automatically. Some tools can keep running if Paseo cannot stop them.",
-      restartUnconfirmed:
-        "The restart is not confirmed. Reconnect to the host and review its current state before trying again.",
-      title: "Recovery is paused on {{hostName}}",
-      description:
-        "Paseo has paused agent work to protect saved history. The host operator must resolve the recovery error before work can continue.",
-      generation: "Checkpoint: {{generation}}",
-      stoppingTitle: "Recovery is stopping work on {{hostName}}",
-      stoppingDescription:
-        "Recovery failed. Paseo is stopping affected agents and preserving their output. Work is not yet confirmed paused.",
-      blockedTitle: "Recovery needs attention on {{hostName}}",
-      blockedDescription:
-        "Paseo could not confirm that all affected agents stopped. New work and restart are blocked. The host operator must resolve the error before retrying recovery.",
-      affectedAgents: "Affected agents: {{agents}}",
-    },
     back: "Back",
     loading: "Loading...",
     actions: {

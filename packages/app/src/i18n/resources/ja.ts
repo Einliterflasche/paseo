@@ -109,25 +109,6 @@ export const ja: TranslationResources = {
     actionError: "操作を確認できませんでした。再試行の前にサービスの現在の状態を確認してください。",
   },
   common: {
-    hostRecovery: {
-      restartAnyway: "強制的に再起動",
-      restarting: "再起動中…",
-      restartWarning:
-        "復旧を完了せずに {{hostName}} を再起動しますか？未保存の履歴や保留中の作業が失われる可能性があります。保存されたタスクは自動的に再開されません。Paseo が停止できないツールは動作を続ける場合があります。",
-      restartUnconfirmed:
-        "再起動を確認できません。ホストに再接続し、現在の状態を確認してから再試行してください。",
-      title: "{{hostName}} の復元は一時停止中です",
-      description:
-        "保存済みの履歴を保護するため、Paseo はエージェントの作業を一時停止しました。作業を続けるには、ホストの管理者が復元エラーを解決する必要があります。",
-      generation: "チェックポイント: {{generation}}",
-      stoppingTitle: "{{hostName}} の復元処理が作業を停止しています",
-      stoppingDescription:
-        "復元に失敗しました。Paseo は対象のエージェントを停止し、出力を保存しています。作業が一時停止したことはまだ確認できていません。",
-      blockedTitle: "{{hostName}} の復元に対応が必要です",
-      blockedDescription:
-        "対象のすべてのエージェントが停止したことを Paseo は確認できませんでした。新しい作業と再起動はブロックされています。ホストの管理者がエラーを解決してから、復元を再試行してください。",
-      affectedAgents: "対象のエージェント: {{agents}}",
-    },
     back: "戻る",
     loading: "読み込み中...",
     actions: {

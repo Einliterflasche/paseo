@@ -286,12 +286,6 @@ export interface DaemonServerInfo {
   features?: ServerInfoStatusPayload["features"];
   servicePreviews?: ServerInfoStatusPayload["servicePreviews"];
   restartRecoveryState?: ServerInfoStatusPayload["restartRecoveryState"];
-  restartAnywayId?: string;
-  restartRecoveryGeneration?: string;
-  restartRecoveryError?: string;
-  restartRecoveryStage?: ServerInfoStatusPayload["restartRecoveryStage"];
-  restartRecoveryPreviousGeneration?: string;
-  restartRecoveryAffectedAgents?: string[];
 }
 
 export function toDaemonServerInfo(serverInfo: ServerInfoStatusPayload): DaemonServerInfo {
@@ -306,24 +300,8 @@ export function toDaemonServerInfo(serverInfo: ServerInfoStatusPayload): DaemonS
     ...(serverInfo.capabilities ? { capabilities: serverInfo.capabilities } : {}),
     ...(serverInfo.features ? { features: serverInfo.features } : {}),
     ...(serverInfo.servicePreviews ? { servicePreviews: serverInfo.servicePreviews } : {}),
-    ...(serverInfo.restartAnywayId ? { restartAnywayId: serverInfo.restartAnywayId } : {}),
     ...(serverInfo.restartRecoveryState
       ? { restartRecoveryState: serverInfo.restartRecoveryState }
-      : {}),
-    ...(serverInfo.restartRecoveryGeneration !== undefined
-      ? { restartRecoveryGeneration: serverInfo.restartRecoveryGeneration }
-      : {}),
-    ...(serverInfo.restartRecoveryError !== undefined
-      ? { restartRecoveryError: serverInfo.restartRecoveryError }
-      : {}),
-    ...(serverInfo.restartRecoveryStage
-      ? { restartRecoveryStage: serverInfo.restartRecoveryStage }
-      : {}),
-    ...(serverInfo.restartRecoveryPreviousGeneration !== undefined
-      ? { restartRecoveryPreviousGeneration: serverInfo.restartRecoveryPreviousGeneration }
-      : {}),
-    ...(serverInfo.restartRecoveryAffectedAgents !== undefined
-      ? { restartRecoveryAffectedAgents: serverInfo.restartRecoveryAffectedAgents }
       : {}),
   };
 }
@@ -713,41 +691,6 @@ function areServerInfoFeaturesEqual(
   return JSON.stringify(current ?? null) === JSON.stringify(next ?? null);
 }
 
-function areRecoveryDetailsEqual(
-  current: DaemonServerInfo | null | undefined,
-  state: DaemonServerInfo["restartRecoveryState"],
-  generation: string | undefined,
-  error: string | undefined,
-  stage: DaemonServerInfo["restartRecoveryStage"],
-  previousGeneration: string | undefined,
-  affectedAgents: string[] | undefined,
-  restartAnywayId: string | undefined,
-): boolean {
-  return (
-    current?.restartAnywayId === restartAnywayId &&
-    current?.restartRecoveryState === state &&
-    current?.restartRecoveryGeneration === generation &&
-    current?.restartRecoveryError === error &&
-    current?.restartRecoveryStage === stage &&
-    current?.restartRecoveryPreviousGeneration === previousGeneration &&
-    JSON.stringify(current?.restartRecoveryAffectedAgents) === JSON.stringify(affectedAgents)
-  );
-}
-
-export function selectRecoveryFailedHostIds(state: Pick<SessionStore, "sessions">): string[] {
-  return Object.entries(state.sessions)
-    .filter(([, session]) => {
-      const info = session.serverInfo;
-      return (
-        Boolean(info?.restartRecoveryError?.trim()) &&
-        (info?.restartRecoveryState === "paused" ||
-          (info?.restartRecoveryState === "restoring" &&
-            (info.restartRecoveryStage === "stopping" || info.restartRecoveryStage === "blocked")))
-      );
-    })
-    .map(([serverId]) => serverId);
-}
-
 function isSessionServerInfoUnchanged(input: {
   currentServerInfo: SessionState["serverInfo"] | undefined;
   nextHostname: string | null;
@@ -757,13 +700,7 @@ function isSessionServerInfoUnchanged(input: {
   nextCapabilities: ServerCapabilities | undefined;
   nextFeatures: ServerInfoStatusPayload["features"] | undefined;
   nextServerId: string;
-  nextRestartAnywayId: string | undefined;
   nextRestartRecoveryState: ServerInfoStatusPayload["restartRecoveryState"] | undefined;
-  nextRestartRecoveryGeneration: string | undefined;
-  nextRestartRecoveryError: string | undefined;
-  nextRestartRecoveryStage: DaemonServerInfo["restartRecoveryStage"];
-  nextRestartRecoveryPreviousGeneration: string | undefined;
-  nextRestartRecoveryAffectedAgents: string[] | undefined;
 }): boolean {
   const {
     currentServerInfo,
@@ -772,13 +709,7 @@ function isSessionServerInfoUnchanged(input: {
     nextDesktopManaged,
     nextCapabilities,
     nextFeatures,
-    nextRestartAnywayId,
     nextRestartRecoveryState,
-    nextRestartRecoveryGeneration,
-    nextRestartRecoveryError,
-    nextRestartRecoveryStage,
-    nextRestartRecoveryPreviousGeneration,
-    nextRestartRecoveryAffectedAgents,
   } = input;
   const prevHostname = currentServerInfo?.hostname?.trim() || null;
   const prevVersion = currentServerInfo?.version?.trim() || null;
@@ -790,16 +721,7 @@ function isSessionServerInfoUnchanged(input: {
     currentServerInfo?.desktopManaged === nextDesktopManaged &&
     areServerCapabilitiesEqual(currentServerInfo?.capabilities, nextCapabilities) &&
     areServerInfoFeaturesEqual(currentServerInfo?.features, nextFeatures) &&
-    areRecoveryDetailsEqual(
-      currentServerInfo,
-      nextRestartRecoveryState,
-      nextRestartRecoveryGeneration,
-      nextRestartRecoveryError,
-      nextRestartRecoveryStage,
-      nextRestartRecoveryPreviousGeneration,
-      nextRestartRecoveryAffectedAgents,
-      nextRestartAnywayId,
-    )
+    currentServerInfo?.restartRecoveryState === nextRestartRecoveryState
   );
 }
 
@@ -938,11 +860,6 @@ export const useSessionStore = create<SessionStore>()(
           const nextCapabilities = info.capabilities;
           const nextFeatures = info.features;
           const nextRestartRecoveryState = info.restartRecoveryState;
-          const nextRestartRecoveryGeneration = info.restartRecoveryGeneration;
-          const nextRestartRecoveryError = info.restartRecoveryError;
-          const nextRestartRecoveryStage = info.restartRecoveryStage;
-          const nextRestartRecoveryPreviousGeneration = info.restartRecoveryPreviousGeneration;
-          const nextRestartRecoveryAffectedAgents = info.restartRecoveryAffectedAgents;
 
           if (
             equal(session.serverInfo?.servicePreviews, info.servicePreviews) &&
@@ -955,13 +872,7 @@ export const useSessionStore = create<SessionStore>()(
               nextCapabilities,
               nextFeatures,
               nextServerId: info.serverId,
-              nextRestartAnywayId: info.restartAnywayId,
               nextRestartRecoveryState,
-              nextRestartRecoveryGeneration,
-              nextRestartRecoveryError,
-              nextRestartRecoveryStage,
-              nextRestartRecoveryPreviousGeneration,
-              nextRestartRecoveryAffectedAgents,
             })
           ) {
             return prev;
@@ -984,24 +895,8 @@ export const useSessionStore = create<SessionStore>()(
                   ...(nextCapabilities ? { capabilities: nextCapabilities } : {}),
                   ...(nextFeatures ? { features: nextFeatures } : {}),
                   ...(info.servicePreviews ? { servicePreviews: info.servicePreviews } : {}),
-                  restartAnywayId: info.restartAnywayId,
                   ...(nextRestartRecoveryState
                     ? { restartRecoveryState: nextRestartRecoveryState }
-                    : {}),
-                  ...(nextRestartRecoveryGeneration !== undefined
-                    ? { restartRecoveryGeneration: nextRestartRecoveryGeneration }
-                    : {}),
-                  ...(nextRestartRecoveryStage
-                    ? { restartRecoveryStage: nextRestartRecoveryStage }
-                    : {}),
-                  ...(nextRestartRecoveryPreviousGeneration !== undefined
-                    ? { restartRecoveryPreviousGeneration: nextRestartRecoveryPreviousGeneration }
-                    : {}),
-                  ...(nextRestartRecoveryAffectedAgents !== undefined
-                    ? { restartRecoveryAffectedAgents: nextRestartRecoveryAffectedAgents }
-                    : {}),
-                  ...(nextRestartRecoveryError !== undefined
-                    ? { restartRecoveryError: nextRestartRecoveryError }
                     : {}),
                 },
               },

@@ -116,25 +116,6 @@ export const es: TranslationResources = {
       "No se pudo confirmar la acción. Comprueba el estado del servicio antes de volver a intentarlo.",
   },
   common: {
-    hostRecovery: {
-      restartAnyway: "Reiniciar de todos modos",
-      restarting: "Reiniciando…",
-      restartWarning:
-        "¿Reiniciar {{hostName}} sin completar la recuperación? Se pueden perder el historial sin guardar y el trabajo pendiente. Las tareas guardadas no se reanudarán automáticamente. Algunas herramientas pueden seguir ejecutándose si Paseo no puede detenerlas.",
-      restartUnconfirmed:
-        "El reinicio no está confirmado. Vuelve a conectarte al host y revisa su estado antes de intentarlo de nuevo.",
-      title: "La recuperación está en pausa en {{hostName}}",
-      description:
-        "Paseo ha pausado el trabajo de los agentes para proteger el historial guardado. El operador del host debe resolver el error de recuperación antes de continuar.",
-      generation: "Punto de control: {{generation}}",
-      stoppingTitle: "La recuperación está deteniendo el trabajo en {{hostName}}",
-      stoppingDescription:
-        "La recuperación falló. Paseo está deteniendo los agentes afectados y conservando sus resultados. Todavía no se ha confirmado que el trabajo esté en pausa.",
-      blockedTitle: "La recuperación requiere atención en {{hostName}}",
-      blockedDescription:
-        "Paseo no pudo confirmar que todos los agentes afectados se hayan detenido. El trabajo nuevo y el reinicio están bloqueados. El operador del host debe resolver el error antes de reintentar la recuperación.",
-      affectedAgents: "Agentes afectados: {{agents}}",
-    },
     back: "Atrás",
     loading: "Cargando...",
     actions: {

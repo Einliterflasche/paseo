@@ -105,24 +105,6 @@ export const zhCN: TranslationResources = {
     actionError: "无法确认操作。请在重试前检查服务的当前状态。",
   },
   common: {
-    hostRecovery: {
-      restartAnyway: "仍然重启",
-      restarting: "正在重启…",
-      restartWarning:
-        "是否在未完成恢复的情况下重启 {{hostName}}？未保存的历史记录和待处理的工作可能丢失。已保存的任务不会自动恢复。如果 Paseo 无法停止某些工具，它们可能继续运行。",
-      restartUnconfirmed: "尚未确认重启。请重新连接主机并查看当前状态，然后再试。",
-      title: "{{hostName}} 的恢复已暂停",
-      description:
-        "Paseo 已暂停代理工作，以保护已保存的历史记录。主机管理员必须解决恢复错误后才能继续工作。",
-      generation: "检查点：{{generation}}",
-      stoppingTitle: "恢复正在停止 {{hostName}} 上的工作",
-      stoppingDescription:
-        "恢复失败。Paseo 正在停止受影响的代理并保留其输出。目前尚未确认工作已暂停。",
-      blockedTitle: "{{hostName}} 上的恢复需要处理",
-      blockedDescription:
-        "Paseo 无法确认所有受影响的代理都已停止。新工作和重启已被阻止。主机操作员必须解决错误后才能重试恢复。",
-      affectedAgents: "受影响的代理：{{agents}}",
-    },
     back: "返回",
     loading: "加载中...",
     actions: {

@@ -768,19 +768,6 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
     [client],
   );
 
-  const _restartServer = useCallback(
-    (reason?: string) => {
-      if (!client) {
-        console.warn("[Session] restartServer skipped: daemon unavailable");
-        return;
-      }
-      void client.restartServer(reason).catch((error) => {
-        console.error("[Session] Failed to restart server:", error);
-      });
-    },
-    [client],
-  );
-
   const _setAgentMode = useCallback(
     (agentId: string, modeId: string) => {
       if (!client) {

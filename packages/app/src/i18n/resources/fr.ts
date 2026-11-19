@@ -116,25 +116,6 @@ export const fr: TranslationResources = {
       "Impossible de confirmer l’action. Vérifiez l’état actuel du service avant de réessayer.",
   },
   common: {
-    hostRecovery: {
-      restartAnyway: "Redémarrer quand même",
-      restarting: "Redémarrage…",
-      restartWarning:
-        "Redémarrer {{hostName}} sans terminer la récupération ? L’historique non enregistré et le travail en attente peuvent être perdus. Les tâches enregistrées ne reprendront pas automatiquement. Certains outils peuvent continuer à fonctionner si Paseo ne peut pas les arrêter.",
-      restartUnconfirmed:
-        "Le redémarrage n’est pas confirmé. Reconnectez-vous à l’hôte et consultez son état avant de réessayer.",
-      title: "La récupération est en pause sur {{hostName}}",
-      description:
-        "Paseo a suspendu le travail des agents pour protéger l’historique enregistré. L’opérateur de l’hôte doit résoudre l’erreur de récupération avant de poursuivre.",
-      generation: "Point de contrôle : {{generation}}",
-      stoppingTitle: "La récupération arrête le travail sur {{hostName}}",
-      stoppingDescription:
-        "La récupération a échoué. Paseo arrête les agents concernés et préserve leurs résultats. La mise en pause du travail n’est pas encore confirmée.",
-      blockedTitle: "La récupération nécessite une intervention sur {{hostName}}",
-      blockedDescription:
-        "Paseo n’a pas pu confirmer l’arrêt de tous les agents concernés. Les nouvelles tâches et le redémarrage sont bloqués. L’opérateur de l’hôte doit résoudre l’erreur avant de relancer la récupération.",
-      affectedAgents: "Agents concernés : {{agents}}",
-    },
     back: "Dos",
     loading: "Chargement...",
     actions: {
