@@ -48,6 +48,8 @@ export async function runStatusCommand(options: CommandOptions, _command: Comman
   };
 }
 
+type ConnectedClient = Awaited<ReturnType<typeof connectToDaemon>>;
+
 async function probeDaemonStatus(
   target: DaemonTarget,
   instance: Awaited<ReturnType<typeof readDaemonInstance>>,
@@ -56,7 +58,7 @@ async function probeDaemonStatus(
   let connectedDaemon = "unreachable";
   let note: string | undefined;
   let live: Record<string, unknown> = {};
-  let client: Awaited<ReturnType<typeof connectToDaemon>> | undefined;
+  let client: ConnectedClient | undefined;
   try {
     client = await connectToDaemon({ target, instance: instance ?? undefined, timeout: 1_500 });
   } catch (error) {
@@ -81,8 +83,7 @@ async function probeDaemonStatus(
         "DAEMON_REPLACED",
         "Supervisor exited or was replaced during status observation.",
       );
-    const info = client.getLastServerInfoMessage();
-    live = { serverId: info?.serverId, daemonVersion: info?.version };
+    live = serverInfoFields(client.getLastServerInfoMessage());
     connectedDaemon = client.isConnected ? "reachable" : "unreachable";
     if (!status) {
       const failure = toCommandError(requestError);
@@ -109,6 +110,16 @@ async function probeDaemonStatus(
     await client.close();
   }
   return { ...live, connectedDaemon, note };
+}
+
+// Daemons without restart recovery omit both recovery fields.
+function serverInfoFields(info: ReturnType<ConnectedClient["getLastServerInfoMessage"]>) {
+  return {
+    serverId: info?.serverId,
+    daemonVersion: info?.version,
+    recoveryState: info?.restartRecoveryState,
+    restoredGeneration: info?.restartRecoveryGeneration,
+  };
 }
 
 function localStatus(home: string, instance: Awaited<ReturnType<typeof readDaemonInstance>>) {

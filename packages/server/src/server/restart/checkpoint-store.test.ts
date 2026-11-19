@@ -29,11 +29,19 @@ function generationDir(home: string, generationId: string): string {
   return path.join(home, "restart-checkpoints", generationId);
 }
 
+/** Snapshot and manifest bytes, which abandoning must never change. */
+async function readGeneration(home: string, generationId: string): Promise<string[]> {
+  const dir = generationDir(home, generationId);
+  return Promise.all([
+    fs.readFile(path.join(dir, "snapshot.json"), "utf8"),
+    fs.readFile(path.join(dir, "manifest.json"), "utf8"),
+  ]);
+}
+
 describe("CheckpointStore", () => {
   it("returns null when no checkpoint has ever been committed", async () => {
     const store = new CheckpointStore<Snapshot>(createTempHome(), parse);
     await expect(store.loadAndClaim()).resolves.toBeNull();
-    await expect(store.peekStatus()).resolves.toBeNull();
   });
 
   it("round-trips the exact committed snapshot through loadAndClaim", async () => {
@@ -47,6 +55,44 @@ describe("CheckpointStore", () => {
     expect(claimed).not.toBeNull();
     expect(claimed?.generationId).toBe(committed.generationId);
     expect(claimed?.snapshot).toEqual(snapshot);
+  });
+
+  it("writes a compact snapshot whose manifest checksum matches the written text", async () => {
+    const home = createTempHome();
+    const store = new CheckpointStore<Snapshot>(home, parse);
+    const snapshot: Snapshot = { agentIds: ["a1", "a2"], epoch: 7 };
+
+    const committed = await store.commit(snapshot);
+    const [snapshotText, manifestText] = await readGeneration(home, committed.generationId);
+
+    expect(snapshotText).toBe(JSON.stringify(snapshot));
+    expect(JSON.parse(manifestText).checksum).toBe(
+      createHash("sha256").update(snapshotText, "utf8").digest("hex"),
+    );
+    await expect(store.loadAndClaim()).resolves.toEqual({
+      generationId: committed.generationId,
+      snapshot,
+    });
+  });
+
+  it("loads an indented snapshot written by an earlier daemon", async () => {
+    const home = createTempHome();
+    const store = new CheckpointStore<Snapshot>(home, parse);
+    const snapshot: Snapshot = { agentIds: ["a1"], epoch: 3 };
+    const committed = await store.commit(snapshot);
+
+    const dir = generationDir(home, committed.generationId);
+    const indentedText = JSON.stringify(snapshot, null, 2);
+    await fs.writeFile(path.join(dir, "snapshot.json"), indentedText, "utf8");
+    const manifestPath = path.join(dir, "manifest.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+    manifest.checksum = createHash("sha256").update(indentedText, "utf8").digest("hex");
+    await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+
+    await expect(store.loadAndClaim()).resolves.toEqual({
+      generationId: committed.generationId,
+      snapshot,
+    });
   });
 
   it("advances ready to the newest generation without deleting prior generations", async () => {
@@ -91,21 +137,69 @@ describe("CheckpointStore", () => {
     } satisfies Partial<CheckpointLoadError>);
   });
 
-  it("reports claimed status via peekStatus without claiming", async () => {
-    const store = new CheckpointStore<Snapshot>(createTempHome(), parse);
-    const committed = await store.commit({ agentIds: [], epoch: 0 });
+  it("abandons an unclaimed ready generation so that no later boot loads it", async () => {
+    const home = createTempHome();
+    const store = new CheckpointStore<Snapshot>(home, parse);
+    const committed = await store.commit({ agentIds: ["a1"], epoch: 1 });
+    const dir = generationDir(home, committed.generationId);
+    const before = await readGeneration(home, committed.generationId);
 
-    await expect(store.peekStatus()).resolves.toEqual({
-      generationId: committed.generationId,
-      claimed: false,
+    await store.abandonReady();
+
+    expect(await readGeneration(home, committed.generationId)).toEqual(before);
+    expect(JSON.parse(await fs.readFile(path.join(dir, "claimed.json"), "utf8"))).toEqual({
+      claimedAt: expect.any(String),
+      abandoned: true,
     });
+    await expect(new CheckpointStore<Snapshot>(home, parse).loadAndClaim()).rejects.toMatchObject({
+      reason: "already_claimed",
+      generationId: committed.generationId,
+    } satisfies Partial<CheckpointLoadError>);
+  });
 
+  it("abandons nothing when no ready generation exists", async () => {
+    const home = createTempHome();
+    await new CheckpointStore<Snapshot>(home, parse).abandonReady();
+    await expect(fs.readdir(home)).resolves.toEqual([]);
+  });
+
+  it("abandons nothing when the ready pointer is unreadable", async () => {
+    const home = createTempHome();
+    const store = new CheckpointStore<Snapshot>(home, parse);
+    const committed = await store.commit({ agentIds: ["a1"], epoch: 1 });
+    await fs.writeFile(readyPath(home), "{not json", "utf8");
+
+    await store.abandonReady();
+
+    await expect(fs.readdir(generationDir(home, committed.generationId))).resolves.not.toContain(
+      "claimed.json",
+    );
+  });
+
+  it("abandons nothing when the ready generation directory is missing", async () => {
+    const home = createTempHome();
+    const store = new CheckpointStore<Snapshot>(home, parse);
+    await store.commit({ agentIds: ["a1"], epoch: 1 });
+    await fs.writeFile(readyPath(home), JSON.stringify({ generationId: "does-not-exist" }), "utf8");
+
+    await store.abandonReady();
+
+    await expect(fs.access(generationDir(home, "does-not-exist"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("keeps an existing claim marker when abandoning", async () => {
+    const home = createTempHome();
+    const store = new CheckpointStore<Snapshot>(home, parse);
+    const committed = await store.commit({ agentIds: ["a1"], epoch: 1 });
     await store.loadAndClaim();
+    const marker = path.join(generationDir(home, committed.generationId), "claimed.json");
+    const claimed = await fs.readFile(marker, "utf8");
 
-    await expect(store.peekStatus()).resolves.toEqual({
-      generationId: committed.generationId,
-      claimed: true,
-    });
+    await store.abandonReady();
+
+    expect(await fs.readFile(marker, "utf8")).toBe(claimed);
   });
 
   it("rejects a corrupt ready.json instead of falling back to empty state", async () => {

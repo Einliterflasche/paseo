@@ -26,11 +26,7 @@ import { relative, isAbsolute } from "node:path";
 import { CreationService } from "./creation/index.js";
 import type { CreationSnapshot, AgentCreateRequest } from "@getpaseo/protocol/messages";
 import type { MessageReceipts } from "./message-receipts/index.js";
-import type {
-  CrashRecoveryAcknowledgment,
-  ServerInfoStatusPayload,
-} from "@getpaseo/protocol/messages";
-import type { CrashAcknowledgmentRequester } from "./restart/checkpoint-store.js";
+import type { ServerInfoStatusPayload } from "@getpaseo/protocol/messages";
 import equal from "fast-deep-equal";
 import { SessionDelivery, type OwnedSubscription } from "./session/owned-subscriptions/index.js";
 import { v4 as uuidv4 } from "uuid";
@@ -583,7 +579,9 @@ export interface SessionOptions {
   getWebSocketRuntimeMetrics?: () => DaemonWebSocketRuntimeDiagnosticSnapshot | null;
 }
 
-export type SessionLifecycleResult = { generationId: string } | { restartId: string };
+export interface SessionLifecycleResult {
+  generationId?: string;
+}
 
 export type SessionLifecycleHandler = (
   intent: SessionLifecycleIntent,
@@ -598,11 +596,6 @@ export type SessionLifecycleIntent =
     }
   | {
       type: "restart";
-      prepareOnly?: boolean;
-      retryRecovery?: boolean;
-      restartAnyway?: { expectedError: string; expectedGenerationId: string | null };
-      acknowledgeCrash?: CrashRecoveryAcknowledgment;
-      acknowledgmentRequester?: CrashAcknowledgmentRequester;
       clientId: string;
       requestId: string;
       reason: string;
@@ -2698,15 +2691,15 @@ export class Session {
       case "dictation_stream_cancel":
         return this.voiceSessions.handleMessage(msg);
       case "restart_server_request":
-        return this.handleRestartServerRequest(
-          msg.requestId,
-          msg.reason,
-          msg.prepareOnly,
-          msg.retryRecovery,
-          msg.acknowledgeCrash,
-        );
+        return this.handleRestartServerRequest(msg);
       case "daemon.restart_anyway.request":
-        return this.handleRestartAnywayRequest(msg);
+        // COMPAT(restartRecoveryOperations): older clients may still send this request; remove after 2027-05-19.
+        this.emitRetiredRestartOperation(
+          msg.requestId,
+          msg.type,
+          "Restart anyway is no longer needed: an ordinary restart always completes on this host",
+        );
+        return undefined;
       case "shutdown_server_request":
         return this.handleShutdownServerRequest(msg.requestId);
       case "client_heartbeat":
@@ -3256,38 +3249,28 @@ export class Session {
     }
   }
 
-  private async handleRestartAnywayRequest(
-    msg: Extract<SessionInboundMessage, { type: "daemon.restart_anyway.request" }>,
-  ): Promise<void> {
-    const result = await this.emitLifecycleIntent({
-      type: "restart",
-      clientId: this.clientId,
-      requestId: msg.requestId,
-      reason: "restart_anyway",
-      restartAnyway: {
-        expectedError: msg.expectedError,
-        expectedGenerationId: msg.expectedGenerationId,
-      },
-    });
-    if (!result || !("restartId" in result))
-      throw new Error("Restart anyway did not return an attempt identity");
+  private emitRetiredRestartOperation(requestId: string, requestType: string, error: string) {
     this.emit({
-      type: "daemon.restart_anyway.response",
-      payload: { requestId: msg.requestId, restartId: result.restartId },
+      type: "rpc_error",
+      payload: { requestId, requestType, error, code: "restart_operation_removed" },
     });
   }
 
   private async handleRestartServerRequest(
-    requestId: string,
-    reason?: string,
-    prepareOnly?: boolean,
-    retryRecovery?: boolean,
-    acknowledgeCrash?: CrashRecoveryAcknowledgment,
+    msg: Extract<SessionInboundMessage, { type: "restart_server_request" }>,
   ): Promise<void> {
-    if ((acknowledgeCrash && (prepareOnly || retryRecovery)) || (prepareOnly && retryRecovery))
-      throw new Error(
-        "Restart preparation, recovery retry, and crash acknowledgment are separate operations",
+    const { requestId, reason } = msg;
+    // COMPAT(restartRecoveryOperations): older clients may still send these flags; remove after 2027-05-19.
+    const retiredFlagSent =
+      msg.prepareOnly === true || msg.retryRecovery === true || msg.acknowledgeCrash !== undefined;
+    if (retiredFlagSent) {
+      this.emitRetiredRestartOperation(
+        requestId,
+        msg.type,
+        "This host no longer pauses recovery: an ordinary restart or stop saves the checkpoint",
       );
+      return;
+    }
     const lifecycleReason = normalizeClientRestartRpcReason(reason);
     const payload: { status: string } & Record<string, unknown> = {
       status: "restart_requested",
@@ -3303,15 +3286,12 @@ export class Session {
       clientId: this.clientId,
       requestId,
       reason: lifecycleReason,
-      prepareOnly,
-      retryRecovery,
-      acknowledgeCrash,
     });
     this.emit({
       type: "status",
       payload: {
         ...payload,
-        ...(result && "generationId" in result ? { generationId: result.generationId } : {}),
+        ...(result?.generationId ? { generationId: result.generationId } : {}),
       },
     });
   }

@@ -104,17 +104,11 @@ Import the module from the host configuration with the reviewed immutable Paseo 
 
 Build and activate through `scripts/deploy-nixos.sh` outside `paseo.service`.
 Use the live state directory and private deployment credential file from fork maintenance.
-The wrapper builds first and requires a ready checkpoint before activation.
-Make sure that the replacement reports the exact restored generation before proceeding.
-If checkpoint preparation fails, preserve the running or paused daemon and diagnose the failure.
-Never bypass failure with raw restart, signals, direct NixOS switch, or reboot.
+The wrapper builds first, stops the service with a time limit, switches, and starts the service again.
+After activation, make sure that the daemon answers before you continue.
 
-Keep the reviewed descendant cleanup in the deployment package and wrapper.
 The first Cloudflare activation left Chromium processes in `paseo.service` and blocked systemd startup.
-Raphael reports external intervention before the saved generation resumed.
-Use the reviewed deployment wrapper for the guarded transition from older packages.
-It preserves the successful checkpoint guard and refuses activation without proof that the old service stopped safely.
-See [fork maintenance](fork-maintenance.md) for this transition.
+The wrapper now kills the service after its stop limit, so leftover processes cannot block the start.
 
 Qualify public ordinary traffic before changing Services policy.
 Exercise authenticated browser and native-style WebSockets through the real Cloudflare hostname.

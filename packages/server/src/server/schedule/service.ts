@@ -15,6 +15,7 @@ import {
 } from "../agent/agent-prompt.js";
 import { resolveCreateAgentTitles } from "../agent/create-agent-title.js";
 import { type BoundCreateAgentCommand, formatProviderModel } from "../agent/create-agent/create.js";
+import type { AgentCheckpoint } from "../restart/agent-checkpoint.js";
 import { AgentRestartSuspendedError, RestartInProgressError } from "../restart/restart-errors.js";
 import type { PersistedWorkspaceRecord } from "../workspace-registry.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../worktree-session.js";
@@ -271,6 +272,21 @@ export const ScheduleRestartSnapshotSchema = z.object({
     .optional(),
 });
 
+/** Keeps the schedule runs that the next boot can settle: the runs whose agent the checkpoint
+ *  saves with `continue: true`. It leaves the other runs out, so that the next boot fails them.
+ *  It keeps every other field of the snapshot. A run entry carries no outcome of its own, so a
+ *  kept run always waits for its agent; a run without an agent ID is left out. */
+export function keepContinuingScheduleRuns(
+  schedules: ScheduleRestartSnapshot,
+  agents: AgentCheckpoint["agents"],
+): ScheduleRestartSnapshot {
+  const continuing = new Set(agents.filter((agent) => agent.continue).map((a) => a.record.id));
+  return {
+    ...schedules,
+    runs: schedules.runs.filter((run) => run.agentId && continuing.has(run.agentId)),
+  };
+}
+
 /**
  * What a schedule target's `start*` method returns once its SHORT admission
  * (assignment + turn start) is done. `completion` represents the rest of the run —
@@ -514,6 +530,47 @@ export class ScheduleService {
         manual: this.activeRunContext.get(scheduleId)?.manual ?? false,
         logicalRunId:
           this.logicalRunIds.get(scheduleId) ??
+          this.agentManager.getRunIdentity(runningRun.agentId),
+      });
+    }
+    return {
+      runs,
+      ...(this.pendingArchives.size ? { archives: [...this.pendingArchives.values()] } : {}),
+    };
+  }
+
+  /** Restart snapshot for the fallback path. Lists every run that the store marks `running`, in
+   *  the shape of `snapshotForRestart`. Does not wait for settlements. Skips a run without an agent
+   *  ID. Never rejects: on a store failure it logs and returns the empty snapshot. */
+  async snapshotRunningRunsForRestart(): Promise<ScheduleRestartSnapshot> {
+    // An empty snapshot would let the next boot fail these runs and archive their
+    // workspaces while the agents resume in them, so any owned run beats none.
+    let schedules: StoredSchedule[];
+    try {
+      schedules = await this.store.list();
+    } catch (error) {
+      this.logger.error(
+        { err: error },
+        "Failed to read schedules for the fallback restart snapshot",
+      );
+      return { runs: [] };
+    }
+    const runs: ScheduleRestartRunRecord[] = [];
+    for (const schedule of schedules) {
+      const runningRun = schedule.runs.find((run) => run.status === "running");
+      if (!runningRun?.agentId) continue;
+      runs.push({
+        scheduleId: schedule.id,
+        runId: runningRun.id,
+        agentId: runningRun.agentId,
+        workspaceId: runningRun.workspaceId ?? null,
+        // `manual` only decides whether completion advances the cadence; ownership at the
+        // next boot comes from the run ID alone, so the default is safe when context is gone.
+        manual: this.activeRunContext.get(schedule.id)?.manual ?? false,
+        // May stay undefined: restore still claims the run, and reattachment reads the
+        // identity from the agent manager once the agent is registered.
+        logicalRunId:
+          this.logicalRunIds.get(schedule.id) ??
           this.agentManager.getRunIdentity(runningRun.agentId),
       });
     }

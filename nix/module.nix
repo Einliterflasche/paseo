@@ -66,12 +66,12 @@ in
       type = lib.types.ints.positive;
       default = 120;
       description = ''
-        Seconds a running daemon may spend committing a restart checkpoint when
+        Seconds a running daemon may spend saving a restart checkpoint when
         the service stops (`systemctl stop` or `restart`, a VM or host shutdown).
-        The next start restores that checkpoint instead of pausing recovery.
-        Sets `PASEO_SHUTDOWN_CHECKPOINT_TIMEOUT_MS`. A failed or timed-out
-        checkpoint retains the daemon and blocks replacement. Diagnose the
-        failure before retrying the checkpointed deployment command.
+        The next start restores that checkpoint and resumes the interrupted
+        agents. Sets `PASEO_SHUTDOWN_CHECKPOINT_TIMEOUT_MS`. After this limit
+        the daemon stops without a checkpoint, and its agents do not resume
+        automatically. The unit's stop limit is this value plus 120 seconds.
       '';
     };
 
@@ -111,7 +111,8 @@ in
         description = ''
           Private daemon port when previews.enable is true. The public loopback
           front keeps services.paseo.port, including during gateway failure.
-          First installation needs the checkpointed continuity preflight.
+          The first installation moves the daemon to this port, so deploy it
+          with the deployment wrapper, which stops the old daemon first.
         '';
       };
 
@@ -401,14 +402,16 @@ in
         # one must not make systemd stop the supervisor and every active agent.
         OOMPolicy = "continue";
 
-        # Only the supervisor receives SIGTERM. It asks the worker to commit a
-        # restart checkpoint and to quiesce its agents itself; signaling every
-        # provider process at once would kill the agents before that capture.
+        # Only the supervisor receives SIGTERM. The worker then saves its
+        # checkpoint and stops its agents itself; a signal to every provider
+        # process at once would kill the agents before that capture.
         KillMode = "mixed";
-        # A failed checkpoint must never turn into systemd-forced termination.
-        SendSIGKILL = false;
         KillSignal = "SIGTERM";
-        TimeoutStopSec = "infinity";
+        # A stop must always finish. After this limit systemd kills every
+        # process that remains. The 120 seconds cover the daemon stop and the
+        # service cleanup that follow the checkpoint, plus the supervisor's
+        # own kill and drain steps.
+        TimeoutStopSec = cfg.shutdownCheckpointTimeout + 120;
       };
     };
 

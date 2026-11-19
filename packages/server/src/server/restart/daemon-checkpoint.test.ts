@@ -1,5 +1,9 @@
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { expect, test } from "vitest";
-import { DaemonCheckpointSchema } from "./daemon-checkpoint.js";
+import { CheckpointStore } from "./checkpoint-store.js";
+import { DaemonCheckpointSchema, READABLE_CHECKPOINT_FORMATS } from "./daemon-checkpoint.js";
 import { InMemoryAgentTimelineStore } from "../agent/agent-timeline-store.js";
 
 test("legacy checkpoints remain readable, while shared text requires a new format version", () => {
@@ -48,3 +52,22 @@ test("legacy checkpoints remain readable, while shared text requires a new forma
     "Checkpoint text encoding does not match its declared version",
   );
 });
+
+test.each(READABLE_CHECKPOINT_FORMATS)(
+  "a saved format %i checkpoint still loads",
+  async (version) => {
+    const home = await mkdtemp(join(tmpdir(), "paseo-checkpoint-format-"));
+    const store = new CheckpointStore(home, (value) => DaemonCheckpointSchema.parse(value));
+    const snapshot = {
+      version,
+      agents: { agents: [], timelines: {}, children: [] },
+      notifications: [],
+      schedules: { runs: [] },
+      ...(version === 4 ? { services: [] } : {}),
+    };
+    const saved = await store.commit(snapshot);
+    await expect(
+      new CheckpointStore(home, (value) => DaemonCheckpointSchema.parse(value)).loadAndClaim(),
+    ).resolves.toEqual({ generationId: saved.generationId, snapshot });
+  },
+);

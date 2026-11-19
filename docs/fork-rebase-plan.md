@@ -3,8 +3,9 @@
 This records the completed source integration for the 2026-09-30 upstream update.
 The live source pin, host speech configuration, daemon, and state remain unchanged.
 Publication and deployment are separate steps. Use [fork maintenance](fork-maintenance.md)
-for the checkpointed deployment path and [fork requirements](fork-requirements.md)
-for the preservation contract.
+for the deployment path and [fork requirements](fork-requirements.md)
+for the preservation contract. The best-effort restart policy of 2026-11-19 replaces the
+blocking graceful stop recorded here.
 
 ## Frozen revisions
 
@@ -43,7 +44,7 @@ was introduced.
 | Ownership `dda390826`, `77cea0984`                      | Extended                   | Retryable certified teardown for existing adapters, OpenCode v2, plugins and Muse; foreign processes skipped and owned descendants certified |
 | Services `02c383686` and follow-ups through `f2949becd` | Adapted                    | Authenticated same-origin catalog/grants, private control listener, prefix mounts, lifecycle controls, thumbnails, workers and Fast Refresh  |
 | Service recovery `5de538ac3`, `bbd4e2ae3`               | Retained                   | Format-4 stable workspace/script identities, managed-service relaunch and ordinary-terminal inventory refusal                                |
-| Graceful stop `39a68cd53`                               | Strengthened               | Checkpoint before graceful stop; checkpoint failure or timeout retains execution ownership and blocks replacement                            |
+| Graceful stop `39a68cd53`                               | Superseded on 2026-11-19   | Checkpoint before graceful stop. A failed or slow checkpoint is logged, and the stop completes.                                              |
 | Opus `33b2d1fb3`                                        | Duplicate catalog replaced | Upstream Opus 5.5 definitions/version gates retained; fork Opus 5/high default preserved                                                     |
 | Codex `3ceb1c966`                                       | Static list replaced       | Upstream native Speed migration retains saved true/false; new drafts/tasks use Normal                                                        |
 | Fork policy/audit and bilingual host documentation      | Retained/integrated        | Archival publication rules, completed qualification and unchanged host speech configuration                                                  |
@@ -92,12 +93,9 @@ filesystem-facing entrypoints and retains their query options. Its streaming byt
 transform preserves UTF-8 chunk boundaries without buffering the bundle. Actual Expo
 Fast Refresh retains React counter and input state through the authenticated prefix.
 
-Graceful-stop failure previously fell through to timed worker/systemd termination.
-The integrated worker, supervisor and NixOS module retain the daemon instead.
-`SendSIGKILL=false` and an unlimited unit stop wait prevent the checkpoint deadline
-from becoming a replacement shortcut. Diagnose a pending failed stop and retry the
-checkpointed deployment path. A VM host can still impose its own external shutdown
-limit; prepare before host maintenance.
+This integration retained the daemon after a failed graceful stop. On 2026-11-19 Raphael
+replaced that rule with the best-effort policy in [restart recovery](restart-recovery-plan.md).
+A stop now always completes within its time limits, with or without a checkpoint.
 
 ## Qualification evidence and limits
 
@@ -168,8 +166,7 @@ and node-pty overrides, recalculate the new lockfile dependency hash, and pass t
 old-to-new format-4 package qualification before claiming production compatibility.
 The existing source pin and live service stay unchanged by this source rebase.
 
-A later authorized deployment must run outside `paseo.service`, validate the exact
-prepared generation with the replacement CLI, and use the checkpointed wrapper.
-Verify restored generation, continuation and browser reconnect before reporting
-activation success. Keep old packages, checkpoints and logs. Never use vanilla upstream
-as an intermediate package or force replacement after preparation failure.
+A later authorized deployment must use the wrapper in [fork maintenance](fork-maintenance.md),
+outside `paseo.service`. After activation, report the daemon status, the restored generation,
+the resumed agents, and the browser reconnect. Keep old packages, checkpoints and logs.
+Never use vanilla upstream as an intermediate package.

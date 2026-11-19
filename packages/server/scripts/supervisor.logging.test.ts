@@ -295,30 +295,71 @@ describe("supervisor durable logging", () => {
     expect(result.log).not.toContain('"msg":"Worker heartbeat timed out; restarting worker"');
   }, 25_000);
 
-  test("retains a worker after a graceful timeout and certifies a later retry", async () => {
+  test("kills an uncooperative worker after the graceful timeout and spawns its replacement", async () => {
     const result = await runSupervisorFixture({
       timeoutMs: 10_000,
       gracefulExitTimeoutMs: 300,
       workerSource: `
-        let requests=0;
-        process.on("message", message => {
-          if(message?.type!=="paseo:graceful-shutdown") return;
-          if(++requests===2) process.exit(0);
-          setTimeout(()=>{
-            console.log("WORKER_ALIVE_AFTER_TIMEOUT");
-            process.send?.({type:"paseo:shutdown",reason:"retry_after_timeout"});
-          },800);
-        });
-        process.send?.({type:"paseo:shutdown",reason:"stalled_worker_shutdown"});
-        setInterval(()=>{},1000);
+        import { existsSync, writeFileSync } from "node:fs";
+        const marker = process.argv[1] + ".started";
+        if (!existsSync(marker)) {
+          writeFileSync(marker, "started");
+          process.on("SIGTERM", () => {});
+          process.send?.({ type: "paseo:restart", reason: "stalled_worker_restart" });
+        } else {
+          process.on("message", (message) => {
+            if (message?.type === "paseo:graceful-shutdown") process.exit(0);
+          });
+          process.send?.({ type: "paseo:shutdown", reason: "replacement_started" });
+        }
+        setInterval(() => {}, 1000);
       `,
     });
     expect(result.code).toBe(0);
-    expect(result.stdout).toContain("WORKER_ALIVE_AFTER_TIMEOUT");
-    expect(result.log).toContain("replacement remains blocked");
-    expect(result.log).toContain('"reason":"retry_after_timeout"');
-    expect(result.log).not.toContain("forcing process tree kill");
+    expect(result.log).toContain('"msg":"Worker did not exit after graceful shutdown request"');
+    expect(result.log).toContain("Restarting worker");
+    expect(result.log).toContain('"reason":"replacement_started"');
+    expect(result.log).not.toContain("remains blocked");
   }, 15_000);
+
+  test.skipIf(isPlatform("win32"))(
+    "exits on shutdown when the worker and its descendants ignore the graceful request",
+    async () => {
+      const result = await runSupervisorFixture({
+        timeoutMs: 10_000,
+        gracefulExitTimeoutMs: 300,
+        workerSource: `
+          import { spawn } from "node:child_process";
+          const descendant = spawn(
+            process.execPath,
+            ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
+            { detached: true, stdio: "ignore" },
+          );
+          descendant.unref();
+          process.stdout.write(\`DESCENDANT_PID=\${descendant.pid}\\n\`);
+          process.on("SIGTERM", () => {});
+          process.send?.({ type: "paseo:shutdown", reason: "uncooperative_shutdown" });
+          process.send?.({ type: "paseo:shutdown", reason: "repeated_shutdown" });
+          setInterval(() => {}, 1000);
+        `,
+      });
+      const descendantPid = Number.parseInt(
+        result.stdout.match(/DESCENDANT_PID=(\d+)/)?.[1] ?? "",
+        10,
+      );
+      const descendantSurvived = isProcessRunning(descendantPid);
+      if (descendantSurvived) process.kill(descendantPid, "SIGKILL");
+
+      expect(result.code).toBe(0);
+      expect(result.signal).toBeNull();
+      expect(descendantSurvived).toBe(false);
+      expect(
+        result.log.match(/"msg":"Supervisor requesting graceful worker shutdown"/g),
+      ).toHaveLength(1);
+      expect(result.log).toContain("Supervisor shutting down");
+    },
+    15_000,
+  );
 
   test("waits for a slow cooperative worker without signaling it prematurely", async () => {
     const result = await runSupervisorFixture({
@@ -331,7 +372,7 @@ describe("supervisor durable logging", () => {
       `,
     });
     expect(result.code).toBe(0);
-    expect(result.log).not.toContain("replacement remains blocked");
+    expect(result.log).not.toContain("Worker did not exit after graceful shutdown request");
   }, 15_000);
 
   test.skipIf(isPlatform("win32"))(

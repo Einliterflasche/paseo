@@ -132,60 +132,64 @@ previous archive and host configuration. A checkout edit or a history-only squas
 does not update the running package; a squash with the same Git tree needs no
 service restart. Push the committed revision to `origin/main` before deployment.
 
-What the CLI now owns is the activation step after that pin update: `paseo daemon
-deploy --target-cli <replacement-paseo> -- <activation argv>` prepares a checkpoint on the _running_ daemon, runs the
-given argv (executed directly, no shell) only once that checkpoint is ready, and only
-reports success once the replacement daemon confirms it is running that exact
-checkpoint generation. It never runs the activation command without a ready
-generation validated by the replacement package, never force-kills anything on failure, and serializes concurrent deploys
-with a `deploy.lock` file in `PASEO_HOME`. Investigate its owner if a previous attempt
-failed; never delete state to force a deployment through. `scripts/deploy-nixos.sh` wraps the whole sequence for a
-NixOS host: it builds the closure with `nixos-rebuild build` (never `switch` directly),
-then hands activation of that exact closure to `paseo daemon deploy`, with the closure's
-own Paseo executable as `--target-cli`. After the checkpoint succeeds, the CLI passes its exact generation to activation.
-The replacement package cleans the prepared service's exact cgroup before stopping it.
-This supports the first deployment from a package without worker cleanup.
-Cleanup excludes the supervisor, worker, and executor. It requires the same live leaders,
-service invocation, and unclaimed ready generation at the final signal boundary.
-Activation privileges allow cleanup of children that changed user through `sudo`.
-The wrapper then stops the service through its checkpoint guard.
-Before changing the system profile, it requires a normal successful exit from the old
-invocation, the same unclaimed generation, and an empty old service group.
-A failed or changed proof blocks activation and preserves the checkpoint and logs.
-Activation starts the replacement once and waits for restoration of that generation.
-The wrapper runs the built closure's CLI for both deployment and checkpoint
-validation. That CLI refuses ordinary or unclassified live terminals before Prepare
-and checks again after Prepare freezes mutation admission and drains the scheduler.
-It allows managed-service terminals only under the format-4 policy below. It verifies
-the same paused, ready generation around the second inventory. A failed inventory or
-changed generation prevents activation. Managed services are relaunched from their
-checkpoint identities; their processes are not transferred. A refusal after Prepare
-leaves the checkpoint and paused daemon intact for diagnosis.
-The complete build and activation run in a finite `systemd-run` unit as the operator,
-outside `paseo.service`, with build logs and the result link retained. The launcher
-returns after submission; follow the printed unit with `journalctl -fu <unit>`
-until deployment reports the restored generation. Submission is not deployment success.
-The worker waits for an explicit handoff after `sudo systemd-run` returns, so no
-privileged waiting client remains in the provider tree when checkpointing begins.
-A process that changed user inside an agent's tree (for example `sudo journalctl -f`
-or `sudo nixos-rebuild build` started from a session) cannot be signaled by the
-daemon at all. Teardown certification skips such foreign-owned processes: the
-daemon stops everything it owns, including owned descendants beneath the foreign
-process, and the foreign process itself is left running as an orphan. It cannot
-write into the provider pipe the daemon owns, so it cannot alter recorded history.
-Worker cleanup refuses to certify an exit while that process remains in the service.
-The deployment wrapper clears such children with activation privileges before it waits for service stop.
-This does not change service OOM preferences or the activation command's privileges. Readiness has no
-default deadline; `--wait-timeout` adds one explicitly and never kills a process.
+Deploy with `scripts/deploy-nixos.sh` after that pin update. It submits the whole job with
+`/run/wrappers/bin/sudo systemd-run` as a transient unit named `paseo-deploy-<time>-<pid>`. The unit runs as the
+operator, outside `paseo.service`. The launcher prints the unit name and returns after submission.
+Follow the job with `journalctl -fu <unit>` until it ends. Submission alone does not mean that the
+deployment succeeded.
 
-The VM-wide continuity rules are in `/home/agent/AGENTS.md`. Build and test while
-the old service stays available, use the wrapper as the sole deployment entry
-point, and follow its detached job until it reports the restored generation.
-Do not invoke its internal worker or generated activation script yourself.
+The job runs these steps:
+
+1. Build with `nixos-rebuild build` in a fresh `/tmp/paseo-deploy.*` directory.
+2. Run `timeout <PASEO_DEPLOY_STOP_TIMEOUT> systemctl stop paseo.service` as root.
+3. If the stop fails or times out, kill the service with SIGKILL.
+4. Run `systemctl reset-failed paseo.service`.
+5. Set the system profile, with a 300 s limit.
+6. If the profile step succeeds, run the closure's `switch-to-configuration switch`.
+7. Run `systemctl start paseo.service`, also after a failed step.
+8. If the profile or switch step failed, run `systemctl start multi-user.target`.
+9. Poll the new closure's `paseo daemon status --json` every 2 seconds.
+
+If the build fails, the job ends with the build status and nothing stops. The build directory
+keeps `build.log`, `build-errors.log`, and the `result` link.
+
+The daemon saves its checkpoint during the stop in step 2. In step 3, the job runs
+`systemctl kill --signal=SIGKILL`, then a second bounded `systemctl stop`. It ignores errors in
+both. The new daemon then starts with the checkpoint that was saved before the kill. If no
+checkpoint was saved, its agents do not resume automatically.
+
+A failed switch can leave other units stopped, for example the public front. Step 8 starts them
+again. The job ignores a failure of step 8.
+
+If the status reports `"connectedDaemon": "reachable"`, step 9 ends. The job then prints the
+status and exits with the activation status. If the daemon does not answer within
+`PASEO_DEPLOY_READY_TIMEOUT`, the job exits with 1. [Time limits](restart-recovery-plan.md#time-limits)
+lists every limit and its default.
+
+The journal shows one result line for each step:
+
+- `Build result:`
+- `Stop result:`
+- `Profile result:`
+- `Switch result:`
+- `Start result:`
+- `System units result:`
+- `Activation result: exited with status <n>.`
+- `Daemon status:`
+
+`Stop result: forced kill.` means that the stop exceeded its limit. A non-zero exit of the job means
+that the build, the profile step, the switch, or the start failed, or that the daemon did not answer. Read the
+journal lines to find the failed step. The job runs the start step in every case, so only a failed
+start leaves the service stopped.
+
+The VM-wide continuity rules are in `/home/agent/AGENTS.md`. Build and test while the old service
+stays available. Use the wrapper as the deployment entry point, because it builds first and runs
+outside `paseo.service`. Do not invoke its internal worker or activation script yourself.
 
 On this VM, select the live state directory explicitly. The
-detached job also needs the host's `NIX_PATH`, a PATH that finds
-`/run/wrappers/bin/sudo`, and its credential file via `PASEO_DEPLOY_ENV_FILE`.
+detached job also needs the host's `NIX_PATH` and its credential file via `PASEO_DEPLOY_ENV_FILE`.
+The script calls the setuid wrapper `/run/wrappers/bin/sudo` by its full path. The `sudo` in an
+agent's PATH is not setuid and fails, so the order of PATH does not matter.
 The current credential source is `/home/agent/.config/slack-bridge/raphaels_agent.env`;
 systemd loads it privately, so do not print or put its contents in command arguments.
 An exported password alone is not forwarded to the detached job. Use `--flake`
@@ -200,96 +204,26 @@ PASEO_DEPLOY_ENV_FILE=/home/agent/.config/slack-bridge/raphaels_agent.env \
 The NixOS source pin must already identify the immutable revision being deployed.
 Running this command is an actual deployment, not a validation command.
 
-For an authorized restart of the currently installed package, use authenticated
-`paseo daemon restart` with the same live `PASEO_HOME`, without `--force`.
-This requests a checkpointed supervisor replacement; a successful request alone
-does not prove restoration is complete. Verify the reported generation is running
-after reconnect. For a new package or NixOS configuration, use the deployment wrapper.
+To restart the installed package, run authenticated `paseo daemon restart` with the same live
+`PASEO_HOME`. The daemon always completes the restart. The command waits for the replacement
+worker and reports `checkpointRestored`. For a new package or NixOS configuration, use the
+deployment wrapper.
 
-The human can explicitly select [Restart anyway](restart-recovery-plan.md#explicit-emergency-replacement)
-from a reachable host's error banner after accepting the recovery loss warning.
-This restarts the installed worker and does not activate a replacement package.
-Never select it automatically after a failed restart or deployment.
+After a deployment or a restart, check that the daemon answers `paseo daemon status`. Report its
+`recoveryState`, its `restoredGeneration`, and which agents resumed. The daemon log names
+the resumed, the superseded, and the skipped agents in one summary line. A skipped agent shows an error row in its
+timeline, and a new message continues it. [Check the result](restart-recovery-plan.md#check-the-result)
+gives the commands and the log messages.
 
-An unsupported or unreachable daemon, failed checkpoint, or readiness error is a
-reason to inspect the logs and retained state. Never fall back to raw stop/start,
-signals, `--force`, a direct NixOS switch, or a reboot. A paused daemon may hold the
-only complete recovery state; preserve it. After a partially completed activation,
-understand which generation is running before retrying or considering rollback.
+Before you hand deployment ownership to another agent, record that result. Compare each
+previously active agent's native session identity. Make sure that the web client reconnects and
+that a scheduled run completes. Save the daemon's memory metrics for the five minutes before
+activation and at one and five minutes afterward. Compare worker heap and RSS separately from the
+service cgroup, which includes provider subprocesses. Keep the 6144 MiB allowance until you observe
+the workload after the deployment. A short healthy sample is not a long-run memory bound.
 
-Success means the expected checkpoint generation is restored, agents continue their
-work, and the updated web UI reconnects. A process or open port alone is insufficient.
-The guarantee covers controlled restarts and graceful stops of a running daemon:
-`systemctl stop` or `restart`, and VM or host shutdowns that wait for the unit.
-The configured checkpoint deadline reports failure without killing the daemon.
-The unit uses `SendSIGKILL=false` and waits for certified graceful exit; a failed
-stop can remain pending while you investigate. The VM host's own shutdown limit
-can still terminate it, so prepare through the deployment path before host work.
-The guarantee does not cover SIGKILL, power loss, arbitrary crashes,
-or harness-native loops. Keep prior packages and state available for an inspected,
-compatible rollback. A package must support the offline `daemon checkpoint-check`
-command and read the prepared checkpoint's format before it can be activated.
-The preflight checks advertised formats before preparation, then validates the exact
-ready generation's checksum and schema without claiming it. Older packages that
-lack this command are rejected; do not flatten history or bypass preflight to use them.
-Recovery semantics also need the isolated handoff test; format acceptance alone is
-not rollback evidence.
-
-Checkpoint format 4 includes running managed services. The deployment guard may allow
-their owned terminals only when the running daemon advertises format 4 and its live
-workspace inventory identifies every allowed terminal as a running service. Any
-ordinary or unclassified terminal still blocks activation, as does an older checkpoint
-format. A format-3 package cannot restore a format-4 generation and is not a compatible
-rollback target. Until another validated package supports the current format, recovery
-means repairing forward while preserving the paused daemon and its checkpoint.
-
-Before handing deployment ownership to another agent, record the restored generation
-and its `running` state, compare each previously active agent's native session identity,
-confirm the web client reconnects, and observe a scheduled run complete. Save the
-daemon's existing memory metrics for the five minutes before activation and at one
-and five minutes afterward. Compare worker heap and RSS separately from the service
-cgroup, which includes provider subprocesses. Keep the 6144 MiB allowance until the
-post-deployment workload has been observed; a short healthy sample is not a long-run
-memory bound.
-
-## Deliberate recovery after an unexpected crash
-
-Use this only when a reachable paused daemon reports that its exact generation
-already completed restoration. That checkpoint predates work accepted afterward.
-Ordinary `--retry-recovery` cannot reconstruct the lost runtime from it. Failed
-controlled preparations, partially claimed generations, corrupt data, and incompatible
-formats do not qualify; keep them paused for repair.
-
-Inspect the retained checkpoint, daemon logs, current agent registry, native provider
-sessions, and schedule records first. Reconcile effects already performed by providers
-and confirm orphan provider execution has stopped. The command cannot discover or stop
-unknown workers from the dead process on your behalf.
-
-After accepting the unexpected-crash data loss, use the generation reported by the
-paused daemon and its actual state directory:
-
-```sh
-PASEO_HOME=/path/to/live-state paseo daemon restart \
-  --acknowledge-crash <reported-generation> --orphan-execution-reconciled
-```
-
-The acknowledgment also accepts these consequences: old checkpoint continuations are
-not replayed; native history is loaded when agents are later opened; Paseo-only system
-rows, client message identities, child descriptors, and pending finish notifications
-may be missing. Persisted running schedules are marked failed during reconciliation,
-even if their orphaned provider had completed. This is a manual recovery decision,
-not controlled-restart restoration.
-
-The same daemon stays running. It verifies the exact consumed generation, writes an
-attributed audit receipt, initializes current owners, and commits a successor containing
-that audit provenance before opening admissions. Check its reported `running` state and successor generation. All
-old checkpoint files remain available. A failed initialization uses ordinary
-`--retry-recovery` with the retained current state. A process death before the successor
-requires a fresh operator decision: audit receipts never authorize boot recovery.
-Another crash after success blocks against the new consumed generation.
-
-Never delete or rename `ready.json`, `claimed.json`, or `restored.json` to get past a
-failure, and never combine this operation with raw stop/start or `--force`.
+Keep prior packages available for a rollback. A package that cannot read checkpoint format 4
+starts without the checkpoint, so its agents do not resume.
 
 The migration requirements and release acceptance criteria are in
 [fork-requirements.md](fork-requirements.md). The checkpoint format and controlled-restart

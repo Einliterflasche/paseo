@@ -1,19 +1,22 @@
-import { withTimeout } from "../utils/promise-timeout.js";
+import { attempt, attemptWithin, type RestartFailureReporter } from "./restart/best-effort.js";
 
-/** Upper bound for committing a restart checkpoint when the service stops. */
+/** Upper bound for the restart checkpoint: freeze, stop, capture, and commit. */
 export const DEFAULT_SHUTDOWN_CHECKPOINT_TIMEOUT_MS = 120_000;
+/** Part of the checkpoint limit: the admission freeze and the provider stop. */
+export const RESTART_STOP_TIMEOUT_MS = 30_000;
+/** Longest time a boot keeps admissions frozen while it resumes a checkpoint. */
+export const RESTART_RESTORE_TIMEOUT_MS = 120_000;
 /** Time the daemon's own stop may take once the checkpoint phase is over. */
 export const SHUTDOWN_STOP_GRACE_MS = 30_000;
+/** Time the service cgroup cleanup may take after the daemon stop. */
+export const SHUTDOWN_CLEANUP_GRACE_MS = 25_000;
 export const SHUTDOWN_CHECKPOINT_TIMEOUT_ENV = "PASEO_SHUTDOWN_CHECKPOINT_TIMEOUT_MS";
+// Covers the exit itself after the last bounded step, so the supervisor never kills a worker
+// that is about to exit on its own.
+const WORKER_EXIT_MARGIN_MS = 5_000;
 
 export interface ShutdownCheckpointDaemon {
-  getRestartStatus(): {
-    state: "running" | "preparing" | "paused" | "restoring";
-    generationId?: string;
-    stage?: string;
-    error?: string;
-  };
-  prepareRestart(): Promise<{ generationId: string }>;
+  prepareRestart(): Promise<{ generationId?: string }>;
   stop(): Promise<void>;
 }
 
@@ -24,14 +27,14 @@ export interface ShutdownCheckpointLogger {
 
 export type ShutdownCheckpointOutcome =
   | { checkpoint: "committed"; generationId: string; elapsedMs: number }
-  | { checkpoint: "skipped"; state: string; generationId?: string; error?: string }
-  | { checkpoint: "failed"; error: unknown; elapsedMs: number };
+  | { checkpoint: "missing"; elapsedMs: number };
 
 interface ShutdownCheckpointOptions {
   logger: ShutdownCheckpointLogger;
   reason: string;
-  timeoutMs?: number;
   cleanup?: () => Promise<void>;
+  stopTimeoutMs?: number;
+  cleanupTimeoutMs?: number;
 }
 
 export function resolveShutdownCheckpointTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
@@ -48,84 +51,61 @@ export function resolveShutdownCheckpointTimeoutMs(env: NodeJS.ProcessEnv = proc
   return Math.floor(parsed);
 }
 
-/** How long a supervisor waits for its worker to exit after a graceful stop request. */
+/** Checkpoint limit + SHUTDOWN_STOP_GRACE_MS + SHUTDOWN_CLEANUP_GRACE_MS + 5_000. */
 export function resolveWorkerGracefulExitMs(env: NodeJS.ProcessEnv = process.env): number {
-  return resolveShutdownCheckpointTimeoutMs(env) + SHUTDOWN_STOP_GRACE_MS;
+  return (
+    resolveShutdownCheckpointTimeoutMs(env) +
+    SHUTDOWN_STOP_GRACE_MS +
+    SHUTDOWN_CLEANUP_GRACE_MS +
+    WORKER_EXIT_MARGIN_MS
+  );
 }
 
-/** A failed checkpoint keeps the daemon and its execution owners alive for diagnosis/retry. */
+/** Saves a best-effort checkpoint, then stops the daemon (at most `SHUTDOWN_STOP_GRACE_MS`), then
+ *  runs `cleanup` (at most `SHUTDOWN_CLEANUP_GRACE_MS`). A missing checkpoint and a failed or slow
+ *  stop or cleanup are logged. Never rejects and never returns early. */
 export async function stopWithShutdownCheckpoint(
   daemon: ShutdownCheckpointDaemon,
   options: ShutdownCheckpointOptions,
 ): Promise<ShutdownCheckpointOutcome> {
-  const outcome = await checkpointBeforeStop(daemon, options);
-  if (outcome.checkpoint !== "failed") {
-    await daemon.stop();
-    await options.cleanup?.();
-  }
-  return outcome;
-}
-
-async function checkpointBeforeStop(
-  daemon: ShutdownCheckpointDaemon,
-  options: { logger: ShutdownCheckpointLogger; reason: string; timeoutMs?: number },
-): Promise<ShutdownCheckpointOutcome> {
   const { logger, reason } = options;
-  const status = daemon.getRestartStatus();
-  // A committed generation stays authoritative once it is ready, including after a
-  // controlled restart has handed it to replacement: that hand-off is what asks the
-  // supervisor to stop this worker.
-  if (
-    status.state === "paused" &&
-    (status.stage === "ready" || status.stage === "replacing") &&
-    status.generationId &&
-    !status.error
-  ) {
-    logger.info(
-      { reason, ...status },
-      "Shutdown checkpoint skipped; retained recovery state stays authoritative",
-    );
-    return {
-      checkpoint: "skipped",
-      state: status.state,
-      ...(status.generationId ? { generationId: status.generationId } : {}),
-      ...(status.error ? { error: status.error } : {}),
-    };
-  }
-  if (status.state !== "running" && status.state !== "preparing") {
-    const error = new Error(
-      `Shutdown refused while recovery is ${status.state}; no prepared generation is ready`,
-    );
-    logger.warn(
-      { reason, ...status, err: error },
-      "Shutdown remains blocked; retained recovery state stays authoritative",
-    );
-    return { checkpoint: "failed", error, elapsedMs: 0 };
-  }
-  const timeoutMs = options.timeoutMs ?? resolveShutdownCheckpointTimeoutMs();
+  const report: RestartFailureReporter = (step, error) => {
+    logger.warn({ err: error, reason, step }, "Shutdown step failed; continuing the stop");
+  };
   const startedAt = Date.now();
-  logger.info(
-    { reason, timeoutMs, state: status.state },
-    "Committing shutdown checkpoint before stopping",
-  );
-  try {
-    const { generationId } = await withTimeout(
-      daemon.prepareRestart(),
-      timeoutMs,
-      `Shutdown checkpoint did not commit within ${timeoutMs}ms`,
-    );
-    const elapsedMs = Date.now() - startedAt;
+  logger.info({ reason }, "Saving shutdown checkpoint before stopping");
+  // The controller bounds the checkpoint and never rejects; the guard only covers a broken daemon.
+  const preparation = await attempt(report, "checkpoint", () => daemon.prepareRestart(), {});
+  const elapsedMs = Date.now() - startedAt;
+  let outcome: ShutdownCheckpointOutcome;
+  if (preparation.generationId) {
     logger.info(
-      { reason, generationId, elapsedMs },
+      { reason, generationId: preparation.generationId, elapsedMs },
       "Shutdown checkpoint committed; the next start restores it",
     );
-    return { checkpoint: "committed", generationId, elapsedMs };
-  } catch (error) {
-    const elapsedMs = Date.now() - startedAt;
+    outcome = { checkpoint: "committed", generationId: preparation.generationId, elapsedMs };
+  } else {
     logger.warn(
-      { err: error, reason, elapsedMs },
-      "Shutdown checkpoint failed; daemon remains alive and replacement is blocked",
+      { reason, elapsedMs },
+      "Shutdown checkpoint missing; stopping without it, agents will not resume automatically",
     );
-    return { checkpoint: "failed", error, elapsedMs };
+    outcome = { checkpoint: "missing", elapsedMs };
   }
+  await attemptWithin(
+    report,
+    "stop",
+    options.stopTimeoutMs ?? SHUTDOWN_STOP_GRACE_MS,
+    () => daemon.stop(),
+    undefined,
+  );
+  if (options.cleanup) {
+    await attemptWithin(
+      report,
+      "cleanup",
+      options.cleanupTimeoutMs ?? SHUTDOWN_CLEANUP_GRACE_MS,
+      options.cleanup,
+      undefined,
+    );
+  }
+  return outcome;
 }

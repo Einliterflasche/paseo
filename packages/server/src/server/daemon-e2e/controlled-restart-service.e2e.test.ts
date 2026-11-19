@@ -82,7 +82,7 @@ test("a running workspace service is relaunched by controlled restart recovery",
   await expect.poll(() => readFile(path.join(workspace, "service-pid.txt"), "utf8")).toMatch(/\d+/);
   const firstPid = await readFile(path.join(workspace, "service-pid.txt"), "utf8");
 
-  const checkpoint = await first.client.prepareRestart();
+  const checkpoint = await first.daemon.daemon.prepareRestart();
   const saved = JSON.parse(
     await readFile(
       path.join(paseoHome, "restart-checkpoints", checkpoint.generationId!, "snapshot.json"),

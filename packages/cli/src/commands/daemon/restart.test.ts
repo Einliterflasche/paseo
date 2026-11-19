@@ -6,33 +6,23 @@ import {
 } from "./restart.js";
 import type { CommandOptions } from "../../output/index.js";
 
-function peer(pid: number, generation = "previous", state = "running") {
-  const info = {
+function peer(pid: number, generation?: string, state: string | undefined = "running") {
+  const info: Record<string, unknown> = {
     serverId: "same-host",
     restartRecoveryGeneration: generation,
     restartRecoveryState: state,
-    features: {
-      restartRecovery: true,
-      restartRecoveryRetry: true,
-      restartCrashAcknowledgment: true,
-    },
+    features: { restartRecovery: true },
   };
   const release = vi.fn(async () => {});
   const client = {
     getLastServerInfoMessage: () => info,
     getDaemonStatus: async () => ({ pid }),
     observeEvents: vi.fn(() => ({ ready: Promise.resolve({}), release })),
-    restartServer: vi.fn(async () => ({ generationId: "prepared" })),
-    retryRecovery: vi.fn(async () => {
-      info.restartRecoveryGeneration = "recovered";
-      info.restartRecoveryState = "running";
-      return { generationId: "recovered" };
-    }),
-    acknowledgeCrash: vi.fn(async () => {
-      info.restartRecoveryGeneration = "reconciled";
-      info.restartRecoveryState = "running";
-      return { generationId: "reconciled" };
-    }),
+    restartServer: vi.fn(
+      async (): Promise<{ generationId?: string }> => ({
+        generationId: "prepared",
+      }),
+    ),
     close: vi.fn(async () => {}),
   };
   return { client: client as unknown as RestartDaemonClient, calls: client, info, release };
@@ -61,17 +51,20 @@ const options = {
 } as CommandOptions;
 
 describe("controlled restart CLI", () => {
-  it("confirms the exact checkpoint generation on the replacement worker", async () => {
-    const before = peer(10);
+  it("reports a restored checkpoint when the replacement runs the returned generation", async () => {
+    const before = peer(10, "previous");
     const after = peer(11, "prepared");
     const { deps } = dependencies(before.client, after.client);
     const result = await runRestartCommand({ ...options, reason: "deploy" }, {} as never, deps);
     expect(result.data).toMatchObject({
       action: "restarted",
       generationId: "prepared",
+      checkpointRestored: true,
+      acknowledged: true,
       previousWorkerPid: 10,
       workerPid: 11,
     });
+    expect(result.schema.renderHuman?.()).toContain("Checkpoint prepared restored.");
     expect(before.calls.restartServer).toHaveBeenCalledWith("deploy", undefined, { timeout: 100 });
     expect(before.calls.observeEvents).toHaveBeenCalledWith(["status.server_info"]);
     expect(before.release).toHaveBeenCalledOnce();
@@ -79,33 +72,91 @@ describe("controlled restart CLI", () => {
     expect(after.calls.close).toHaveBeenCalledOnce();
   });
 
-  it("a listening replacement with another generation cannot report success", async () => {
-    const before = peer(10);
-    const after = peer(11, "another");
+  it("confirms a running replacement that started without the returned generation", async () => {
+    const before = peer(10, "previous");
+    const after = peer(11, "previous");
     const { deps } = dependencies(before.client, after.client);
-    await expect(runRestartCommand(options, {} as never, deps)).rejects.toMatchObject({
-      code: "RESTART_NOT_CONFIRMED",
-    });
-    expect(before.calls.restartServer).toHaveBeenCalledOnce();
-  });
-
-  it("waits while the previous worker is still paused on the checkpoint during handover", async () => {
-    const before = peer(10);
-    const draining = peer(10, "prepared", "paused");
-    const after = peer(11, "prepared");
-    const { deps } = dependencies(before.client, draining.client, after.client);
-    const result = await runRestartCommand({ ...options, timeout: "1" }, {} as never, deps);
+    const result = await runRestartCommand(options, {} as never, deps);
     expect(result.data).toMatchObject({
       action: "restarted",
       generationId: "prepared",
+      checkpointRestored: false,
+      workerPid: 11,
+    });
+    expect(result.schema.renderHuman?.()).toContain("No checkpoint restored");
+  });
+
+  it("waits for the replacement when the request returns no generation", async () => {
+    const before = peer(10, "previous");
+    before.calls.restartServer.mockResolvedValueOnce({});
+    const after = peer(11, "previous");
+    const { deps, connect } = dependencies(before.client, after.client);
+    const result = await runRestartCommand(options, {} as never, deps);
+    expect(result.data).toMatchObject({
+      action: "restarted",
+      generationId: undefined,
+      checkpointRestored: false,
+      acknowledged: true,
+      workerPid: 11,
+    });
+    expect(connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("restarts a daemon that reports no recovery fields", async () => {
+    const before = peer(10, undefined, undefined);
+    before.info.features = {};
+    before.calls.restartServer.mockResolvedValueOnce({});
+    const after = peer(11, undefined, undefined);
+    after.info.features = {};
+    const { deps } = dependencies(before.client, after.client);
+    const result = await runRestartCommand(options, {} as never, deps);
+    expect(result.data).toMatchObject({
+      action: "restarted",
+      checkpointRestored: false,
+      previousWorkerPid: 10,
+      workerPid: 11,
+    });
+  });
+
+  it("confirms the replacement after the connection drops during the request", async () => {
+    const before = peer(10, "previous");
+    before.calls.restartServer.mockImplementationOnce(async () => {
+      before.info.restartRecoveryState = "paused";
+      before.info.restartRecoveryGeneration = "prepared";
+      throw { code: "DAEMON_CONNECTION_LOST" };
+    });
+    const after = peer(11, "prepared");
+    const { deps } = dependencies(before.client, after.client);
+    const result = await runRestartCommand(options, {} as never, deps);
+    expect(result.data).toMatchObject({
+      action: "restarted",
+      acknowledged: false,
+      generationId: "prepared",
+      checkpointRestored: true,
+      workerPid: 11,
+    });
+    expect(before.calls.close).toHaveBeenCalledOnce();
+  });
+
+  it("waits while the previous worker still holds the checkpoint during handover", async () => {
+    const before = peer(10, "previous");
+    const draining = peer(10, "prepared", "paused");
+    const restoring = peer(11, "prepared", "restoring");
+    const after = peer(11, "prepared");
+    const { deps } = dependencies(before.client, draining.client, restoring.client, after.client);
+    const result = await runRestartCommand({ ...options, timeout: "1" }, {} as never, deps);
+    expect(result.data).toMatchObject({
+      action: "restarted",
+      checkpointRestored: true,
       previousWorkerPid: 10,
       workerPid: 11,
     });
     expect(draining.calls.close).toHaveBeenCalledOnce();
+    expect(restoring.calls.close).toHaveBeenCalledOnce();
   });
 
   it("reports the stalled previous worker when no replacement takes over", async () => {
-    const before = peer(10);
+    const before = peer(10, "previous");
     const stalled = peer(10, "prepared", "paused");
     const { deps } = dependencies(before.client, stalled.client);
     await expect(runRestartCommand(options, {} as never, deps)).rejects.toMatchObject({
@@ -114,62 +165,5 @@ describe("controlled restart CLI", () => {
         "Last observation: Previous worker 10 reports paused on generation prepared",
       ),
     });
-  });
-
-  it("retains the failed checkpoint and surfaces paused restoration", async () => {
-    const before = peer(10);
-    const after = peer(11, "prepared", "paused");
-    const { deps } = dependencies(before.client, after.client);
-    await expect(runRestartCommand(options, {} as never, deps)).rejects.toMatchObject({
-      code: "RESTART_RECOVERY_FAILED",
-    });
-    expect(after.calls.close).toHaveBeenCalledOnce();
-  });
-
-  it("checkpoint preparation failure does not initiate another connection or replacement", async () => {
-    const before = peer(10);
-    before.calls.restartServer.mockRejectedValueOnce(new Error("checkpoint write failed"));
-    const { deps, connect } = dependencies(before.client);
-    await expect(runRestartCommand(options, {} as never, deps)).rejects.toThrow(
-      "checkpoint write failed",
-    );
-    expect(connect).toHaveBeenCalledOnce();
-    expect(before.release).toHaveBeenCalledOnce();
-    expect(before.calls.close).toHaveBeenCalledOnce();
-  });
-
-  it("retries retained recovery without replacing the current worker", async () => {
-    const current = peer(10, "failed", "paused");
-    const { deps, connect } = dependencies(current.client);
-    const result = await runRestartCommand({ ...options, retryRecovery: true }, {} as never, deps);
-    expect(result.data).toEqual({ action: "recovery_retried", generationId: "recovered" });
-    expect(current.calls.restartServer).not.toHaveBeenCalled();
-    expect(connect).toHaveBeenCalledOnce();
-  });
-
-  it("acknowledges the exact consumed generation only with reconciliation", async () => {
-    const current = peer(10, "consumed", "paused");
-    const { deps } = dependencies(current.client);
-    const result = await runRestartCommand(
-      { ...options, acknowledgeCrash: "consumed", orphanExecutionReconciled: true },
-      {} as never,
-      deps,
-    );
-    expect(current.calls.acknowledgeCrash).toHaveBeenCalledWith("consumed", true);
-    expect(result.data).toEqual({ action: "crash_acknowledged", generationId: "reconciled" });
-    expect(current.calls.restartServer).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    { acknowledgeCrash: "consumed" },
-    { orphanExecutionReconciled: true },
-    { acknowledgeCrash: "consumed", orphanExecutionReconciled: true, retryRecovery: true },
-    { force: true },
-  ])("rejects conflicting or incomplete recovery options before connecting: %j", async (extra) => {
-    const { deps, connect } = dependencies();
-    await expect(
-      runRestartCommand({ ...options, ...extra }, {} as never, deps),
-    ).rejects.toMatchObject({ code: "INVALID_OPTIONS" });
-    expect(connect).not.toHaveBeenCalled();
   });
 });

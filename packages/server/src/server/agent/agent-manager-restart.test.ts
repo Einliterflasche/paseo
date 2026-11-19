@@ -2,14 +2,17 @@ import { cancelAgentRunCommand } from "./lifecycle-command.js";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import pino from "pino";
 import { expect, test } from "vitest";
 import { ProviderInitializationCleanupError } from "./provider-initialization-cleanup-error.js";
-import { AgentManager } from "./agent-manager.js";
+import { AgentManager, RESTART_RESUME_TIMEOUT_MS } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
 import { buildTimelinePromptIndex } from "./timeline-prompt-index.js";
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { createCheckpointAgentClient } from "../test-utils/checkpoint-agent-client.js";
 import { RestartInProgressError } from "../restart/restart-errors.js";
+import { RESTART_RESTORE_TIMEOUT_MS } from "../shutdown-checkpoint.js";
+import type { AgentCheckpoint } from "../restart/agent-checkpoint.js";
 import type { AgentClient, AgentSession, AgentStreamEvent } from "./agent-sdk-types.js";
 import { AgentTurnStartUncertainError } from "./agent-turn-start-uncertain-error.js";
 import { CodexAppServerAgentSession } from "./providers/codex-app-server-agent.js";
@@ -21,11 +24,43 @@ import {
   snapshotFinishNotificationWatches,
 } from "./agent-prompt.js";
 
-async function manager(home: string, client: AgentClient = createCheckpointAgentClient()) {
-  const logger = createTestLogger();
+async function manager(
+  home: string,
+  client: AgentClient = createCheckpointAgentClient(),
+  options: { logger?: pino.Logger; restartResumeMs?: number } = {},
+) {
+  const logger = options.logger ?? createTestLogger();
   const registry = new AgentStorage(join(home, "agents"), logger);
   await registry.initialize();
-  return new AgentManager({ clients: { codex: client }, registry, logger });
+  return new AgentManager({
+    clients: { codex: client },
+    registry,
+    logger,
+    ...(options.restartResumeMs
+      ? { rescueTimeouts: { restartResumeMs: options.restartResumeMs } }
+      : {}),
+  });
+}
+
+interface LoggedLine {
+  level: number;
+  msg: string;
+  agentId?: string;
+  agentIds?: string[];
+  err?: { message: string };
+}
+
+function warningLogger() {
+  const lines: LoggedLine[] = [];
+  const logger = pino(
+    { level: "warn" },
+    {
+      write(line: string) {
+        lines.push(JSON.parse(line) as LoggedLine);
+      },
+    },
+  );
+  return { logger, warnings: () => lines.filter((line) => line.level >= 40) };
 }
 
 test.each(["no native events", "staged output", "late completion", "transport loss"] as const)(
@@ -273,7 +308,7 @@ test.each(["completed", "suspended"] as const)(
   },
 );
 
-test("failed durable completion keeps admissions closed after restoring history", async () => {
+test("a failed recovery completion step is logged and admissions open after restoring history", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-recovery-completion-"));
   const before = await manager(home);
   const agent = await before.createAgent({ provider: "codex", cwd: home }, undefined, {
@@ -281,20 +316,26 @@ test("failed durable completion keeps admissions closed after restoring history"
   });
   await before.runAgent(agent.id, "finish", { clientMessageId: "saved-input" });
   const saved = await before.quiesceForRestart();
-  const after = await manager(home);
+  const log = warningLogger();
+  const after = await manager(home, createCheckpointAgentClient(), { logger: log.logger });
   await after.installRestartCheckpoint(saved);
-  await expect(
-    after.resumeRestartCheckpoint(saved, undefined, async () => {
-      expect(() => after.assertAcceptingWork()).toThrow(RestartInProgressError);
-      throw new Error("completion fsync failed");
+  await after.resumeRestartCheckpoint(saved, undefined, async () => {
+    expect(() => after.assertAcceptingWork()).toThrow(RestartInProgressError);
+    throw new Error("completion fsync failed");
+  });
+  expect(log.warnings()).toContainEqual(
+    expect.objectContaining({
+      err: expect.objectContaining({ message: "completion fsync failed" }),
     }),
-  ).rejects.toThrow("completion fsync failed");
-  expect(after.recoveryPhase).toBe("paused");
-  await expect(after.createAgent({ provider: "codex", cwd: home })).rejects.toThrow(
-    RestartInProgressError,
   );
-  expect(() => after.streamAgent(agent.id, "must not dispatch")).toThrow(RestartInProgressError);
-  expect((await after.quiesceForRestart()).timelines).toEqual(saved.timelines);
+  expect(after.recoveryPhase).toBe("running");
+  expect(await after.getCanonicalTimelineRows(agent.id)).toEqual(saved.timelines[agent.id]!.rows);
+  const fresh = await after.createAgent({ provider: "codex", cwd: home }, undefined, {
+    workspaceId: "workspace",
+  });
+  await expect(
+    after.runAgent(fresh.id, "finish", { clientMessageId: "after-restart" }),
+  ).resolves.toMatchObject({ canceled: false });
 });
 
 test("restart preserves late output and user identity without native overwrite and records the attributed continuation", async () => {
@@ -394,7 +435,7 @@ test("a delayed terminal event for an older turn cannot erase newer recovery inp
   expect(snapshot.agents[0]!.inputs[0]!.prompt).toBe("still working");
 });
 
-test("a failed close remains blocked until a fresh provider stop certifies cessation", async () => {
+test("a failed close is logged, keeps the agent resumable, and a later stop retries it", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-close-failure-"));
   const client = createCheckpointAgentClient();
   const create = client.createSession.bind(client);
@@ -409,20 +450,17 @@ test("a failed close remains blocked until a fresh provider stop certifies cessa
     };
     return session;
   };
-  const before = await manager(home, client);
+  const log = warningLogger();
+  const before = await manager(home, client, { logger: log.logger });
   const agent = await before.createAgent({ provider: "codex", cwd: home }, undefined, {
     workspaceId: "workspace",
   });
   await before.streamAgent(agent.id, "retained", { clientMessageId: "keep" }).next();
-  await expect(before.quiesceForRestart()).rejects.toMatchObject({
-    message: "Cannot certify provider teardown and event drain",
-    errors: expect.arrayContaining([
-      expect.objectContaining({ message: "provider teardown failed" }),
-    ]),
-  });
-  await expect(before.quiesceForRestart()).rejects.toThrow(
-    "Cannot certify provider teardown and event drain",
-  );
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const unconfirmed = await before.quiesceForRestart();
+    expect(unconfirmed.agents[0]).toMatchObject({ continue: true, inputs: [{ id: "keep" }] });
+    expect(before.recoveryBlockedAgents()).toEqual([agent.id]);
+  }
   const successor = await before.quiesceForRestart();
   expect(successor.agents[0]?.continue).toBe(true);
   expect(before.recoveryBlockedAgents()).toEqual([]);
@@ -430,6 +468,11 @@ test("a failed close remains blocked until a fresh provider stop certifies cessa
   expect(before.getTimeline(agent.id).filter((item) => item.type === "user_message")).toMatchObject(
     [{ clientMessageId: "keep", text: "retained" }],
   );
+  expect(
+    log
+      .warnings()
+      .filter((line) => line.agentIds?.includes(agent.id) && line.msg.includes("teardown")),
+  ).toHaveLength(2);
 });
 
 test("an explicit stop never acquires restart continuation intent", async () => {
@@ -538,7 +581,7 @@ test.each([0, 1, 2, 3, 4])(
   },
 );
 
-test("an active restoration's failed completion closes capture before pause and preserves late output", async () => {
+test("an active restoration's failed completion is logged and the continued agent stays live", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-active-restore-failure-"));
   const before = await manager(home);
   const agent = await before.createAgent({ provider: "codex", cwd: home }, undefined, {
@@ -546,19 +589,26 @@ test("an active restoration's failed completion closes capture before pause and 
   });
   await before.streamAgent(agent.id, "original task", { clientMessageId: "original" }).next();
   const saved = await before.quiesceForRestart();
+  const log = warningLogger();
   const after = await manager(
     home,
     createCheckpointAgentClient(undefined, { keepResumedActive: true }),
+    { logger: log.logger },
   );
   await after.installRestartCheckpoint(saved);
-  await expect(
-    after.resumeRestartCheckpoint(saved, undefined, async () => {
-      throw new Error("restored marker fsync failed");
+  await after.resumeRestartCheckpoint(saved, undefined, async () => {
+    throw new Error("restored marker fsync failed");
+  });
+  expect(log.warnings()).toContainEqual(
+    expect.objectContaining({
+      err: expect.objectContaining({ message: "restored marker fsync failed" }),
     }),
-  ).rejects.toThrow("restored marker fsync failed");
-  expect(after.recoveryPhase).toBe("paused");
-  expect(after.getRunOutcome(agent.id)).toMatchObject({ type: "suspended", agentId: agent.id });
+  );
+  expect(after.recoveryPhase).toBe("running");
+  expect(after.isRestartSuspended(agent.id)).toBe(false);
+  expect(after.getAgent(agent.id)?.lifecycle).toBe("running");
   const current = await after.quiesceForRestart();
+  expect(after.getRunOutcome(agent.id)).toMatchObject({ type: "suspended", agentId: agent.id });
   expect(current.agents[0]!.continue).toBe(true);
   expect(current.agents[0]!.inputs.map((input) => input.id)).toEqual(["original"]);
   expect(
@@ -581,7 +631,7 @@ test("an active restoration's failed completion closes capture before pause and 
   ]);
 });
 
-test("a later continuation failure preserves every agent and does not retain ambient admission authority", async () => {
+test("a later continuation failure abandons only that agent and does not retain ambient admission authority", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-partial-continuation-"));
   const before = await manager(home);
   const ids: string[] = [];
@@ -617,9 +667,23 @@ test("a later continuation failure preserves every agent and does not retain amb
       rejectedCallback = error instanceof RestartInProgressError;
     }
   });
-  await expect(after.resumeRestartCheckpoint(saved)).rejects.toThrow("later start failed");
-  const current = await after.quiesceForRestart();
+  await after.resumeRestartCheckpoint(saved);
   expect(rejectedCallback).toBe(true);
+  expect(after.recoveryPhase).toBe("running");
+  expect(after.getAgent(ids[0]!)?.lifecycle).toBe("running");
+  expect(after.isRestartSuspended(ids[0])).toBe(false);
+  expect(after.getRunOutcome(ids[1]!)).toMatchObject({
+    type: "failed",
+    runId: "second",
+    error: "later start failed",
+  });
+  expect(after.isRestartSuspended(ids[1])).toBe(false);
+  expect(after.getAgent(ids[1]!)?.lifecycle).toBe("idle");
+  expect(after.getTimeline(ids[1]!).at(-1)).toEqual({
+    type: "error",
+    message: "Paseo could not resume this task after the restart. Send a message to continue it.",
+  });
+  const current = await after.quiesceForRestart();
   expect(
     current.agents.map((entry) => [
       entry.record.id,
@@ -628,17 +692,13 @@ test("a later continuation failure preserves every agent and does not retain amb
     ]),
   ).toEqual([
     [ids[0], true, ["first"]],
-    [ids[1], true, ["second"]],
+    [ids[1], false, []],
   ]);
-  expect(after.getRunOutcome(ids[0]!)).toMatchObject({ type: "suspended", agentId: ids[0] });
-  expect(after.getRunOutcome(ids[1]!)).toMatchObject({ type: "suspended", agentId: ids[1] });
-  await after.resumeRestartCheckpoint(current);
-  const resumed = await after.quiesceForRestart();
+  expect(current.timelines[ids[0]!]!.rows.slice(0, saved.timelines[ids[0]!]!.rows.length)).toEqual(
+    saved.timelines[ids[0]!]!.rows,
+  );
   expect(
-    resumed.timelines[ids[0]!]!.rows.slice(0, current.timelines[ids[0]!]!.rows.length),
-  ).toEqual(current.timelines[ids[0]!]!.rows);
-  expect(
-    resumed.timelines[ids[1]!]!.rows.filter(
+    current.timelines[ids[1]!]!.rows.filter(
       (row) => row.item.type === "user_message" && row.item.sender?.kind !== "system",
     ),
   ).toHaveLength(1);
@@ -692,15 +752,20 @@ test.each(["before rejection", "during close"] as const)(
     };
     const after = await manager(home, client);
     await after.installRestartCheckpoint(saved);
-    await expect(after.resumeRestartCheckpoint(saved)).rejects.toThrow(
-      "handoff receipt rejected after execution",
+    await after.resumeRestartCheckpoint(saved);
+    // A completion that arrived before the rejection settled the run; otherwise it is abandoned
+    // until the real completion that the provider delivers when it closes.
+    expect(after.getRunOutcome(agent.id)).toMatchObject(
+      terminalTiming === "before rejection"
+        ? { type: "completed", runId: "original-logical-run" }
+        : { type: "failed", runId: "original-logical-run" },
     );
+    const current = await after.quiesceForRestart();
     expect(after.getRunOutcome(agent.id)).toMatchObject({
       type: "completed",
       runId: "original-logical-run",
       lastMessage: "partial-outputlate-close-outputcontinued-output",
     });
-    const current = await after.quiesceForRestart();
     expect(current.agents[0]!.continue).toBe(false);
     expect(current.agents[0]!.inputs).toEqual([]);
     expect(
@@ -864,7 +929,7 @@ test("failed ordinary close retains the native owner and late output until retry
   expect(instance.recoveryBlockedAgents()).toEqual([]);
 });
 
-test("partial provider initialization remains owned until its cleanup capability certifies cessation", async () => {
+test("partial provider initialization stays owned and a later quiesce retries its cleanup", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-initialization-owner-"));
   const client = createCheckpointAgentClient();
   let canStop = false;
@@ -889,8 +954,9 @@ test("partial provider initialization remains owned until its cleanup capability
   ).rejects.toBeInstanceOf(ProviderInitializationCleanupError);
   expect(instance.getAgent(agentId)).toBeNull();
   expect(instance.recoveryBlockedAgents()).toEqual([agentId]);
-  await expect(instance.quiesceForRestart()).rejects.toThrow("Cannot certify provider teardown");
+  expect((await instance.quiesceForRestart()).agents).toEqual([]);
   expect(cleanupAttempts).toBe(1);
+  expect(instance.recoveryBlockedAgents()).toEqual([agentId]);
   canStop = true;
   expect((await instance.quiesceForRestart()).agents).toEqual([]);
   expect(cleanupAttempts).toBe(2);
@@ -1122,7 +1188,7 @@ test.each(["commands", "features"] as const)(
   },
 );
 
-test("a failed direct catalog probe transfers cleanup ownership to recovery", async () => {
+test("a failed direct catalog probe transfers cleanup ownership to the next restart stop", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-probe-cleanup-"));
   const client = createCheckpointAgentClient();
   let canClose = false;
@@ -1145,7 +1211,8 @@ test("a failed direct catalog probe transfers cleanup ownership to recovery", as
     ProviderInitializationCleanupError,
   );
   expect(instance.recoveryBlockedAgents()).toEqual([expect.stringMatching(/^draft:codex:/)]);
-  await expect(instance.quiesceForRestart()).rejects.toThrow("Cannot certify provider teardown");
+  await instance.quiesceForRestart();
+  expect(instance.recoveryBlockedAgents()).toEqual([expect.stringMatching(/^draft:codex:/)]);
   canClose = true;
   await instance.quiesceForRestart();
   expect(closes).toBe(3);
@@ -1244,11 +1311,12 @@ test("recovery drains a cancellation accepted during marker publication and reti
   };
   const after = await manager(home, client);
   let opened = false;
+  const failedSteps: string[] = [];
   const controller = new RestartController({
     store,
     freeze: () => after.freezeRestartAdmissions(),
     stop: () => after.quiesceRestartExecution(),
-    capture: () => after.quiesceForRestart(),
+    capture: () => after.captureRestartCheckpoint(),
     install: (snapshot) => after.installRestartCheckpoint(snapshot),
     resume: (snapshot) => after.resumeRestartCheckpoint(snapshot),
     finalize: () => after.finalizeRestartRestoration(),
@@ -1256,6 +1324,10 @@ test("recovery drains a cancellation accepted during marker publication and reti
       opened = true;
       after.openRestartAdmissions();
     },
+    failed: (step) => failedSteps.push(step),
+    prepareTimeoutMs: 10_000,
+    stopTimeoutMs: 5_000,
+    restoreTimeoutMs: 10_000,
   });
   after.bindRecoveryLifecycle(controller);
   const claim = (await controller.claim())!;
@@ -1274,6 +1346,7 @@ test("recovery drains a cancellation accepted during marker publication and reti
   await cancellation;
   await restoring;
   expect(opened).toBe(true);
+  expect(failedSteps).toEqual([]);
   expect(after.getAgent(agent.id)).toBeNull();
   expect(after.getRunOutcome(agent.id)).toMatchObject({
     type: "user_canceled",
@@ -1350,4 +1423,424 @@ test("checkpoint and ordinary reload resume with native replay fenced until an e
     ...submitted,
   ]);
   await after.closeAgentsForShutdown();
+});
+
+async function checkpointWithRunningAgents(home: string, prompts: string[]) {
+  const before = await manager(home);
+  const ids: string[] = [];
+  for (const prompt of prompts) {
+    const agent = await before.createAgent({ provider: "codex", cwd: home }, undefined, {
+      workspaceId: "workspace",
+    });
+    ids.push(agent.id);
+    await before.streamAgent(agent.id, prompt, { clientMessageId: prompt }).next();
+  }
+  return { ids, saved: await before.quiesceForRestart() };
+}
+
+const ABANDONED_ROW = {
+  type: "error",
+  message: "Paseo could not resume this task after the restart. Send a message to continue it.",
+};
+
+test("unfinished work without a native session handle is saved without continuation", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-restart-no-handle-"));
+  const log = warningLogger();
+  const instance = await manager(
+    home,
+    createCheckpointAgentClient(undefined, { withoutSessionHandle: true }),
+    { logger: log.logger },
+  );
+  const agent = await instance.createAgent({ provider: "codex", cwd: home }, undefined, {
+    workspaceId: "workspace",
+  });
+  await instance.streamAgent(agent.id, "no handle yet", { clientMessageId: "unsaved" }).next();
+  const saved = await instance.quiesceForRestart();
+  expect(saved.agents).toMatchObject([{ record: { id: agent.id }, continue: false, inputs: [] }]);
+  expect(saved.timelines[agent.id]!.rows.map((row) => row.item)).toContainEqual(
+    expect.objectContaining({ type: "user_message", clientMessageId: "unsaved" }),
+  );
+  expect(log.warnings()).toContainEqual(
+    expect.objectContaining({
+      agentIds: [agent.id],
+      msg: "Agents without a native session handle will not resume after the restart",
+    }),
+  );
+});
+
+test("a session resume that fails abandons the agent with a failed outcome and an error row", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-restart-abandon-"));
+  const { ids, saved } = await checkpointWithRunningAgents(home, ["abandoned"]);
+  const agentId = ids[0]!;
+  const after = await manager(home, createCheckpointAgentClient(undefined, { failResume: true }));
+  await after.installRestartCheckpoint(saved);
+  const outcome = after.waitForRunOutcome(agentId, "abandoned");
+  const states: string[] = [];
+  after.subscribe((event) => {
+    if (event.type === "agent_state" && event.agent.id === agentId)
+      states.push(event.agent.lifecycle);
+  });
+  expect(after.getAgentLifecycle(agentId)?.lifecycle).toBe("running");
+  await after.resumeRestartCheckpoint(saved);
+  expect(await outcome).toMatchObject({
+    type: "failed",
+    runId: "abandoned",
+    error: "Native session cannot be resumed",
+  });
+  expect(after.isRestartSuspended(agentId)).toBe(false);
+  expect(after.getAgentLifecycle(agentId)?.lifecycle).toBe("idle");
+  expect(states).toEqual(["closed"]);
+  expect(after.getTimeline(agentId).at(-1)).toEqual(ABANDONED_ROW);
+  expect(after.recoveryPhase).toBe("running");
+  const successor = await after.quiesceForRestart();
+  expect(successor.agents[0]).toMatchObject({ continue: false, inputs: [] });
+  expect(successor.timelines[agentId]!.rows.at(-1)?.item).toEqual(ABANDONED_ROW);
+});
+
+test("a session resume that never settles is abandoned after the resume limit and the next agent resumes", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-restart-resume-limit-"));
+  const { ids, saved } = await checkpointWithRunningAgents(home, ["stuck", "next"]);
+  const stuckSessionId = saved.agents.find((entry) => entry.record.id === ids[0])!.record
+    .persistence!.sessionId;
+  const client = createCheckpointAgentClient();
+  const resume = client.resumeSession.bind(client);
+  const neverSettles = recoveryGate();
+  client.resumeSession = async (handle, ...args) => {
+    if (handle.sessionId === stuckSessionId) await neverSettles.promise;
+    return resume(handle, ...args);
+  };
+  const after = await manager(home, client, { restartResumeMs: 50 });
+  await after.installRestartCheckpoint(saved);
+  await after.resumeRestartCheckpoint(saved);
+  expect(after.getRunOutcome(ids[0]!)).toMatchObject({
+    type: "failed",
+    runId: "stuck",
+    error: "Restart step 'resume agent " + ids[0] + "' did not finish within 50 ms",
+  });
+  expect(after.isRestartSuspended(ids[0])).toBe(false);
+  expect(after.getTimeline(ids[0]!).at(-1)).toEqual(ABANDONED_ROW);
+  expect(after.isRestartSuspended(ids[1])).toBe(false);
+  expect(after.getTimeline(ids[1]!)).toContainEqual({
+    type: "assistant_message",
+    text: "continued-output",
+  });
+  expect(after.recoveryPhase).toBe("running");
+});
+
+test("checkpoint capture does not wait for a provider stop that never settles", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-restart-hung-stop-"));
+  const client = createCheckpointAgentClient();
+  const create = client.createSession.bind(client);
+  const closeEntered = recoveryGate();
+  client.createSession = async (...args) => {
+    const session = await create(...args);
+    session.close = () => {
+      closeEntered.resolve();
+      return new Promise<void>(() => undefined);
+    };
+    return session;
+  };
+  const instance = await manager(home, client);
+  const agent = await instance.createAgent({ provider: "codex", cwd: home }, undefined, {
+    workspaceId: "workspace",
+  });
+  await instance.streamAgent(agent.id, "still working", { clientMessageId: "hung" }).next();
+  void instance.quiesceRestartExecution();
+  await closeEntered.promise;
+  const saved = await instance.captureRestartCheckpoint();
+  expect(saved.agents).toMatchObject([
+    { record: { id: agent.id }, continue: true, inputs: [{ id: "hung" }] },
+  ]);
+});
+
+test("a restart quiesce stops a running resume from starting more agents and keeps them suspended", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-restart-resume-interrupted-"));
+  const { ids, saved } = await checkpointWithRunningAgents(home, ["first", "second"]);
+  const client = createCheckpointAgentClient(undefined, { keepResumedActive: true });
+  const resume = client.resumeSession.bind(client);
+  const entered = recoveryGate();
+  const release = recoveryGate();
+  let resumes = 0;
+  let starts = 0;
+  client.resumeSession = async (...args) => {
+    resumes++;
+    entered.resolve();
+    await release.promise;
+    const session = await resume(...args);
+    const start = session.startTurn.bind(session);
+    session.startTurn = async (...input) => {
+      starts++;
+      return start(...input);
+    };
+    return session;
+  };
+  const after = await manager(home, client);
+  await after.installRestartCheckpoint(saved);
+  const restoring = after.resumeRestartCheckpoint(saved);
+  await entered.promise;
+  const quiescing = after.quiesceRestartExecution();
+  release.resolve();
+  await restoring;
+  await quiescing;
+  expect(resumes).toBe(1);
+  expect(starts).toBe(0);
+  expect(after.isRestartSuspended(ids[0])).toBe(true);
+  expect(after.isRestartSuspended(ids[1])).toBe(true);
+  expect(after.recoveryPhase).toBe("paused");
+  expect(after.getRunOutcome(ids[1]!)).toBeUndefined();
+  const successor = await after.captureRestartCheckpoint();
+  expect(
+    successor.agents.map((entry) => [
+      entry.record.id,
+      entry.continue,
+      entry.inputs.map((i) => i.id),
+    ]),
+  ).toEqual([
+    [ids[0], true, ["first"]],
+    [ids[1], true, ["second"]],
+  ]);
+});
+
+test("a continuation that starts during the checkpoint inventory is saved to continue", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-restart-late-continuation-"));
+  const logger = createTestLogger();
+  const registry = new AgentStorage(join(home, "agents"), logger);
+  await registry.initialize();
+  const instance = new AgentManager({
+    clients: { codex: createCheckpointAgentClient() },
+    registry,
+    logger,
+  });
+  const agent = await instance.createAgent({ provider: "codex", cwd: home }, undefined, {
+    workspaceId: "workspace",
+  });
+  const get = registry.get.bind(registry);
+  const entered = recoveryGate();
+  const release = recoveryGate();
+  let holdNextRead = true;
+  registry.get = async (id) => {
+    if (holdNextRead) {
+      holdNextRead = false;
+      entered.resolve();
+      await release.promise;
+    }
+    return get(id);
+  };
+  const capturing = instance.captureRestartCheckpoint();
+  await entered.promise;
+  await instance.streamAgent(agent.id, "late work", { clientMessageId: "late" }).next();
+  release.resolve();
+  const saved = await capturing;
+  expect(saved.agents).toMatchObject([
+    { record: { id: agent.id }, continue: true, inputs: [{ id: "late" }] },
+  ]);
+});
+
+test.each(["active", "settled"] as const)(
+  "an agent with an %s newer run before the resume loop reaches it keeps that work",
+  async (newerRun) => {
+    const home = await mkdtemp(join(tmpdir(), "paseo-restart-newer-work-"));
+    const { ids, saved } = await checkpointWithRunningAgents(home, ["first", "second"]);
+    const [firstId, secondId] = [ids[0]!, ids[1]!];
+    const sessionIdOf = (agentId: string) =>
+      saved.agents.find((entry) => entry.record.id === agentId)!.record.persistence!.sessionId;
+    const client = createCheckpointAgentClient(undefined, {
+      keepResumedActive: newerRun === "active",
+    });
+    const resume = client.resumeSession.bind(client);
+    const entered = recoveryGate();
+    const release = recoveryGate();
+    client.resumeSession = async (handle, ...args) => {
+      if (handle.sessionId === sessionIdOf(firstId)) {
+        entered.resolve();
+        await release.promise;
+      }
+      return resume(handle, ...args);
+    };
+    const after = await manager(home, client);
+    await after.installRestartCheckpoint(saved);
+    const outcomes: string[] = [];
+    after.subscribeRunOutcome(secondId, (outcome) => outcomes.push(outcome.type));
+    const restoring = after.resumeRestartCheckpoint(saved);
+    await entered.promise;
+    // The boot's restore limit opened admissions while the loop still waits on the first agent.
+    after.openRestartAdmissions();
+    await after.resumeAgentFromPersistence(
+      { provider: "codex", sessionId: sessionIdOf(secondId) },
+      { cwd: home },
+      secondId,
+      { workspaceId: "workspace" },
+    );
+    await after.streamAgent(secondId, "newer work", { clientMessageId: "newer" }).next();
+    release.resolve();
+    await restoring;
+    expect(outcomes).not.toContain("failed");
+    expect(after.getRunOutcome(secondId)?.type).not.toBe("failed");
+    expect(after.isRestartSuspended(secondId)).toBe(false);
+    expect(after.getTimeline(secondId)).not.toContainEqual(ABANDONED_ROW);
+    expect(after.getTimeline(secondId)).toContainEqual(
+      expect.objectContaining({ type: "user_message", clientMessageId: "newer" }),
+    );
+    // Only the newer run reached the provider; no continuation followed it.
+    expect(
+      after
+        .getTimeline(secondId)
+        .filter((item) => item.type === "assistant_message" && item.text === "continued-output"),
+    ).toHaveLength(1);
+    expect(after.isRestartSuspended(firstId)).toBe(false);
+    expect(after.getTimeline(firstId)).toContainEqual({
+      type: "assistant_message",
+      text: "continued-output",
+    });
+  },
+);
+
+test("the default resume limit for one agent stays below the boot's restore limit", () => {
+  expect(RESTART_RESUME_TIMEOUT_MS).toBe(60_000);
+  expect(RESTART_RESUME_TIMEOUT_MS).toBeLessThan(RESTART_RESTORE_TIMEOUT_MS);
+});
+
+const UNSAVED_ROW = {
+  type: "error",
+  message:
+    "The restart interrupted this task before Paseo could save it. Send a message to continue it.",
+};
+
+test("unfinished work without a native session handle gets one error row across captures", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-restart-no-handle-row-"));
+  const instance = await manager(
+    home,
+    createCheckpointAgentClient(undefined, { withoutSessionHandle: true }),
+  );
+  const agent = await instance.createAgent({ provider: "codex", cwd: home }, undefined, {
+    workspaceId: "workspace",
+  });
+  await instance.streamAgent(agent.id, "no handle yet", { clientMessageId: "unsaved" }).next();
+  const unsavedRows = (snapshot: AgentCheckpoint) =>
+    snapshot.timelines[agent.id]!.rows.filter(
+      (row) => JSON.stringify(row.item) === JSON.stringify(UNSAVED_ROW),
+    );
+  const first = await instance.quiesceForRestart();
+  expect(unsavedRows(first)).toHaveLength(1);
+  const second = await instance.captureRestartCheckpoint();
+  expect(unsavedRows(second)).toHaveLength(1);
+});
+
+test.each([
+  "session resume rejects",
+  "session resume succeeds late",
+  "continuation start rejects",
+  "continuation start succeeds late",
+] as const)(
+  "a quiesce that begins while the %s keeps the agent suspended for the next checkpoint",
+  async (mode) => {
+    const home = await mkdtemp(join(tmpdir(), "paseo-restart-quiesce-mid-agent-"));
+    const { ids, saved } = await checkpointWithRunningAgents(home, ["held"]);
+    const agentId = ids[0]!;
+    const client = createCheckpointAgentClient(undefined, { keepResumedActive: true });
+    const resume = client.resumeSession.bind(client);
+    const entered = recoveryGate();
+    const release = recoveryGate();
+    client.resumeSession = async (...args) => {
+      if (mode.startsWith("session resume")) {
+        entered.resolve();
+        await release.promise;
+        if (mode === "session resume rejects") throw new Error("Resume rejected");
+      }
+      const session = await resume(...args);
+      const start = session.startTurn.bind(session);
+      session.startTurn = async (...input) => {
+        if (mode.startsWith("continuation start")) {
+          entered.resolve();
+          await release.promise;
+          if (mode === "continuation start rejects") throw new Error("Start rejected");
+        }
+        return start(...input);
+      };
+      return session;
+    };
+    const after = await manager(home, client);
+    await after.installRestartCheckpoint(saved);
+    const outcomes: string[] = [];
+    after.subscribeRunOutcome(agentId, (outcome) => outcomes.push(outcome.type));
+    const restoring = after.resumeRestartCheckpoint(saved);
+    await entered.promise;
+    const quiescing = after.quiesceRestartExecution();
+    release.resolve();
+    await restoring;
+    await quiescing;
+    expect(outcomes).not.toContain("failed");
+    expect(after.getTimeline(agentId)).not.toContainEqual(ABANDONED_ROW);
+    expect(after.isRestartSuspended(agentId)).toBe(true);
+    const successor = await after.captureRestartCheckpoint();
+    expect(successor.agents).toMatchObject([
+      { record: { id: agentId }, continue: true, inputs: [{ id: "held" }] },
+    ]);
+  },
+);
+
+test("an agent whose session a client loaded before the resume loop reached it continues on that session", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-restart-live-idle-"));
+  const { ids, saved } = await checkpointWithRunningAgents(home, ["first", "second"]);
+  const [firstId, secondId] = [ids[0]!, ids[1]!];
+  const sessionIdOf = (agentId: string) =>
+    saved.agents.find((entry) => entry.record.id === agentId)!.record.persistence!.sessionId;
+  const client = createCheckpointAgentClient();
+  const resume = client.resumeSession.bind(client);
+  const entered = recoveryGate();
+  const release = recoveryGate();
+  let secondResumes = 0;
+  const secondPrompts: string[] = [];
+  client.resumeSession = async (handle, ...args) => {
+    if (handle.sessionId === sessionIdOf(firstId)) {
+      entered.resolve();
+      await release.promise;
+    }
+    const session = await resume(handle, ...args);
+    if (handle.sessionId === sessionIdOf(secondId)) {
+      secondResumes++;
+      const start = session.startTurn.bind(session);
+      session.startTurn = (prompt, options) => {
+        secondPrompts.push(typeof prompt === "string" ? prompt : JSON.stringify(prompt));
+        return start(prompt, options);
+      };
+    }
+    return session;
+  };
+  const lines: { msg: string; resumed?: string[]; superseded?: string[] }[] = [];
+  const logger = pino(
+    { level: "info" },
+    {
+      write(line: string) {
+        lines.push(JSON.parse(line) as (typeof lines)[number]);
+      },
+    },
+  );
+  const after = await manager(home, client, { logger });
+  await after.installRestartCheckpoint(saved);
+  const restoring = after.resumeRestartCheckpoint(saved);
+  await entered.promise;
+  // The boot's restore limit opened admissions, and the owner opened the second agent.
+  after.openRestartAdmissions();
+  await after.resumeAgentFromPersistence(
+    { provider: "codex", sessionId: sessionIdOf(secondId) },
+    { cwd: home },
+    secondId,
+    { workspaceId: "workspace" },
+  );
+  expect(after.getAgentLifecycle(secondId)?.lifecycle).toBe("idle");
+  release.resolve();
+  await restoring;
+  expect(secondResumes).toBe(1);
+  expect(secondPrompts).toHaveLength(1);
+  expect(secondPrompts[0]).toContain("second");
+  expect(after.isRestartSuspended(secondId)).toBe(false);
+  expect(after.getTimeline(secondId)).toContainEqual({
+    type: "assistant_message",
+    text: "continued-output",
+  });
+  expect(lines.find((line) => line.msg === "Restart recovery resumed agents")).toMatchObject({
+    resumed: [firstId, secondId],
+    superseded: [],
+  });
 });

@@ -1,80 +1,31 @@
-import { fork, type ChildProcess } from "node:child_process";
-import { once } from "node:events";
-import { mkdtemp, readFile, readdir, mkdir, rename } from "node:fs/promises";
+import { type ChildProcess } from "node:child_process";
+import { mkdtemp, readdir, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { expect, onTestFinished, test } from "vitest";
-import { DaemonClient } from "../test-utils/daemon-client.js";
+import { expect, test } from "vitest";
+import {
+  dispatches,
+  harnessLog,
+  launchCheckpointDaemon,
+  readyGeneration,
+  restartCheckpointDaemon,
+  type CheckpointDaemon,
+} from "./test-utils/checkpoint-daemon.js";
 
-async function launch(
-  home: string,
-  port?: number,
-): Promise<{ child: ChildProcess; client: DaemonClient; port: number }> {
-  const child = fork(
-    fileURLToPath(new URL("../test-utils/checkpoint-daemon-process.ts", import.meta.url)),
-    [home, String(port ?? 0)],
-    {
-      execArgv: ["--import", "tsx"],
-      stdio: ["ignore", "pipe", "pipe", "ipc"],
-      env: { ...process.env, PASEO_SUPERVISED: "0" },
-    },
-  );
-  let errors = "";
-  child.stderr?.on("data", (data) => {
-    errors += String(data);
-  });
-  child.stdout?.resume();
-  onTestFinished(async () => {
-    if (child.exitCode === null && child.signalCode === null) {
-      const exited = once(child, "exit");
-      child.kill("SIGKILL");
-      await exited;
-    }
-  });
-  const ready = await new Promise<{ port: number }>((resolve, reject) => {
-    child.once("message", (message) => resolve(message as { port: number }));
-    child.once("exit", (code) => reject(new Error(`Daemon exited ${code}: ${errors}`)));
-    child.once("error", reject);
-  });
-  const client = new DaemonClient({
-    url: `ws://127.0.0.1:${ready.port}/ws`,
-    reconnect: { enabled: false },
-  });
-  onTestFinished(() => client.close());
-  await client.connect();
-  await client.observeEvents(["status.server_info"]).ready;
-  return { child, client, port: ready.port };
+async function terminate(daemon: { child: ChildProcess; exited: Promise<number | null> }) {
+  daemon.child.kill("SIGTERM");
+  return daemon.exited;
 }
 
-async function dispatches(home: string): Promise<Array<{ resumed: boolean }>> {
-  return (await readFile(join(home, "provider-dispatches.jsonl"), "utf8"))
-    .trim()
-    .split("\n")
-    .map((row) => JSON.parse(row));
-}
-
-async function readyGeneration(home: string): Promise<string | null> {
-  try {
-    const ready = JSON.parse(
-      await readFile(join(home, "restart-checkpoints", "ready.json"), "utf8"),
-    );
-    return typeof ready.generationId === "string" ? ready.generationId : null;
-  } catch {
-    return null;
-  }
-}
-
-async function terminate(child: ChildProcess): Promise<number | null> {
-  const exited = once(child, "exit");
-  child.kill("SIGTERM");
-  const [code] = await exited;
-  return code as number | null;
+async function crash(daemon: CheckpointDaemon): Promise<void> {
+  daemon.child.kill("SIGKILL");
+  await daemon.exited;
+  await daemon.client.close();
 }
 
 test("a SIGTERM stop of a running daemon commits a checkpoint that the next start restores", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-sigterm-checkpoint-"));
-  const first = await launch(home);
+  const first = await launchCheckpointDaemon(home);
   const agent = await first.client.createAgent({
     provider: "codex",
     cwd: home,
@@ -83,7 +34,7 @@ test("a SIGTERM stop of a running daemon commits a checkpoint that the next star
   await first.client.sendAgentMessage(agent.id, "survive the stop", { messageId: "sigterm-1" });
   expect(await readyGeneration(home)).toBeNull();
 
-  expect(await terminate(first.child)).toBe(0);
+  expect(await terminate(first)).toBe(0);
   await first.client.close();
   const generationId = await readyGeneration(home);
   expect(generationId).not.toBeNull();
@@ -91,7 +42,7 @@ test("a SIGTERM stop of a running daemon commits a checkpoint that the next star
   expect(committed).toEqual(expect.arrayContaining(["manifest.json", "snapshot.json"]));
   expect(committed).not.toContain("claimed.json");
 
-  const next = await launch(home, first.port);
+  const next = await launchCheckpointDaemon(home, { port: first.port });
   expect(next.client.getLastServerInfoMessage()).toMatchObject({
     restartRecoveryState: "running",
     restartRecoveryGeneration: generationId,
@@ -103,70 +54,63 @@ test("a SIGTERM stop of a running daemon commits a checkpoint that the next star
     limit: 0,
     projection: "canonical",
   });
-  expect(timeline.entries.filter((row) => row.item.type === "user_message")).toHaveLength(1);
+  expect(
+    timeline.entries.flatMap((row) =>
+      row.item.type === "user_message"
+        ? [{ sender: row.item.sender, messageId: row.item.clientMessageId }]
+        : [],
+    ),
+  ).toEqual([
+    { sender: { kind: "human" }, messageId: "sigterm-1" },
+    { sender: { kind: "system", source: "Restart recovery" }, messageId: expect.any(String) },
+  ]);
   expect(await readdir(join(home, "restart-checkpoints", generationId!))).toEqual(
     expect.arrayContaining(["claimed.json", "restored.json"]),
   );
 }, 30_000);
 
-test("a SIGTERM stop of a blocked daemon leaves the consumed generation untouched", async () => {
-  const home = await mkdtemp(join(tmpdir(), "paseo-sigterm-blocked-"));
-  const first = await launch(home);
+test("a daemon that booted after a crash runs, and SIGTERM saves a new checkpoint and exits", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-sigterm-after-crash-"));
+  const first = await launchCheckpointDaemon(home);
   const agent = await first.client.createAgent({ provider: "codex", cwd: home });
   await first.client.sendAgentMessage(agent.id, "finish", { messageId: "before-checkpoint" });
   await first.client.waitForFinish(agent.id, 5000);
-  const checkpoint = await first.client.prepareRestart();
-  const firstExit = once(first.child, "exit");
-  await first.client.restartServer();
-  await firstExit;
-  await first.client.close();
+  const checkpoint = await restartCheckpointDaemon(first);
 
-  const second = await launch(home, first.port);
+  const second = await launchCheckpointDaemon(home, { port: first.port });
   expect(second.client.getLastServerInfoMessage()?.restartRecoveryState).toBe("running");
   await second.client.sendAgentMessage(agent.id, "finish", { messageId: "newer-work" });
   await second.client.waitForFinish(agent.id, 5000);
-  const secondExit = once(second.child, "exit");
-  second.child.kill("SIGKILL");
-  await secondExit;
-  await second.client.close();
+  await crash(second);
 
-  const blocked = await launch(home, first.port);
-  expect(blocked.client.getLastServerInfoMessage()).toMatchObject({
-    restartRecoveryState: "paused",
-    restartRecoveryGeneration: checkpoint.generationId,
-  });
-  const generationsBefore = await readdir(join(home, "restart-checkpoints"));
-  const readyBefore = await readFile(join(home, "restart-checkpoints", "ready.json"), "utf8");
+  const afterCrash = await launchCheckpointDaemon(home, { port: first.port });
+  const info = afterCrash.client.getLastServerInfoMessage();
+  expect(info?.restartRecoveryState).toBe("running");
+  expect(info?.restartRecoveryGeneration).toBeUndefined();
+  await expect(
+    afterCrash.client.createAgent({ provider: "codex", cwd: home }),
+  ).resolves.toHaveProperty("id");
 
-  blocked.child.kill("SIGTERM");
-  await new Promise((resolve) => setTimeout(resolve, 200));
-  expect(blocked.child.exitCode).toBeNull();
-  expect(blocked.client.getLastServerInfoMessage()).toMatchObject({
-    restartRecoveryState: "paused",
-    restartRecoveryGeneration: checkpoint.generationId,
-  });
-  await blocked.client.listTerminals();
-  expect(await readFile(join(home, "restart-checkpoints", "ready.json"), "utf8")).toBe(readyBefore);
-  expect(await readdir(join(home, "restart-checkpoints"))).toEqual(generationsBefore);
+  expect(await terminate(afterCrash)).toBe(0);
+  const generationId = await readyGeneration(home);
+  expect(generationId).not.toBeNull();
+  expect(generationId).not.toBe(checkpoint.generationId);
+  expect(await readdir(join(home, "restart-checkpoints", generationId!))).not.toContain(
+    "claimed.json",
+  );
 }, 30_000);
 
-test("a checkpoint commit failure retains the daemon and permits a prepared retry", async () => {
-  const home = await mkdtemp(join(tmpdir(), "paseo-sigterm-refusal-"));
-  const first = await launch(home);
+test("a checkpoint commit failure still lets SIGTERM stop the daemon in bounded time", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-sigterm-commit-failure-"));
+  const first = await launchCheckpointDaemon(home);
   await mkdir(join(home, "restart-checkpoints", "ready.json"), { recursive: true });
-  first.child.kill("SIGTERM");
-  await expect
-    .poll(() => first.client.getLastServerInfoMessage()?.restartRecoveryError)
-    .toBeTruthy();
-  expect(first.child.exitCode).toBeNull();
-  await first.client.listTerminals();
+  const startedAt = Date.now();
+  expect(await terminate(first)).toBe(0);
+  expect(Date.now() - startedAt).toBeLessThan(15_000);
   expect(await readyGeneration(home)).toBeNull();
-  await rename(
-    join(home, "restart-checkpoints", "ready.json"),
-    join(home, "restart-checkpoints", "retained-blocking-directory"),
-  );
-  const prepared = await first.client.prepareRestart();
-  expect(prepared.generationId).toBeTruthy();
-  expect(await terminate(first.child)).toBe(0);
-  expect(await readyGeneration(home)).toBe(prepared.generationId);
+  expect(
+    (await harnessLog(home)).find(
+      (line) => line.msg === "Restart step failed; continuing without it",
+    ),
+  ).toMatchObject({ step: "checkpoint" });
 }, 30_000);

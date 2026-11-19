@@ -36,17 +36,22 @@ the checkpoint completes is outside the no-loss guarantee. Continuous crash-safe
 transcript persistence is not required for this implementation. Keep the work
 inside the existing daemon/lifecycle; do not introduce another background process.
 
-On 2026-11-03 Raphael requested an explicit `Restart anyway` action in the recovery error banner.
-This emergency action accepts the forced termination limitation above.
-It must work independently of the failed orderly operation and keep retained recovery files.
-Its boundaries and architecture belong in [restart recovery](restart-recovery-plan.md#explicit-emergency-replacement).
+On 2026-11-19 Raphael made saving and resuming best effort and removed every blocking gate.
+A restart, a stop, and a deployment always complete. A boot always ends in a running daemon.
+A failed checkpoint or resume is logged and skipped, and it never needs a manual recovery step.
+This withdraws the earlier rules that a completed checkpoint is required before replacement.
+It also withdraws the rule that a failed checkpoint aborts replacement.
+The `Restart anyway` action requested on 2026-11-03 is superseded, because nothing pauses recovery now.
+[Restart recovery](restart-recovery-plan.md) describes the policy and the remaining limits.
 
 Begin a controlled restart immediately by default, including while agents are working. A brief
 client disconnect and reconnect is acceptable. Interrupted work must resume
 automatically in the same conversation without Raphael sending a continuation
 prompt. Waiting until agents finish is an optional, explicitly selected future
-mode; it must not be a prerequisite for safe updates. Completing the restart
-checkpoint is required before replacing the process.
+mode; it must not be a prerequisite for safe updates.
+
+The rules below are goals of the best-effort path. If an agent cannot resume, its timeline
+shows an error row, and a new message continues it.
 
 Preserve user messages, queued messages, and agent output across the restart.
 Preserve the history already produced. The resumed model may continue differently,
@@ -63,8 +68,7 @@ Explicit stop or replacement changes execution, not the retained conversation.
 Before deploying controlled restart recovery, exercise active turns, pending messages,
 output delivery, and client reconnection across a real controlled daemon update.
 The implementation and local validation evidence are recorded in
-[restart-recovery-plan.md](restart-recovery-plan.md). Abort replacement
-if the checkpoint cannot be completed. Reconcile native session state before continuing;
+[restart-recovery-plan.md](restart-recovery-plan.md). Reconcile native session state before continuing;
 an uncertain native tool execution may repeat, but this does not permit duplicate
 logical user messages or discarding previously recorded history.
 

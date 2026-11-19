@@ -30,7 +30,6 @@ type WorkerLifecycleMessage =
       listen: string;
       serverId: string;
     }
-  | { type: "paseo:restart-anyway"; restartId: string }
   | {
       type: "paseo:restart";
       reason?: string;
@@ -95,12 +94,6 @@ function parseLifecycleMessage(msg: unknown): WorkerLifecycleMessage | null {
       return null;
     }
     return { type: "paseo:ready", listen, serverId };
-  }
-  if (type === "paseo:restart-anyway") {
-    const restartId = (msg as { restartId?: unknown }).restartId;
-    return typeof restartId === "string" && /^[a-f0-9-]{36}$/.test(restartId)
-      ? { type: "paseo:restart-anyway", restartId }
-      : null;
   }
   if (type === "paseo:restart") {
     const reason = (msg as { reason?: unknown }).reason;
@@ -188,8 +181,6 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
 
   let child: ChildProcess | null = null;
   let restarting = false;
-  let emergencyRestartId: string | undefined;
-  let emergencyStopping = false;
   let shuttingDown = false;
   let exiting = false;
   let lifecycleFailed = false;
@@ -198,9 +189,8 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     process.stderr.write(`[${options.name}] ${message}\n`);
   });
   let workerStop: Promise<void> | null = null;
-  let workerStopCertified = false;
+  let workerStopFinished = false;
   let workerClosed: Promise<void> = Promise.resolve();
-  let shutdownKeepAlive: NodeJS.Timeout | null = null;
   let workerExit: {
     child: ChildProcess;
     code: number | null;
@@ -248,70 +238,97 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
       });
   };
 
+  const describeError = (error: unknown): string =>
+    error instanceof Error ? error.message : String(error);
+
+  const isAlive = (currentChild: ChildProcess): boolean =>
+    currentChild.exitCode === null && currentChild.signalCode === null;
+
+  const waitForExit = async (currentChild: ChildProcess, timeoutMs: number): Promise<boolean> => {
+    if (!isAlive(currentChild)) return true;
+    const waiting = new AbortController();
+    try {
+      const exited = once(currentChild, "exit", { signal: waiting.signal }).then(() => true);
+      const expired = delay(timeoutMs, false, { signal: waiting.signal });
+      return await Promise.race([exited, expired]);
+    } finally {
+      waiting.abort();
+    }
+  };
+
+  // Every step is bounded and a failed step only logs: a stop must finish without an operator.
   const stopWorker = async (currentChild: ChildProcess, reason: string): Promise<void> => {
-    // Capture before IPC: a cooperative worker can exit immediately, leaving
-    // descendant stdio detached and no leader from which to discover ownership.
-    await prepareProcessTreeTermination(currentChild, { timeoutMs: WORKER_TERMINATION_GRACE_MS });
-    if (currentChild.exitCode === null && currentChild.signalCode === null) {
-      const waiting = new AbortController();
-      try {
-        const exited = once(currentChild, "exit", { signal: waiting.signal });
-        const expired = delay(gracefulExitTimeoutMs, "timeout", { signal: waiting.signal });
-        requestWorkerShutdown(currentChild, reason);
-        if ((await Promise.race([exited, expired])) === "timeout") {
-          writeLifecycleLog(
-            "Worker did not exit after graceful shutdown request; replacement remains blocked",
-            {
-              reason,
-              gracefulExitTimeoutMs,
-              supervisorPid: process.pid,
-              workerPid: currentChild.pid ?? null,
-            },
-          );
-          throw new Error(
-            "Worker graceful shutdown is unconfirmed; retained execution ownership forbids replacement",
-          );
-        }
-      } finally {
-        waiting.abort();
+    const workerPid = currentChild.pid ?? null;
+    try {
+      // Capture before IPC: a cooperative worker can exit immediately, leaving
+      // descendant stdio detached and no leader from which to discover ownership.
+      await prepareProcessTreeTermination(currentChild, { timeoutMs: WORKER_TERMINATION_GRACE_MS });
+    } catch (error) {
+      writeLifecycleLog("Worker process tree capture failed", {
+        reason,
+        workerPid,
+        error: describeError(error),
+      });
+    }
+    if (isAlive(currentChild)) {
+      const exited = waitForExit(currentChild, gracefulExitTimeoutMs);
+      requestWorkerShutdown(currentChild, reason);
+      if (!(await exited)) {
+        log(`Worker did not exit within ${gracefulExitTimeoutMs}ms; killing its process tree`);
+        writeLifecycleLog("Worker did not exit after graceful shutdown request", {
+          reason,
+          gracefulExitTimeoutMs,
+          workerPid,
+        });
       }
     }
-    const result = await terminateWithTreeKill(currentChild, {
-      gracefulSignal: "SIGKILL",
-      forceSignal: "SIGKILL",
-      gracefulTimeoutMs: WORKER_TERMINATION_GRACE_MS,
-      forceTimeoutMs: WORKER_TERMINATION_GRACE_MS,
-    });
-    if (result === "kill-timeout") throw new Error("Worker process tree cessation is unconfirmed");
-    await withTimeout(workerClosed, WORKER_TERMINATION_GRACE_MS, "Worker output drain");
+    try {
+      const result = await terminateWithTreeKill(currentChild, {
+        gracefulSignal: "SIGKILL",
+        forceSignal: "SIGKILL",
+        gracefulTimeoutMs: WORKER_TERMINATION_GRACE_MS,
+        forceTimeoutMs: WORKER_TERMINATION_GRACE_MS,
+      });
+      if (result === "kill-timeout") {
+        writeLifecycleLog("Worker descendants survived SIGKILL", { reason, workerPid });
+      }
+    } catch (error) {
+      writeLifecycleLog("Worker process tree kill failed", {
+        reason,
+        workerPid,
+        error: describeError(error),
+      });
+    }
+    if (isAlive(currentChild)) {
+      currentChild.kill("SIGKILL");
+      if (!(await waitForExit(currentChild, WORKER_TERMINATION_GRACE_MS))) {
+        writeLifecycleLog("Worker process survived SIGKILL", { reason, workerPid });
+      }
+    }
+    try {
+      await withTimeout(workerClosed, WORKER_TERMINATION_GRACE_MS, "Worker output drain");
+    } catch (error) {
+      writeLifecycleLog("Worker output did not drain", { reason, error: describeError(error) });
+    }
+    // Surviving descendants can hold inherited pipes open; their output must not hold the stop.
+    currentChild.stdout?.destroy();
+    currentChild.stderr?.destroy();
   };
 
   const beginWorkerStop = (reason: string): void => {
     if (!child || workerStop) return;
     const currentChild = child;
-    // Keep a failed controlled stop present for inspection/retry, rather than
-    // exiting implicitly and letting an external supervisor launch a successor.
-    shutdownKeepAlive ??= setInterval(() => {}, WORKER_HEARTBEAT_INTERVAL_MS);
-    const attempt = stopWorker(currentChild, reason);
-    workerStop = attempt;
-    void attempt.then(
-      () => {
-        if (workerStop !== attempt) return;
-        workerStopCertified = true;
-        if (shutdownKeepAlive) clearInterval(shutdownKeepAlive);
-        shutdownKeepAlive = null;
-        if (workerExit?.child === currentChild)
-          finishWorkerExit(workerExit.code, workerExit.signal);
-        return undefined;
-      },
-      (error: unknown) => {
-        if (workerStop !== attempt) return;
-        workerStop = null;
-        log(
-          `Worker shutdown remains blocked: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      },
-    );
+    workerStop = (async () => {
+      await stopWorker(currentChild, reason);
+      workerStopFinished = true;
+      if (isAlive(currentChild)) {
+        // The service manager clears the process group and starts the service again.
+        log(`Worker ${currentChild.pid ?? "unknown"} survived SIGKILL. Supervisor exiting.`);
+        exitSupervisor(1);
+        return;
+      }
+      if (workerExit?.child === currentChild) finishWorkerExit(workerExit.code, workerExit.signal);
+    })();
   };
 
   const spawnWorker = () => {
@@ -327,13 +344,8 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     }
 
     const spawnSpec = resolveWorkerSpawnSpec?.(workerEntry) ?? null;
-    writeLifecycleLog("Spawning worker", { workerEntry, restartAnywayId: emergencyRestartId });
-    const nextEnv = { ...(spawnSpec?.env ?? workerEnv) };
-    delete nextEnv.PASEO_RESTART_ANYWAY_ID;
-    nextEnv.PASEO_SUPERVISOR_RESTART_ANYWAY = "1";
-    if (emergencyRestartId) nextEnv.PASEO_RESTART_ANYWAY_ID = emergencyRestartId;
-    emergencyRestartId = undefined;
-    emergencyStopping = false;
+    writeLifecycleLog("Spawning worker", { workerEntry });
+    const nextEnv = spawnSpec?.env ?? workerEnv;
     if (spawnSpec) {
       child = spawn(spawnSpec.command, spawnSpec.args, {
         stdio: ["inherit", "pipe", "pipe", "ipc"],
@@ -349,7 +361,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
 
     workerExit = null;
     workerStop = null;
-    workerStopCertified = false;
+    workerStopFinished = false;
     const currentChild = child;
     workerReachedReady = false;
     workerClosed = new Promise((resolve) => currentChild.once("close", () => resolve()));
@@ -408,10 +420,6 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
         return;
       }
 
-      if (lifecycleMessage.type === "paseo:restart-anyway") {
-        requestRestartAnyway(currentChild, lifecycleMessage.restartId);
-        return;
-      }
       if (lifecycleMessage.type === "paseo:shutdown") {
         const reason = lifecycleMessage.reason ?? "worker_requested_shutdown";
         writeLifecycleLog("Worker requested shutdown", { reason });
@@ -435,8 +443,8 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
       const exitDescriptor = describeExit(code, signal);
       writeLifecycleLog("Worker exited", { code, signal, exit: exitDescriptor });
       workerExit = { child: currentChild, code, signal };
-      // Controlled stop owns finalization until every captured member stopped.
-      if (workerStopCertified || (!restarting && !shuttingDown)) finishWorkerExit(code, signal);
+      // A controlled stop finalizes the exit itself, after it killed the captured tree.
+      if (workerStopFinished || (!restarting && !shuttingDown)) finishWorkerExit(code, signal);
     });
   };
 
@@ -452,7 +460,8 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
       });
     void publication.then(() => {
       const exitDescriptor = describeExit(code, signal);
-      if (lifecycleFailed || (!reachedReady && !shuttingDown)) {
+      // A restart requested during the boot restore, before ready, still spawns the replacement.
+      if (lifecycleFailed || (!reachedReady && !shuttingDown && !restarting)) {
         log(`Worker exited before successful readiness (${exitDescriptor}). Supervisor exiting.`);
         exitSupervisor(1);
         return;
@@ -511,91 +520,8 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     });
   };
 
-  const requestRestartAnyway = (currentChild: ChildProcess, restartId: string): void => {
-    if (emergencyStopping || child !== currentChild) return;
-    const fail = (error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      log(`Emergency restart failed: ${message}`);
-      if (currentChild.connected)
-        currentChild.send?.({ type: "paseo:restart-anyway-failed", error: message }, () => {});
-    };
-    if (shuttingDown) {
-      fail(
-        new Error(
-          "The host is stopping the supervisor. Finish or cancel that host operation first.",
-        ),
-      );
-      return;
-    }
-    emergencyStopping = true;
-    emergencyRestartId = restartId;
-    restarting = true;
-    shutdownKeepAlive ??= setInterval(() => {}, WORKER_HEARTBEAT_INTERVAL_MS);
-    writeLifecycleLog("Explicit emergency restart requested", {
-      restartId,
-      workerPid: currentChild.pid,
-    });
-    const attempt = (async () => {
-      // Allow the worker's accepted response to reach the client. Never ask it to checkpoint.
-      await delay(100);
-      try {
-        const result = await terminateWithTreeKill(currentChild, {
-          gracefulSignal: "SIGKILL",
-          forceSignal: "SIGKILL",
-          gracefulTimeoutMs: WORKER_TERMINATION_GRACE_MS,
-          forceTimeoutMs: WORKER_TERMINATION_GRACE_MS,
-        });
-        if (result === "kill-timeout") throw new Error("Some worker descendants did not stop");
-      } catch (error) {
-        // This explicit escape accepts uncertain descendant execution. Never use it
-        // in the orderly path. The successor starts no saved agent continuations.
-        writeLifecycleLog("Emergency descendant cleanup could not be certified", {
-          restartId,
-          error: String(error),
-        });
-      }
-      if (currentChild.exitCode === null && currentChild.signalCode === null) {
-        const waiting = new AbortController();
-        try {
-          const exited = once(currentChild, "exit", { signal: waiting.signal });
-          currentChild.kill("SIGKILL");
-          await withTimeout(exited, WORKER_TERMINATION_GRACE_MS, "Emergency worker termination");
-        } finally {
-          waiting.abort();
-        }
-      }
-      // Unknown descendants can retain inherited pipes. Their output cannot mutate
-      // the dead worker's state and must not prevent its replacement.
-      currentChild.stdout?.destroy();
-      currentChild.stderr?.destroy();
-    })();
-    workerStop = attempt;
-    void attempt.then(
-      () => {
-        if (workerStop !== attempt) return;
-        workerStopCertified = true;
-        if (shutdownKeepAlive) clearInterval(shutdownKeepAlive);
-        shutdownKeepAlive = null;
-        if (workerExit?.child === currentChild)
-          finishWorkerExit(workerExit.code, workerExit.signal);
-        return undefined;
-      },
-      (error: unknown) => {
-        if (workerStop !== attempt) return;
-        workerStop = null;
-        emergencyStopping = false;
-        emergencyRestartId = undefined;
-        fail(error);
-      },
-    );
-  };
-
   const requestRestart = (reason: string) => {
-    if (!child || shuttingDown) return;
-    if (restarting) {
-      beginWorkerStop(reason);
-      return;
-    }
+    if (!child || shuttingDown || restarting) return;
     restarting = true;
     writeLifecycleLog("Restart requested", { reason });
     log(`${reason}. Stopping worker for restart...`);
@@ -603,10 +529,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
   };
 
   const requestShutdown = (reason: string) => {
-    if (shuttingDown) {
-      beginWorkerStop(reason);
-      return;
-    }
+    if (shuttingDown) return;
     shuttingDown = true;
     restarting = false;
     writeLifecycleLog("Supervisor shutdown requested", { reason });

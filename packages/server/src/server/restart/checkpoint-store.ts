@@ -10,7 +10,6 @@ const MANIFEST_FILE = "manifest.json";
 const SNAPSHOT_FILE = "snapshot.json";
 const CLAIMED_FILE = "claimed.json";
 const RESTORED_FILE = "restored.json";
-const CRASH_RECONCILIATION_FILE = "crash-reconciliation.json";
 const MANIFEST_VERSION = 1;
 
 export type CheckpointLoadFailureReason =
@@ -24,9 +23,8 @@ export type CheckpointLoadFailureReason =
   | "already_restored";
 
 /**
- * Typed failure for a ready generation that cannot be trusted. There is no fallback: every
- * reason here must block recovery visibly rather than silently replacing it with shorter
- * native history or an older generation.
+ * Typed failure for a ready generation that cannot be used. The boot logs the reason and starts
+ * without the checkpoint; it never falls back to an older generation.
  */
 export class CheckpointLoadError extends Error {
   constructor(
@@ -50,23 +48,11 @@ export interface CheckpointClaim<T> {
   snapshot: T;
 }
 
-export interface CheckpointStatus {
-  generationId: string;
-  claimed: boolean;
-}
-
-export interface CrashAcknowledgmentRequester {
-  principalId: string;
-  clientId: string;
-  sessionId: string;
-}
-
 interface ManifestFile {
   version: number;
   generationId: string;
   createdAt: string;
   checksum: string;
-  crashReconciliationChecksum?: string;
 }
 
 interface ReadyFile {
@@ -134,6 +120,34 @@ async function pathExists(target: string): Promise<boolean> {
   }
 }
 
+interface ClaimMarker {
+  claimedAt: string;
+  /** Present when a boot marked the generation used without loading it. */
+  abandoned?: true;
+}
+
+/**
+ * Writes the single-use claim marker durably. Exclusive creation keeps the claim single-use even
+ * for two concurrent booters. Returns false when a marker already exists.
+ */
+async function createClaimMarker(generationDir: string, marker: ClaimMarker): Promise<boolean> {
+  let handle: FileHandle;
+  try {
+    handle = await fs.open(path.join(generationDir, CLAIMED_FILE), "wx", PRIVATE_FILE_MODE);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+  try {
+    await handle.writeFile(JSON.stringify(marker));
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await fsyncDirectory(generationDir);
+  return true;
+}
+
 /**
  * Durable, versioned restart checkpoints under `<home>/restart-checkpoints/`. Each generation
  * is a directory holding one `snapshot.json` (the caller's full `T`) plus a `manifest.json`
@@ -141,7 +155,7 @@ async function pathExists(target: string): Promise<boolean> {
  * trustworthy generation. Prior generations and partially-written generations are never
  * deleted — only `ready.json` decides what counts as ready. No pointer is published until
  * the snapshot and manifest are durable. Failure of the final directory sync can leave the
- * new pointer visible, but the caller still receives failure and must not replace the process.
+ * new pointer visible while the caller still receives a failure.
  *
  * `parse` is the only source of truth for what `T` is: the store never assumes a snapshot is
  * valid because it parsed as JSON and matched a checksum. It must also match the caller's
@@ -158,13 +172,7 @@ export class CheckpointStore<T> {
     this.root = path.join(home, CHECKPOINTS_DIR);
   }
 
-  async commit(
-    snapshot: T,
-    options?: {
-      crashAcknowledgment?: { generationId: string; acknowledgmentId: string };
-      expectedReadyGeneration?: string;
-    },
-  ): Promise<CheckpointCommitResult<T>> {
+  async commit(snapshot: T): Promise<CheckpointCommitResult<T>> {
     const generationId = `${Date.now()}-${randomUUID()}`;
     const generationDir = path.join(this.root, generationId);
     await fs.mkdir(generationDir, { recursive: true });
@@ -173,7 +181,9 @@ export class CheckpointStore<T> {
     await fsyncDirectory(this.root);
 
     snapshot = this.parse(snapshot);
-    const snapshotText = JSON.stringify(snapshot, null, 2);
+    // Compact: V8 cannot build a string above about 512 MB, and indentation inflates large
+    // snapshots toward that limit. The checksum covers the exact text, so readers accept both.
+    const snapshotText = JSON.stringify(snapshot);
     await writeFileDurable(path.join(generationDir, SNAPSHOT_FILE), snapshotText);
 
     const manifest: ManifestFile = {
@@ -182,75 +192,15 @@ export class CheckpointStore<T> {
       createdAt: new Date().toISOString(),
       checksum: checksumOf(snapshotText),
     };
-    if (options?.crashAcknowledgment) {
-      const receipt = options.crashAcknowledgment;
-      const auditText = await fs.readFile(
-        path.join(
-          this.root,
-          receipt.generationId,
-          `operator-crash-acknowledgment-${receipt.acknowledgmentId}.json`,
-        ),
-        "utf8",
-      );
-      const audit = JSON.parse(auditText) as { generationId?: unknown; acknowledgmentId?: unknown };
-      if (
-        audit.generationId !== receipt.generationId ||
-        audit.acknowledgmentId !== receipt.acknowledgmentId
-      )
-        throw new Error("Crash reconciliation receipt does not match its durable audit");
-      const provenance = JSON.stringify({
-        version: 1,
-        successorGenerationId: generationId,
-        acknowledgment: audit,
-      });
-      await writeFileDurable(path.join(generationDir, CRASH_RECONCILIATION_FILE), provenance);
-      manifest.crashReconciliationChecksum = checksumOf(provenance);
-    }
     await writeFileDurable(
       path.join(generationDir, MANIFEST_FILE),
       JSON.stringify(manifest, null, 2),
     );
 
-    if (options?.expectedReadyGeneration)
-      await this.assertReadyGeneration(options.expectedReadyGeneration);
     const ready: ReadyFile = { generationId };
     await writeFileDurable(path.join(this.root, READY_FILE), JSON.stringify(ready, null, 2));
 
     return { generationId, snapshot };
-  }
-
-  /** Retain old data but prevent an emergency-abandoned generation from ever dispatching again. */
-  async fenceEmergencyReplay(restartId: string): Promise<void> {
-    let generationId: string | null;
-    try {
-      generationId = await this.readReadyGenerationId();
-    } catch (error) {
-      // A corrupt pointer already prevents ordinary boot from replaying anything.
-      if (error instanceof CheckpointLoadError && error.reason === "ready_pointer_corrupt") return;
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "EISDIR" || code === "ENOTDIR") return;
-      throw error;
-    }
-    if (!generationId) return;
-    const generationDir = path.join(this.root, generationId);
-    let handle: FileHandle;
-    try {
-      handle = await fs.open(path.join(generationDir, CLAIMED_FILE), "wx", PRIVATE_FILE_MODE);
-    } catch (error) {
-      // Existing claims already prevent replay. A missing directory cannot be loaded.
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "EEXIST" || code === "ENOENT") return;
-      throw error;
-    }
-    try {
-      await handle.writeFile(
-        JSON.stringify({ abandonedAt: new Date().toISOString(), emergencyRestartId: restartId }),
-      );
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    await fsyncDirectory(generationDir);
   }
 
   /**
@@ -282,7 +232,7 @@ export class CheckpointStore<T> {
           restored = JSON.parse(restoredText);
         } catch {
           // A malformed completion marker cannot turn a consumed checkpoint into
-          // fresh work. Keep the claim authoritative and fail closed below.
+          // fresh work. The claim stays authoritative below.
         }
         if (
           typeof restored === "object" &&
@@ -295,7 +245,7 @@ export class CheckpointStore<T> {
           throw new CheckpointLoadError(
             "already_restored",
             generationId,
-            `Generation '${generationId}' already completed restoration. Recovery is paused because later work must be reconciled before this checkpoint can be used again.`,
+            `Generation '${generationId}' already completed restoration and is never replayed`,
           );
         }
       }
@@ -308,115 +258,16 @@ export class CheckpointStore<T> {
 
     const snapshot = await this.readSnapshot(generationId);
 
-    // Exclusive creation makes the claim single-use even for two concurrent booters.
-    let claimHandle: FileHandle;
-    try {
-      claimHandle = await fs.open(path.join(generationDir, CLAIMED_FILE), "wx", PRIVATE_FILE_MODE);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-        throw new CheckpointLoadError(
-          "already_claimed",
-          generationId,
-          "Checkpoint was concurrently claimed",
-          { cause: error },
-        );
-      }
-      throw error;
+    if (!(await createClaimMarker(generationDir, { claimedAt: new Date().toISOString() }))) {
+      throw new CheckpointLoadError(
+        "already_claimed",
+        generationId,
+        "Checkpoint was concurrently claimed",
+      );
     }
-    try {
-      await claimHandle.writeFile(JSON.stringify({ claimedAt: new Date().toISOString() }));
-      await claimHandle.sync();
-    } finally {
-      await claimHandle.close();
-    }
-    await fsyncDirectory(generationDir);
     this.claimedGenerationId = generationId;
 
     return { generationId, snapshot };
-  }
-
-  /** Side-effect-free target-package preflight; validates the exact current ready generation. */
-  async inspectReadyGeneration(expectedId: string): Promise<CheckpointClaim<T>> {
-    const generationId = await this.readReadyGenerationId();
-    if (generationId !== expectedId)
-      throw new Error(`Expected ready generation ${expectedId}, found ${generationId ?? "none"}`);
-    return { generationId, snapshot: await this.readSnapshot(generationId) };
-  }
-
-  /** Audit only: this receipt never makes a consumed generation replayable at boot. */
-  async acknowledgeConsumedGeneration(
-    expectedId: string,
-    requester: CrashAcknowledgmentRequester,
-  ): Promise<{ generationId: string; acknowledgmentId: string }> {
-    await this.assertReadyGeneration(expectedId);
-    // This generation was schema-validated before its durable restoration. An
-    // acknowledgment needs integrity evidence, not another in-memory history.
-    await this.verifyConsumedSnapshotChecksum(expectedId);
-    const generationDir = path.join(this.root, expectedId);
-    const restoredText = await readFileOrNull(path.join(generationDir, RESTORED_FILE));
-    const restored: unknown = restoredText === null ? null : JSON.parse(restoredText);
-    if (
-      !(await pathExists(path.join(generationDir, CLAIMED_FILE))) ||
-      typeof restored !== "object" ||
-      restored === null ||
-      !("generationId" in restored) ||
-      restored.generationId !== expectedId ||
-      !("restoredAt" in restored) ||
-      typeof restored.restoredAt !== "string"
-    ) {
-      throw new Error("Crash acknowledgment requires a valid completed restoration marker");
-    }
-    await this.assertReadyGeneration(expectedId);
-    const acknowledgmentId = randomUUID();
-    await writeFileDurable(
-      path.join(generationDir, `operator-crash-acknowledgment-${acknowledgmentId}.json`),
-      JSON.stringify({
-        version: 1,
-        generationId: expectedId,
-        acknowledgmentId,
-        acknowledgedAt: new Date().toISOString(),
-        daemonPid: process.pid,
-        requester,
-        orphanExecutionReconciled: true,
-        paseoOnlyStateMayBeLost: true,
-      }),
-    );
-    await this.assertReadyGeneration(expectedId);
-    return { generationId: expectedId, acknowledgmentId };
-  }
-
-  private async verifyConsumedSnapshotChecksum(generationId: string): Promise<void> {
-    const generationDir = path.join(this.root, generationId);
-    const manifest = await this.readManifest(generationDir, generationId);
-    const hash = createHash("sha256");
-    let handle: FileHandle;
-    try {
-      handle = await fs.open(path.join(generationDir, SNAPSHOT_FILE), "r");
-    } catch (error) {
-      throw new CheckpointLoadError(
-        "snapshot_corrupt",
-        generationId,
-        "Consumed snapshot cannot be read",
-        { cause: error },
-      );
-    }
-    try {
-      for await (const chunk of handle.createReadStream({ autoClose: false })) hash.update(chunk);
-    } finally {
-      await handle.close();
-    }
-    if (hash.digest("hex") !== manifest.checksum)
-      throw new CheckpointLoadError(
-        "manifest_checksum_mismatch",
-        generationId,
-        "Consumed snapshot does not match its manifest checksum",
-      );
-  }
-
-  async assertReadyGeneration(expectedId: string): Promise<void> {
-    const actual = await this.readReadyGenerationId();
-    if (actual !== expectedId)
-      throw new Error(`Expected ready generation ${expectedId}, found ${actual ?? "none"}`);
   }
 
   private async readSnapshot(generationId: string): Promise<T> {
@@ -479,14 +330,26 @@ export class CheckpointStore<T> {
     );
   }
 
-  /** Cheap status read for reporting: does not validate checksum/schema or claim anything. */
-  async peekStatus(): Promise<CheckpointStatus | null> {
-    const generationId = await this.readReadyGenerationId();
-    if (generationId === null) {
-      return null;
+  /** Marks the ready generation as used without loading it, so that no later boot replays it.
+   *  Does nothing when no ready generation exists, the pointer is unreadable, the generation
+   *  directory is missing, or a claim marker exists. */
+  async abandonReady(): Promise<void> {
+    let generationId: string | null;
+    try {
+      generationId = await this.readReadyGenerationId();
+    } catch (error) {
+      if (error instanceof CheckpointLoadError) return;
+      throw error;
     }
-    const claimed = await pathExists(path.join(this.root, generationId, CLAIMED_FILE));
-    return { generationId, claimed };
+    if (generationId === null) return;
+    const generationDir = path.join(this.root, generationId);
+    if (!(await pathExists(generationDir))) return;
+    // A boot that skipped this generation accepts new work; replaying it later would repeat
+    // old continuation prompts over that work.
+    await createClaimMarker(generationDir, {
+      claimedAt: new Date().toISOString(),
+      abandoned: true,
+    });
   }
 
   private async readReadyGenerationId(): Promise<string | null> {
@@ -562,20 +425,6 @@ export class CheckpointStore<T> {
         generationId,
         `Generation '${generationId}' manifest.json is malformed`,
       );
-    }
-    if ("crashReconciliationChecksum" in manifest) {
-      const provenance = await readFileOrNull(path.join(generationDir, CRASH_RECONCILIATION_FILE));
-      if (
-        typeof manifest.crashReconciliationChecksum !== "string" ||
-        provenance === null ||
-        checksumOf(provenance) !== manifest.crashReconciliationChecksum
-      ) {
-        throw new CheckpointLoadError(
-          "manifest_checksum_mismatch",
-          generationId,
-          "Crash reconciliation provenance does not match its manifest",
-        );
-      }
     }
     return manifest as ManifestFile;
   }

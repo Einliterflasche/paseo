@@ -1,19 +1,18 @@
 import { AgentNotFoundError } from "../agent/agent-not-found-error.js";
 import {
-  CheckpointStore,
-  CheckpointLoadError,
-  type CheckpointClaim,
-  type CheckpointCommitResult,
-  type CrashAcknowledgmentRequester,
-} from "./checkpoint-store.js";
-import { RestartHandoffInProgressError, RestartInProgressError } from "./restart-errors.js";
+  attempt,
+  attemptWithin,
+  RestartStepTimeoutError,
+  type RestartFailureReporter,
+} from "./best-effort.js";
+import type { CheckpointClaim, CheckpointStore } from "./checkpoint-store.js";
+import { RestartHandoffInProgressError } from "./restart-errors.js";
 
 export type RestartPhase = "running" | "preparing" | "paused" | "restoring";
 export type RestartStage =
   | "installing"
   | "starting"
   | "stopping"
-  | "blocked"
   | "checkpointing"
   | "ready"
   | "replacing";
@@ -21,92 +20,61 @@ export type RestartStage =
 export interface RestartStatus {
   state: RestartPhase;
   generationId?: string;
-  previousGenerationId?: string;
   stage?: RestartStage;
-  error?: string;
-  affectedAgentIds?: string[];
 }
 
-/** Owns lifecycle publication, admission, certified stopping, and successor attempts. */
+/** Result of the best-effort checkpoint. `generationId` is absent when none was saved. */
+export interface RestartPreparation {
+  generationId?: string;
+}
+
+export interface RestartControllerOptions<T> {
+  store: Pick<CheckpointStore<T>, "commit" | "loadAndClaim" | "markRestored" | "abandonReady">;
+  capture: () => Promise<T>;
+  /** Closing ingress is synchronous. The promise drains accepted short operations. */
+  freeze?: () => Promise<void>;
+  stop?: () => Promise<void>;
+  install?: (snapshot: T) => Promise<void>;
+  initialize?: () => Promise<void>;
+  resume?: (snapshot: T) => Promise<void>;
+  finalize?: () => Promise<void>;
+  open?: () => void;
+  changed?: () => void;
+  observerFailed?: (error: unknown) => void;
+  /** Receives every step that failed or ran out of time. */
+  failed: RestartFailureReporter;
+  prepareTimeoutMs: number;
+  stopTimeoutMs: number;
+  restoreTimeoutMs: number;
+}
+
+/**
+ * Owns the admission freeze, the best-effort checkpoint, and the boot restoration. Every hook is
+ * bounded or isolated, so a restart, a stop, and a boot always complete; a failed step is reported
+ * through `failed` and skipped.
+ */
 export class RestartController<T> {
-  private preparation: Promise<CheckpointCommitResult<T>> | null = null;
+  private preparation: Promise<RestartPreparation> | null = null;
   private replacement: Promise<void> | null = null;
-  private restoration: Promise<void> | null = null;
-  private failureCleanup: Promise<void> | null = null;
-  private handledFailure: { error: unknown } | null = null;
   private readonly controls = new Set<Promise<unknown>>();
-  private readonly recoveryControlErrors: unknown[] = [];
   private finalizing = false;
-  private abandoned = false;
   private phase: RestartPhase = "running";
   private stage: RestartStage | undefined;
   private generationId: string | undefined;
-  private previousGenerationId: string | undefined;
-  private error: unknown;
-  private recovery: "none" | "installed" | "unavailable" = "none";
-  private pendingInstallation: T | null = null;
-  private initializationPending = false;
-  private claimFailure: CheckpointLoadError | null = null;
-  private crashAcknowledgment: { generationId: string; acknowledgmentId: string } | null = null;
-  private acknowledgedReadyGeneration: string | null = null;
 
-  constructor(
-    private readonly options: {
-      store: CheckpointStore<T>;
-      capture: () => Promise<T>;
-      /** Closing ingress is synchronous; its promise drains accepted short operations. */
-      freeze?: () => Promise<void>;
-      stop?: () => Promise<void>;
-      install?: (snapshot: T) => Promise<void>;
-      initialize?: () => Promise<void>;
-      resume?: (snapshot: T) => Promise<void>;
-      finalize?: () => Promise<void>;
-      open?: () => void;
-      affectedAgentIds?: () => string[];
-      changed?: () => void;
-      observerFailed?: (error: unknown) => void;
-    },
-  ) {}
+  constructor(private readonly options: RestartControllerOptions<T>) {}
 
   get status(): RestartStatus {
     return {
       state: this.phase,
-      generationId: this.generationId,
-      error: this.error instanceof Error ? this.error.message : undefined,
-      ...(this.previousGenerationId ? { previousGenerationId: this.previousGenerationId } : {}),
+      ...(this.generationId ? { generationId: this.generationId } : {}),
       ...(this.stage ? { stage: this.stage } : {}),
-      ...(this.stage === "blocked"
-        ? { affectedAgentIds: this.options.affectedAgentIds?.() ?? [] }
-        : {}),
     };
   }
 
-  /** Explicit emergency replacement never joins the failed orderly operation. */
-  abandonForRestart(): void {
-    if (this.abandoned) return;
-    const { state, stage, error } = this.status;
-    if (
-      !error ||
-      (state !== "paused" &&
-        !(state === "restoring" && (stage === "stopping" || stage === "blocked")))
-    )
-      throw new Error("Restart anyway requires a current restart recovery error");
-    this.abandoned = true;
-    this.phase = "paused";
-    this.stage = "replacing";
-    this.changed();
-  }
-
-  reportEmergencyFailure(error: unknown): void {
-    this.phase = "paused";
-    this.stage = "blocked";
-    this.error = error instanceof Error ? error : new Error(String(error));
-    this.changed();
-  }
-
-  private assertRetained(): void {
-    if (this.abandoned) throw new Error("Restart anyway superseded this recovery attempt");
-  }
+  private readonly report: RestartFailureReporter = (step, error) => {
+    this.options.failed(step, error);
+  };
 
   private changed(): void {
     try {
@@ -121,11 +89,46 @@ export class RestartController<T> {
     }
   }
 
-  private freeze(): Promise<void> {
+  private open(): void {
+    this.phase = "running";
+    this.stage = undefined;
     try {
-      return this.options.freeze?.() ?? Promise.resolve();
+      this.options.open?.();
     } catch (error) {
-      return Promise.reject(error);
+      this.report("open", error);
+    }
+    this.changed();
+  }
+
+  /**
+   * Waits until tracked controls settle, for at most `timeoutMs`. A control can wait for a
+   * provider call that never settles, so after the bound the step `controls` is reported and the
+   * caller continues. Resolves synchronously after the last check, so the caller can seal the
+   * control set without an await in between.
+   */
+  private async settleControls(timeoutMs: number): Promise<void> {
+    if (!this.controls.size) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<true>((resolve) => {
+      timer = setTimeout(() => resolve(true), timeoutMs);
+    });
+    try {
+      while (this.controls.size) {
+        const timedOut = await Promise.race([
+          Promise.allSettled(this.controls).then(() => false),
+          expired,
+        ]);
+        if (timedOut) {
+          try {
+            this.report("controls", new RestartStepTimeoutError("controls", timeoutMs));
+          } catch {
+            // A broken reporter must not hold the restart or the boot.
+          }
+          return;
+        }
+      }
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -144,367 +147,166 @@ export class RestartController<T> {
     this.controls.add(result);
     const belongsToRecovery = this.phase !== "running";
     void result
-      .catch((error) => {
-        if (belongsToRecovery && !(error instanceof AgentNotFoundError))
-          this.recoveryControlErrors.push(error);
+      .catch((error: unknown) => {
+        if (!belongsToRecovery || error instanceof AgentNotFoundError) return;
+        try {
+          this.report("control", error);
+        } catch {
+          // The caller still receives the rejection; the reporter only adds diagnostics.
+        }
       })
       .finally(() => this.controls.delete(result));
     return result;
   }
 
-  prepare(): Promise<CheckpointCommitResult<T>> {
-    if (this.abandoned)
-      return Promise.reject(new Error("Restart anyway superseded this recovery attempt"));
-    if (this.recovery !== "none") return Promise.reject(this.error ?? new RestartInProgressError());
-    if (this.phase === "restoring") return Promise.reject(new RestartInProgressError());
+  prepare(): Promise<RestartPreparation> {
     if (this.preparation) return this.preparation;
-    this.handledFailure = null;
+    const startedAt = Date.now();
     this.phase = "preparing";
     this.stage = "stopping";
-    const freeze = this.freeze();
+    const frozen = attempt(this.report, "freeze", () => this.options.freeze?.(), undefined);
     this.changed();
-    this.preparation = Promise.resolve().then(async () => {
-      try {
-        await freeze;
-        await this.options.stop?.();
-        this.assertRetained();
-        this.stage = "checkpointing";
-        this.changed();
-        while (this.controls.size) await Promise.allSettled(this.controls);
-        this.assertRetained();
-        const snapshot = await this.options.capture();
-        this.assertRetained();
-        const checkpoint = await this.options.store.commit(snapshot);
-        this.assertRetained();
-        this.generationId = checkpoint.generationId;
-        this.phase = "paused";
-        this.stage = "ready";
-        this.error = undefined;
-        this.changed();
-        return checkpoint;
-      } catch (error) {
-        await this.stopAfterFailure(error);
-        this.preparation = null;
-        throw error;
-      }
-    });
+    this.preparation = (async () => {
+      await attemptWithin(
+        this.report,
+        "stop",
+        this.options.stopTimeoutMs,
+        // A running restore is not awaited: the agent manager ends its resume loop when the
+        // quiesce in `stop` begins, and the restore skips its finalize once a preparation began.
+        async () => {
+          await frozen;
+          await this.options.stop?.();
+        },
+        undefined,
+      );
+      this.stage = "checkpointing";
+      this.changed();
+      const checkpointTimeoutMs = Math.max(
+        0,
+        this.options.prepareTimeoutMs - (Date.now() - startedAt),
+      );
+      let expired = false;
+      const committed = await attemptWithin(
+        this.report,
+        "checkpoint",
+        checkpointTimeoutMs,
+        async () => {
+          await this.settleControls(Math.min(this.options.stopTimeoutMs, checkpointTimeoutMs));
+          const snapshot = await this.options.capture();
+          // A late commit would publish a pointer after the replacement already booted without it.
+          if (expired) return null;
+          return await this.options.store.commit(snapshot);
+        },
+        null,
+      );
+      expired = true;
+      this.phase = "paused";
+      this.stage = "ready";
+      this.generationId = committed?.generationId;
+      this.changed();
+      return committed ? { generationId: committed.generationId } : {};
+    })();
     return this.preparation;
   }
 
-  async replace(replace: (checkpoint: CheckpointCommitResult<T>) => Promise<void>): Promise<void> {
-    if (!this.replacement) {
-      this.replacement = this.prepare()
-        .then(async (checkpoint) => {
-          this.assertRetained();
-          this.stage = "replacing";
-          this.changed();
-          await replace(checkpoint);
-          return undefined;
-        })
-        .catch((error) => {
-          this.replacement = null;
-          throw error;
-        });
-    }
-    await this.replacement;
+  replace(replace: (preparation: RestartPreparation) => void | Promise<void>): Promise<void> {
+    this.replacement ??= (async () => {
+      const preparation = await this.prepare();
+      this.stage = "replacing";
+      this.changed();
+      await attempt(this.report, "replace", () => replace(preparation), undefined);
+    })();
+    return this.replacement;
   }
 
-  async claim(options?: { restartAnyway?: string }): Promise<CheckpointClaim<T> | null> {
-    this.handledFailure = null;
+  /** Boot step one. Admissions stay frozen until `restore` when a checkpoint comes back. */
+  async claim(): Promise<CheckpointClaim<T> | null> {
     // Freeze before any asynchronous disk read: the listener may already exist.
     this.phase = "restoring";
     this.stage = "installing";
-    const freeze = this.freeze();
+    const frozen = attempt(this.report, "freeze", () => this.options.freeze?.(), undefined);
     this.changed();
-    try {
-      await freeze;
-      if (options?.restartAnyway)
-        await this.options.store.fenceEmergencyReplay(options.restartAnyway);
-      const checkpoint = options?.restartAnyway ? null : await this.options.store.loadAndClaim();
-      if (checkpoint) {
-        this.generationId = checkpoint.generationId;
-        this.phase = "restoring";
-        this.stage = "installing";
-        this.recovery = "unavailable";
-        this.changed();
-      } else {
-        // No source generation exists: the current runtime owns this fresh initialization.
-        this.recovery = "installed";
-        this.initializationPending = true;
-        await this.options.initialize?.();
-        this.initializationPending = false;
-        this.phase = "running";
-        this.stage = undefined;
-        this.recovery = "none";
-        this.options.open?.();
-        this.changed();
-      }
-      return checkpoint;
-    } catch (error) {
-      if (error instanceof CheckpointLoadError) {
-        this.claimFailure = error;
-        this.generationId = error.generationId ?? undefined;
-      }
-      if (this.recovery !== "installed") this.recovery = "unavailable";
-      await this.stopAfterFailure(error);
-      throw error;
+    await frozen;
+    let loadFailed = false;
+    const checkpoint = await attempt(
+      (step, error) => {
+        loadFailed = true;
+        this.report(step, error);
+      },
+      "load",
+      () => this.options.store.loadAndClaim(),
+      null,
+    );
+    if (loadFailed) {
+      await attempt(this.report, "abandon", () => this.options.store.abandonReady(), undefined);
     }
-  }
-
-  /** Installation is idempotent at the runtime owner; no execution starts until it completes. */
-  async install(checkpoint: CheckpointClaim<T>): Promise<void> {
-    if (
-      checkpoint.generationId !== this.generationId ||
-      this.phase !== "restoring" ||
-      this.stage !== "installing"
-    )
-      throw new Error("Checkpoint installation does not belong to the active recovery attempt");
-    this.pendingInstallation = checkpoint.snapshot;
-    try {
-      await this.options.install?.(checkpoint.snapshot);
-      this.recovery = "installed";
-      this.pendingInstallation = null;
-    } catch (error) {
-      await this.stopAfterFailure(error);
-      throw error;
-    }
-  }
-
-  restore(checkpoint: CheckpointClaim<T>): Promise<void> {
-    if (this.restoration) return this.restoration;
-    if (
-      checkpoint.generationId !== this.generationId ||
-      this.phase !== "restoring" ||
-      this.stage !== "installing"
-    )
-      return Promise.reject(new RestartInProgressError());
-    this.handledFailure = null;
-    this.restoration = (async () => {
-      try {
-        if (this.recovery !== "installed") await this.install(checkpoint);
-        this.phase = "restoring";
-        this.stage = "starting";
-        this.changed();
-        await this.options.resume?.(checkpoint.snapshot);
-        await this.completeRestoration();
-      } catch (error) {
-        await this.stopAfterFailure(error);
-        throw error;
-      }
-    })().finally(() => {
-      this.restoration = null;
-    });
-    return this.restoration;
-  }
-
-  private async completeRestoration(): Promise<void> {
-    if (this.phase !== "restoring" || this.stage !== "starting" || !this.generationId) {
-      throw new Error("No checkpoint restoration is in progress");
-    }
-    // Controls accepted while durable completion is being written still own
-    // provider teardown. Seal admission, join them, then retire closed handles.
-    try {
-      this.assertRetained();
-      await this.options.store.markRestored(this.generationId);
-      this.finalizing = true;
-      while (this.controls.size) await Promise.allSettled(this.controls);
-      if (this.recoveryControlErrors.length) {
-        throw new AggregateError(
-          this.recoveryControlErrors.splice(0),
-          "Recovery cancellation did not complete",
-        );
-      }
-      await this.options.finalize?.();
-      this.assertRetained();
-      this.phase = "running";
-      this.stage = undefined;
-      this.recovery = "none";
-      this.error = undefined;
-      this.options.open?.();
+    if (checkpoint) {
+      this.generationId = checkpoint.generationId;
       this.changed();
-    } catch (error) {
-      this.finalizing = false;
-      await this.stopAfterFailure(error);
-      throw error;
+      await attempt(
+        this.report,
+        "install",
+        () => this.options.install?.(checkpoint.snapshot),
+        undefined,
+      );
+      return checkpoint;
+    }
+    await attempt(this.report, "initialize", () => this.options.initialize?.(), undefined);
+    if (this.phase === "restoring") this.open();
+    return null;
+  }
+
+  /** Boot step two. Opens admissions after the resume or after `restoreTimeoutMs`. */
+  async restore(checkpoint: CheckpointClaim<T>): Promise<void> {
+    if (
+      checkpoint.generationId !== this.generationId ||
+      this.phase !== "restoring" ||
+      this.stage !== "installing"
+    )
+      return;
+    this.stage = "starting";
+    this.changed();
+    const resumed = attempt(
+      this.report,
+      "resume",
+      () => this.options.resume?.(checkpoint.snapshot),
+      undefined,
+    );
+    const resumedInTime = await attemptWithin(
+      this.report,
+      "restore",
+      this.options.restoreTimeoutMs,
+      async () => {
+        await resumed;
+        return true;
+      },
+      false,
+    );
+    await attempt(
+      this.report,
+      "mark-restored",
+      () => this.options.store.markRestored(checkpoint.generationId),
+      undefined,
+    );
+    // Finalize after the marker: a cancellation accepted during its write must be retired too.
+    // After a timeout, finalize waits for the late resume without holding admissions closed.
+    const finalized = resumed.then(() => this.finalizeRestoration());
+    if (resumedInTime) await finalized;
+    // A preparation that began meanwhile owns the frozen admissions now.
+    if (!this.preparation) this.open();
+  }
+
+  private async finalizeRestoration(): Promise<void> {
+    // A preparation means the process exits soon; retiring handles would only race its capture.
+    if (this.preparation) return;
+    await this.settleControls(this.options.stopTimeoutMs);
+    if (this.preparation) return;
+    // No await may separate the drained control set from sealing it against new controls.
+    this.finalizing = true;
+    try {
+      await attempt(this.report, "finalize", () => this.options.finalize?.(), undefined);
     } finally {
       this.finalizing = false;
     }
-  }
-
-  async failRestoration(error: unknown): Promise<void> {
-    if (this.recovery === "none") this.recovery = "unavailable";
-    await this.stopAfterFailure(error);
-  }
-
-  private async stopAfterFailure(failure: unknown): Promise<void> {
-    if (this.abandoned) return;
-    if (this.failureCleanup) return this.failureCleanup;
-    if (this.handledFailure?.error === failure) return;
-    this.handledFailure = { error: failure };
-    this.error = failure;
-    this.phase = "restoring";
-    this.stage = "stopping";
-    const freeze = this.freeze();
-    this.changed();
-    this.failureCleanup = this.stopFailedAttempt(failure, freeze).finally(() => {
-      this.failureCleanup = null;
-    });
-    await this.failureCleanup;
-  }
-
-  private async stopFailedAttempt(failure: unknown, freeze: Promise<void>): Promise<void> {
-    try {
-      await freeze;
-      await this.options.stop?.();
-      while (this.controls.size) await Promise.allSettled(this.controls);
-      if (this.abandoned) return;
-      this.phase = "paused";
-      this.stage = undefined;
-    } catch (stopError) {
-      if (this.abandoned) return;
-      this.phase = "restoring";
-      this.stage = "blocked";
-      this.error = new AggregateError(
-        [failure, stopError],
-        `${failure instanceof Error ? failure.message : String(failure)}; execution stop could not be confirmed: ${stopError instanceof Error ? stopError.message : String(stopError)}`,
-      );
-    }
-    this.changed();
-  }
-
-  /** Retry current quiescent state, never install an old source over newer output. */
-  retryRecovery(): Promise<void> {
-    if (this.abandoned) return Promise.reject(new RestartHandoffInProgressError());
-    if (this.restoration) return this.restoration;
-    const stoppingBlocked = this.phase === "restoring" && this.stage === "blocked";
-    if (
-      (this.phase !== "paused" && !stoppingBlocked) ||
-      (this.recovery !== "installed" && !this.pendingInstallation)
-    ) {
-      return Promise.reject(this.error ?? new RestartInProgressError());
-    }
-    this.handledFailure = null;
-    this.recoveryControlErrors.length = 0;
-    this.phase = "restoring";
-    this.stage = "stopping";
-    this.changed();
-    this.restoration = (async () => {
-      try {
-        await this.freeze();
-        await this.options.stop?.();
-        this.assertRetained();
-        this.stage = "checkpointing";
-        this.changed();
-        while (this.controls.size) await Promise.allSettled(this.controls);
-        if (this.initializationPending) {
-          await this.options.initialize?.();
-          this.initializationPending = false;
-        }
-        if (this.pendingInstallation) {
-          await this.options.install?.(this.pendingInstallation);
-          this.pendingInstallation = null;
-          this.recovery = "installed";
-        }
-        await this.restoreCurrentSuccessor();
-      } catch (error) {
-        await this.stopAfterFailure(error);
-        throw error;
-      }
-    })().finally(() => {
-      this.restoration = null;
-    });
-    return this.restoration;
-  }
-
-  /** Deliberate unexpected-crash reconciliation, never an ordinary retry fallback. */
-  acknowledgeCrash(
-    expectedGenerationId: string,
-    orphanExecutionReconciled: true,
-    requester: CrashAcknowledgmentRequester,
-  ): Promise<void> {
-    if (
-      orphanExecutionReconciled !== true ||
-      this.restoration ||
-      this.preparation ||
-      this.recovery !== "unavailable" ||
-      this.pendingInstallation ||
-      this.claimFailure?.reason !== "already_restored" ||
-      this.claimFailure.generationId !== expectedGenerationId ||
-      this.generationId !== expectedGenerationId ||
-      this.phase !== "paused"
-    ) {
-      return Promise.reject(
-        new Error(
-          "Crash acknowledgment requires the exact consumed generation, no installed recovery, and reconciled orphan execution",
-        ),
-      );
-    }
-    this.handledFailure = null;
-    this.recoveryControlErrors.length = 0;
-    this.phase = "restoring";
-    this.stage = "stopping";
-    const freeze = this.freeze();
-    this.changed();
-    this.restoration = (async () => {
-      try {
-        await freeze;
-        await this.options.stop?.();
-        this.assertRetained();
-        this.stage = "checkpointing";
-        this.changed();
-        while (this.controls.size) await Promise.allSettled(this.controls);
-        this.crashAcknowledgment = await this.options.store.acknowledgeConsumedGeneration(
-          expectedGenerationId,
-          requester,
-        );
-        this.acknowledgedReadyGeneration = expectedGenerationId;
-        // From here the current owners, not the old checkpoint, are authoritative.
-        // Failure uses ordinary retained-state retry. A process death still sees the
-        // consumed pointer and requires a fresh operator decision: the audit is inert.
-        this.recovery = "installed";
-        this.initializationPending = true;
-        await this.options.initialize?.();
-        this.initializationPending = false;
-        await this.options.store.assertReadyGeneration(expectedGenerationId);
-        await this.restoreCurrentSuccessor();
-      } catch (error) {
-        await this.stopAfterFailure(error);
-        throw error;
-      }
-    })().finally(() => {
-      this.restoration = null;
-    });
-    return this.restoration;
-  }
-
-  private async restoreCurrentSuccessor(): Promise<void> {
-    this.assertRetained();
-    const snapshot = await this.options.capture();
-    this.assertRetained();
-    if (this.acknowledgedReadyGeneration)
-      await this.options.store.assertReadyGeneration(this.acknowledgedReadyGeneration);
-    const successor = await this.options.store.commit(
-      snapshot,
-      this.crashAcknowledgment
-        ? {
-            crashAcknowledgment: this.crashAcknowledgment,
-            expectedReadyGeneration: this.acknowledgedReadyGeneration ?? undefined,
-          }
-        : undefined,
-    );
-    if (this.crashAcknowledgment) this.acknowledgedReadyGeneration = successor.generationId;
-    const claimed = await this.options.store.loadAndClaim();
-    if (!claimed || claimed.generationId !== successor.generationId)
-      throw new Error("Recovery successor changed before it could be claimed");
-    this.previousGenerationId = this.generationId;
-    this.generationId = claimed.generationId;
-    this.stage = "starting";
-    this.error = undefined;
-    this.changed();
-    this.assertRetained();
-    await this.options.resume?.(claimed.snapshot);
-    await this.completeRestoration();
-    this.crashAcknowledgment = null;
-    this.acknowledgedReadyGeneration = null;
   }
 }

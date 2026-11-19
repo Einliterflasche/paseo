@@ -42,7 +42,7 @@ test("a restored child notifies its parent once, without reporting restart suspe
   });
   await original.client.sendAgentMessage(parent.id, "parent task", { messageId: "parent-input" });
   await original.client.sendAgentMessage(child.id, "child task", { messageId: "child-input" });
-  await original.client.prepareRestart();
+  await original.instance.daemon.prepareRestart();
   const before = snapshotFinishNotificationWatches(original.instance.daemon.agentManager);
   expect(before).toHaveLength(1);
   expect(before[0]!.hasSeenRunning).toBe(true);
@@ -88,7 +88,7 @@ test("a restored child notifies its parent once, without reporting restart suspe
   });
 
   // A completed obligation must not reappear in the next checkpoint or boot.
-  await restored.client.prepareRestart();
+  await restored.instance.daemon.prepareRestart();
   await restored.client.close();
   await restored.instance.close();
   const again = await launch();

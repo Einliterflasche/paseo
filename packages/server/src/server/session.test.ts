@@ -32,7 +32,7 @@ import type { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.
 import { WorkspaceLabelError, type WorkspaceLabelService } from "./workspace-labels/index.js";
 import { createPersistedProjectRecord } from "./workspace-registry.js";
 import { deriveProjectKey } from "./project-key.js";
-import type { SessionOptions } from "./session.js";
+import type { SessionLifecycleIntent, SessionOptions } from "./session.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "./messages.js";
 import {
   asSessionInternals as asSessionInternalsHelper,
@@ -332,6 +332,7 @@ interface SessionForTestOptions {
   pluginRuntime?: SessionOptions["pluginRuntime"];
   orchestrationSkills?: SessionOptions["orchestrationSkills"];
   workspaceLabelService?: WorkspaceLabelService;
+  onLifecycleIntent?: SessionOptions["onLifecycleIntent"];
 }
 
 function createSessionForTest(options: SessionForTestOptions = {}): Session {
@@ -440,9 +441,102 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     daemonVersion: options.daemonVersion,
     daemonRuntimeConfig: options.daemonRuntimeConfig,
     permissions: options.permissions ?? OWNER_PERMISSIONS,
+    onLifecycleIntent: options.onLifecycleIntent,
   };
   return new Session(sessionOptions);
 }
+
+describe("daemon restart requests", () => {
+  function createRestartSession() {
+    const messages: SessionOutboundMessage[] = [];
+    const intents: SessionLifecycleIntent[] = [];
+    const session = createSessionForTest({
+      messages,
+      onLifecycleIntent: async (intent) => {
+        intents.push(intent);
+        return { generationId: "gen-restart" };
+      },
+    });
+    return { session, messages, intents };
+  }
+
+  test("a plain restart request hands the intent to the lifecycle handler", async () => {
+    const { session, messages, intents } = createRestartSession();
+
+    await session.handleMessage({ type: "restart_server_request", requestId: "restart" });
+
+    expect(intents).toEqual([
+      {
+        type: "restart",
+        clientId: "test-client",
+        requestId: "restart",
+        reason: expect.any(String),
+      },
+    ]);
+    expect(messages).toContainEqual({
+      type: "status",
+      payload: {
+        status: "restart_requested",
+        clientId: "test-client",
+        requestId: "restart",
+        generationId: "gen-restart",
+      },
+    });
+  });
+
+  test.each([
+    { prepareOnly: true },
+    { retryRecovery: true },
+    { acknowledgeCrash: { generationId: "gen-old", orphanExecutionReconciled: true as const } },
+  ])("a restart request with retired flag %o gets an rpc_error", async (flags) => {
+    const { session, messages, intents } = createRestartSession();
+
+    await session.handleMessage({
+      type: "restart_server_request",
+      requestId: "retired",
+      ...flags,
+    });
+
+    expect(intents).toEqual([]);
+    expect(messages).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "retired",
+          requestType: "restart_server_request",
+          error:
+            "This host no longer pauses recovery: an ordinary restart or stop saves the checkpoint",
+          code: "restart_operation_removed",
+        },
+      },
+    ]);
+  });
+
+  test("a restart anyway request gets an rpc_error", async () => {
+    const { session, messages, intents } = createRestartSession();
+
+    await session.handleMessage({
+      type: "daemon.restart_anyway.request",
+      requestId: "anyway",
+      expectedError: "blocked",
+      expectedGenerationId: null,
+    });
+
+    expect(intents).toEqual([]);
+    expect(messages).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "anyway",
+          requestType: "daemon.restart_anyway.request",
+          error:
+            "Restart anyway is no longer needed: an ordinary restart always completes on this host",
+          code: "restart_operation_removed",
+        },
+      },
+    ]);
+  });
+});
 
 test("routes host-scoped agent skills requests through the daemon owner", async () => {
   const messages: SessionOutboundMessage[] = [];

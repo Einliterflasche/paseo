@@ -62,7 +62,7 @@ test("the original scheduled run survives two active restarts and completes once
   await expect.poll(() => first.instance.daemon.agentManager.hasInFlightRun(agent.id)).toBe(true);
   const original = (await inspect(first.client)).runs[0]!;
   expect(original).toMatchObject({ status: "running", agentId: agent.id, endedAt: null });
-  const checkpoint = await first.client.prepareRestart();
+  const checkpoint = await first.instance.daemon.prepareRestart();
   expect((await inspect(first.client)).runs).toEqual([original]);
   await first.client.close();
   await pendingRpc;
@@ -74,7 +74,7 @@ test("the original scheduled run survives two active restarts and completes once
   );
   expect((await inspect(second.client)).runs).toEqual([original]);
   expect(second.instance.daemon.agentManager.hasInFlightRun(agent.id)).toBe(true);
-  await second.client.prepareRestart();
+  await second.instance.daemon.prepareRestart();
   expect((await inspect(second.client)).runs).toEqual([original]);
   await second.client.close();
   await second.instance.close();

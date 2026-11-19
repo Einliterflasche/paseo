@@ -1,6 +1,10 @@
-import { CheckpointStore, type CrashAcknowledgmentRequester } from "./restart/checkpoint-store.js";
-import type { CrashRecoveryAcknowledgment } from "@getpaseo/protocol/messages";
-import { RestartController } from "./restart/restart-controller.js";
+import { CheckpointStore, type CheckpointClaim } from "./restart/checkpoint-store.js";
+import { attempt, attemptWithin, type RestartFailureReporter } from "./restart/best-effort.js";
+import {
+  RestartController,
+  type RestartPreparation,
+  type RestartStatus,
+} from "./restart/restart-controller.js";
 import { DaemonCheckpointSchema } from "./restart/daemon-checkpoint.js";
 import {
   snapshotFinishNotificationWatches,
@@ -14,7 +18,6 @@ import { createServer as createHTTPServer, type IncomingMessage } from "http";
 import { constants, existsSync, unlinkSync } from "fs";
 import { open, stat } from "fs/promises";
 import { randomUUID } from "node:crypto";
-import { EmergencyRestart } from "./restart/emergency-restart.js";
 import { hostname as getHostname } from "node:os";
 import type { Socket } from "node:net";
 import path from "node:path";
@@ -91,15 +94,15 @@ function assertControlListenerOwnership(config: PaseoDaemonConfig): void {
 
 function createWorkspaceServiceRestoration({
   runtimeStore,
-  terminalManager,
   launch,
+  report,
 }: {
   runtimeStore: WorkspaceScriptRuntimeStore;
-  terminalManager: TerminalManager;
   launch(identity: { workspaceId: string; scriptName: string }): Promise<{
     lifecycle: "running" | "stopped";
     terminalId?: string | null;
   }>;
+  report: RestartFailureReporter;
 }): WorkspaceServiceRestoration {
   return new WorkspaceServiceRestoration(
     runtimeStore,
@@ -112,12 +115,33 @@ function createWorkspaceServiceRestoration({
       }
       return { terminalId: service.terminalId };
     },
-    async (terminalId) => {
-      if (terminalManager.getTerminal(terminalId)) {
-        await terminalManager.killTerminalAndWait(terminalId);
-      }
-    },
+    report,
   );
+}
+
+function resolveRestartTimeouts(config: PaseoDaemonConfig) {
+  const prepareTimeoutMs = config.restartPrepareTimeoutMs ?? DEFAULT_SHUTDOWN_CHECKPOINT_TIMEOUT_MS;
+  return {
+    prepareTimeoutMs,
+    stopTimeoutMs: Math.min(RESTART_STOP_TIMEOUT_MS, prepareTimeoutMs / 2),
+    restoreTimeoutMs: RESTART_RESTORE_TIMEOUT_MS,
+  };
+}
+
+async function claimRestartCheckpoint<T>(
+  controller: RestartController<T>,
+  logger: Logger,
+): Promise<CheckpointClaim<T> | null> {
+  const checkpoint = await controller.claim();
+  if (checkpoint) {
+    logger.info(
+      { generationId: checkpoint.generationId },
+      "Restart checkpoint loaded; restoring after the listener starts",
+    );
+  } else {
+    logger.info("Starting without a restart checkpoint");
+  }
+  return checkpoint;
 }
 
 function configuredGitProcessPolicy(config: PaseoDaemonConfig) {
@@ -305,7 +329,16 @@ import {
   type WorkspaceArchiveContext,
 } from "./workspace-registry.js";
 import { CheckoutDiffManager } from "./checkout-diff-manager.js";
-import { ScheduleService } from "./schedule/service.js";
+import {
+  keepContinuingScheduleRuns,
+  ScheduleRestartSnapshotSchema,
+  ScheduleService,
+} from "./schedule/service.js";
+import {
+  DEFAULT_SHUTDOWN_CHECKPOINT_TIMEOUT_MS,
+  RESTART_RESTORE_TIMEOUT_MS,
+  RESTART_STOP_TIMEOUT_MS,
+} from "./shutdown-checkpoint.js";
 import { DaemonConfigStore, type MutableDaemonConfig } from "./daemon-config-store.js";
 import { createOrchestrationSkills } from "./orchestration-skills/index.js";
 import { resolveConfigFromPersisted, type CliConfigOverrides } from "./config.js";
@@ -393,6 +426,7 @@ import { PluginService } from "./plugins/index.js";
 import { BuiltinPluginLoader } from "./plugins/builtin/index.js";
 import { ManagedPluginSources } from "./plugins/managed-source.js";
 
+const RESTART_SCHEDULE_CAPTURE_TIMEOUT_MS = 10_000;
 const MCP_DEBUG_BATCH_LIMIT = 10;
 const MCP_DEBUG_SECRET = "[redacted]";
 const DOWNLOAD_OPEN_FLAGS =
@@ -540,11 +574,6 @@ export type DaemonLifecycleIntent =
     }
   | {
       type: "restart";
-      prepareOnly?: boolean;
-      retryRecovery?: boolean;
-      restartAnyway?: { expectedError: string; expectedGenerationId: string | null };
-      acknowledgeCrash?: CrashRecoveryAcknowledgment;
-      acknowledgmentRequester?: CrashAcknowledgmentRequester;
       clientId: string;
       requestId: string;
       reason: string;
@@ -616,9 +645,8 @@ export interface PaseoDaemonConfig {
   providerOverrides?: Record<string, ProviderOverride>;
   log?: PersistedConfig["log"];
   onLifecycleIntent?: (intent: DaemonLifecycleIntent) => void | Promise<void>;
-  restartAnywaySupported?: boolean;
-  /** One-use supervisor handoff. Never inherited by agent processes. */
-  restartAnywayId?: string;
+  /** Limit for the restart checkpoint: freeze, stop, capture, and commit. */
+  restartPrepareTimeoutMs?: number;
   pushNotificationSender?: PushNotificationSender;
   managedProcesses?: ManagedProcessRegistry;
   configReload?: {
@@ -640,13 +668,8 @@ export interface PaseoDaemon {
   browserToolsBroker: BrowserToolsBroker;
   start(): Promise<void>;
   stop(): Promise<void>;
-  prepareRestart(): Promise<{ generationId: string }>;
-  restartAnywayFailed(error: Error): void;
-  getRestartStatus(): {
-    state: "running" | "preparing" | "paused" | "restoring";
-    generationId?: string;
-    error?: string;
-  };
+  prepareRestart(): Promise<RestartPreparation>;
+  getRestartStatus(): RestartStatus;
   getListenTarget(): ListenTarget | null;
   getServerId(): string;
 }
@@ -1570,13 +1593,19 @@ export async function createPaseoDaemon(
       assertWorkspaceAutomationAllowedForWorkspace(workspaceRegistry, workspaceId),
     globalServicePorts: loadPersistedConfig(config.paseoHome).worktrees?.servicePorts,
   });
+  const reportRestartFailure: RestartFailureReporter = (step, error) => {
+    logger.warn({ err: error, step }, "Restart step failed; continuing without it");
+  };
   const workspaceServiceRestoration = createWorkspaceServiceRestoration({
     runtimeStore: scriptRuntimeStore,
-    terminalManager,
     launch: (identity) => restartWorkspaceScripts.launch(identity),
+    report: reportRestartFailure,
   });
+  const emptyScheduleSnapshot = ScheduleRestartSnapshotSchema.parse({ runs: [] });
   const restartController = new RestartController({
     store: new CheckpointStore(config.paseoHome, DaemonCheckpointSchema.parse),
+    failed: reportRestartFailure,
+    ...resolveRestartTimeouts(config),
     changed: () => wsServer?.broadcastRestartStatus(),
     observerFailed: (error) => logger.error({ err: error }, "Failed to broadcast recovery status"),
     freeze: () => {
@@ -1585,71 +1614,144 @@ export async function createPaseoDaemon(
       return Promise.all([admissions, schedules]).then(() => undefined);
     },
     stop: async () => {
-      await agentManager.quiesceRestartExecution();
-      await workspaceSetupRuntime.drain();
-      await wsServer?.drainAgentRequests();
-      await pluginRuntime.prepareForRestart();
-      await drainFinishNotificationWatches(agentManager);
-      await scheduleService.snapshotForRestart();
-      await workspaceServiceRestoration.rollbackOrThrow();
+      const report = reportRestartFailure;
+      await attempt(report, "stop:agents", () => agentManager.quiesceRestartExecution(), undefined);
+      await attempt(report, "stop:setup", () => workspaceSetupRuntime.drain(), undefined);
+      await attempt(report, "stop:requests", () => wsServer?.drainAgentRequests(), undefined);
+      await attempt(report, "stop:plugins", () => pluginRuntime.prepareForRestart(), undefined);
+      await attempt(
+        report,
+        "stop:notifications",
+        () => drainFinishNotificationWatches(agentManager),
+        undefined,
+      );
+      await attempt(report, "stop:schedules", () => scheduleService.snapshotForRestart(), null);
     },
-    affectedAgentIds: () => agentManager.recoveryBlockedAgents(),
     initialize: () => scheduleService.initializeRecoveryState(),
-    capture: async () => ({
-      version: 4 as const,
-      agents: await agentManager.quiesceForRestart(),
-      notifications: snapshotFinishNotificationWatches(agentManager),
-      schedules: await scheduleService.snapshotForRestart(),
-      services: workspaceServiceRestoration.capture(),
-    }),
+    capture: async () => {
+      const report = reportRestartFailure;
+      // The agents carry the work to resume; without them the checkpoint has no purpose.
+      const agents = await agentManager.captureRestartCheckpoint();
+      const notifications = await attempt(
+        report,
+        "capture:notifications",
+        () => snapshotFinishNotificationWatches(agentManager),
+        [],
+      );
+      // The fallback keeps running runs owned: an empty snapshot would let the next boot fail
+      // them and archive their workspaces while their agents resume there.
+      const ownedSchedules =
+        (await attemptWithin(
+          report,
+          "capture:schedules",
+          RESTART_SCHEDULE_CAPTURE_TIMEOUT_MS,
+          () => scheduleService.snapshotForRestart(),
+          null,
+        )) ??
+        (await attemptWithin(
+          report,
+          "capture:schedules-fallback",
+          RESTART_SCHEDULE_CAPTURE_TIMEOUT_MS,
+          () => scheduleService.snapshotRunningRunsForRestart(),
+          emptyScheduleSnapshot,
+        ));
+      // A restored run waits for its agent's outcome; an agent that does not continue never
+      // publishes one, so its run would block the schedule forever.
+      const schedules = keepContinuingScheduleRuns(ownedSchedules, agents.agents);
+      const services = await attempt(
+        report,
+        "capture:services",
+        () => workspaceServiceRestoration.capture(),
+        [],
+      );
+      return { version: 4 as const, agents, notifications, schedules, services };
+    },
     install: async (snapshot) => {
-      await agentManager.installRestartCheckpoint(snapshot.agents);
-      workspaceServiceRestoration.install(snapshot.services);
-      scheduleService.restoreAfterRestart(snapshot.schedules);
-      await scheduleService.initializeRecoveryState();
-      for (const watch of snapshot.notifications)
-        restoreFinishNotificationWatch({ agentManager, agentStorage, logger }, watch);
+      const report = reportRestartFailure;
+      await attempt(
+        report,
+        "install:agents",
+        () => agentManager.installRestartCheckpoint(snapshot.agents),
+        undefined,
+      );
+      await attempt(
+        report,
+        "install:services",
+        () => workspaceServiceRestoration.install(snapshot.services),
+        undefined,
+      );
+      await attempt(
+        report,
+        "install:schedules",
+        () => scheduleService.restoreAfterRestart(snapshot.schedules),
+        undefined,
+      );
+      // Separate from the restore above, so recovery initialization runs once on every boot.
+      await attempt(
+        report,
+        "install:schedule-recovery",
+        () => scheduleService.initializeRecoveryState(),
+        undefined,
+      );
+      for (const watch of snapshot.notifications) {
+        await attempt(
+          report,
+          "install:watch",
+          () => restoreFinishNotificationWatch({ agentManager, agentStorage, logger }, watch),
+          undefined,
+        );
+      }
     },
     resume: async (snapshot) => {
-      scheduleService.restoreAfterRestart(snapshot.schedules);
-      await workspaceServiceRestoration.resume();
-      await agentManager.resumeRestartCheckpoint(snapshot.agents, () =>
-        scheduleService.resumeRestoredRuns(),
+      const report = reportRestartFailure;
+      await attempt(
+        report,
+        "resume:schedules",
+        () => scheduleService.restoreAfterRestart(snapshot.schedules),
+        undefined,
+      );
+      await attempt(
+        report,
+        "resume:services",
+        () => workspaceServiceRestoration.resume(),
+        undefined,
+      );
+      await attempt(
+        report,
+        "resume:agents",
+        () =>
+          agentManager.resumeRestartCheckpoint(snapshot.agents, () =>
+            scheduleService.resumeRestoredRuns(),
+          ),
+        undefined,
       );
     },
-    finalize: async () => {
-      await agentManager.finalizeRestartRestoration();
-      workspaceServiceRestoration.finalize();
-    },
+    finalize: () => agentManager.finalizeRestartRestoration(),
+    // Each part starts synchronously, so admissions open before `changed` publishes `running`.
     open: () => {
-      agentManager.openRestartAdmissions();
-      retryPendingFinishNotifications(agentManager);
-      scheduleService.resumeAfterRestartFailure();
+      const report = reportRestartFailure;
+      void attempt(
+        report,
+        "open:admissions",
+        () => agentManager.openRestartAdmissions(),
+        undefined,
+      );
+      void attempt(
+        report,
+        "open:notifications",
+        () => retryPendingFinishNotifications(agentManager),
+        undefined,
+      );
+      void attempt(
+        report,
+        "open:schedules",
+        () => scheduleService.resumeAfterRestartFailure(),
+        undefined,
+      );
     },
   });
   agentManager.bindRecoveryLifecycle(restartController);
-  const emergencyRestart = new EmergencyRestart({
-    home: config.paseoHome,
-    agentManager,
-    controller: restartController,
-    logger,
-    supported: config.restartAnywaySupported === true,
-    replace: config.onLifecycleIntent,
-  });
-  await emergencyRestart.installHistory(config.restartAnywayId);
-  const initializeScheduleRecovery = async () => {
-    try {
-      const checkpoint = await restartController.claim({
-        restartAnyway: config.restartAnywayId,
-      });
-      if (checkpoint) await restartController.install(checkpoint);
-      return checkpoint;
-    } catch (error) {
-      logger.error({ err: error }, "Restart recovery blocked; saved state retained");
-      return null;
-    }
-  };
-  let restartCheckpoint = await initializeScheduleRecovery();
+  const restartCheckpoint = await claimRestartCheckpoint(restartController, logger);
   agentManager.setAgentArchivedCallback(async (agentId) => {
     try {
       await scheduleService.completeForAgent(agentId);
@@ -1991,8 +2093,6 @@ export async function createPaseoDaemon(
                 externallyDispatched: previewIngress !== null,
                 startPaused: true,
                 getRestartStatus: () => restartController.status,
-                restartAnywaySupported: config.restartAnywaySupported === true,
-                restartAnywayId: config.restartAnywayId,
               },
               workspaceAutoName,
               daemonAuth,
@@ -2004,46 +2104,23 @@ export async function createPaseoDaemon(
               daemonVersion,
               async (intent) => {
                 if (intent.type === "restart") {
-                  if (intent.restartAnyway) return emergencyRestart.request(intent);
-                  if (intent.acknowledgeCrash) {
-                    if (!intent.acknowledgmentRequester)
-                      throw new Error(
-                        "Crash acknowledgment requires an attributed authenticated session",
-                      );
-                    await restartController.acknowledgeCrash(
-                      intent.acknowledgeCrash.generationId,
-                      intent.acknowledgeCrash.orphanExecutionReconciled,
-                      intent.acknowledgmentRequester,
-                    );
-                    const generationId = restartController.status.generationId;
-                    if (!generationId)
-                      throw new Error(
-                        "Crash acknowledgment completed without a successor generation",
-                      );
-                    return { generationId };
-                  }
-                  if (intent.retryRecovery) {
-                    await restartController.retryRecovery();
-                    const generationId = restartController.status.generationId;
-                    if (!generationId) throw new Error("Recovery completed without a generation");
-                    return { generationId };
-                  }
-                  if (!intent.prepareOnly && !config.onLifecycleIntent) {
+                  if (!config.onLifecycleIntent) {
                     throw new Error("No daemon replacement handler is configured");
                   }
-                  const checkpoint = await restartController.prepare();
-                  if (!intent.prepareOnly) {
-                    await restartController.replace(async () => {
-                      setImmediate(() => {
-                        try {
-                          config.onLifecycleIntent?.(intent);
-                        } catch (error) {
-                          logger.error({ err: error }, "Checkpoint ready but replacement failed");
-                        }
-                      });
+                  const replaceDaemon = config.onLifecycleIntent;
+                  await restartController.replace(() => {
+                    // Answer the requester before the replacement handler stops this worker.
+                    setImmediate(() => {
+                      void attempt(
+                        reportRestartFailure,
+                        "replace",
+                        () => replaceDaemon(intent),
+                        undefined,
+                      );
                     });
-                  }
-                  return { generationId: checkpoint.generationId };
+                  });
+                  const { generationId } = await restartController.prepare();
+                  return { generationId };
                 }
                 config.onLifecycleIntent?.(intent);
               },
@@ -2130,20 +2207,14 @@ export async function createPaseoDaemon(
       // model loading doesn't block the server from accepting connections.
       speechService.start();
       scriptHealthMonitor.start();
-      if (restartCheckpoint && restartController.status.state === "restoring") {
-        try {
-          const checkpoint = restartCheckpoint;
-          await restartController.restore(checkpoint);
-          // Installed owners retain histories and obligations; release legacy inline source copies.
-          restartCheckpoint = null;
-        } catch (error) {
-          restartCheckpoint = null;
-          logger.error(
-            { err: error },
-            "Restart restoration stopped or blocked; saved state retained",
-          );
-        }
-      }
+      if (restartCheckpoint) await restartController.restore(restartCheckpoint);
+      logger.info(
+        {
+          restoredGeneration: restartCheckpoint?.generationId ?? null,
+          state: restartController.status.state,
+        },
+        "Restart recovery ended",
+      );
     } catch (error) {
       localCredential = null;
       await deleteLocalCredential(config.paseoHome);
@@ -2230,9 +2301,6 @@ export async function createPaseoDaemon(
     serviceProxy,
     scriptRuntimeStore,
     browserToolsBroker,
-    restartAnywayFailed: (error: Error) => {
-      emergencyRestart.failed(error);
-    },
     prepareRestart: () => restartController.prepare(),
     getRestartStatus: () => restartController.status,
     start,

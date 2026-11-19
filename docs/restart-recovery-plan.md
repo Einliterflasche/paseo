@@ -1,226 +1,279 @@
 # Controlled restart recovery
 
-Status: controlled restart recovery has been deployed in the fork since 2026-09-16.
-Based on upstream `b8e24677e12b226c7c38c1c3a40649daa9f1152f`. Requirements are in
-[fork-requirements.md](fork-requirements.md). On 2026-09-16 Raphael accepted the
-controlled-restart limitation. The earlier Fable review covered the superseded
-continuous-journal proposal, not this implementation plan.
+The fork saves a restart checkpoint before a restart or a stop. The next boot restores it and
+resumes the interrupted agents. Requirements are in [fork requirements](fork-requirements.md).
+The fork has run restart recovery since 2026-09-16, with the best-effort policy since 2026-11-19.
 
-## Scope and result
+## Policy
 
-A controlled restart interrupts active agents, saves their display and pending
-work, replaces the daemon, and continues the same native sessions automatically.
-Start immediately; waiting for whole tasks to finish is not the default. Different
-continuations and repeated interrupted tools are acceptable. Dropped or reordered
-inputs and duplicate logical user messages are not.
+On 2026-11-19 Raphael removed every gate that blocked a restart, a stop, a boot, or a deployment.
+Saving and resuming stay, as best effort. The rules:
 
-Keep the existing supervisor, daemon, provider processes, and in-memory timeline
-stores. Add JSON checkpoints written once per controlled restart. No additional
-background process, database, continuous transcript writes, or persistent client
-outbox. Native files supply the model's execution context; checkpoints preserve
-Paseo's displayed history and continuation intent.
+- A restart, a stop, and a deployment always complete in bounded time.
+- A boot always ends in state `running`, with admissions open.
+- The daemon logs and skips a failed or slow step.
+- One failed agent, service, file, or schedule never stops the others.
+- The daemon never publishes a recovery error state.
 
-A graceful stop of a running daemon (SIGTERM to the supervisor, `systemctl stop`
-or `restart`, or a host shutdown that waits for the unit) commits a checkpoint
-first. A paused daemon may stop only when its prepared generation is ready.
-Failed checkpoints, checkpoint timeouts, and blocked or restoring recovery retain
-the daemon and block ordinary replacement. The supervisor and NixOS unit do not force-kill
-it after a deadline. Inspect the retained state and retry the checkpointed path.
-Unexpected crashes, SIGKILL, power loss, and client process death/reload are outside
-the guarantee. Updates must keep clients alive
-while they own unsent messages. Preparation depends on history size and provider
-shutdown; measure it rather than promise a fixed downtime.
+Do not add a step that waits for an operator or blocks on an uncertain result. The gates of the
+earlier design did not protect against a real failure. On 2026-11-17 the virtual machine was
+powered off about 3 seconds into a checkpoint save. The next boots found `ready.json` pointing to
+a used checkpoint, and the daemon stayed paused for about 19 hours. No provider failed to stop in
+that log window.
 
-## Ownership
+`restart/best-effort.ts` provides `attempt` and `attemptWithin`. Every hook of
+`restart/restart-controller.ts` runs through them. `bootstrap.ts` wraps each part of a hook
+separately, so one failed part does not skip the next part.
 
-`packages/server/src/server/restart/checkpoint-store.ts` owns validation and durable
-file writes. `restart-controller.ts` owns lifecycle state, admission, preparation,
-restoration failure, retry, and replacement. Keep agent execution state in
-`AgentManager`, notification state with its driver, and schedules with their service.
+## Stops that save a checkpoint
 
-User-facing operations are **restart** and **deploy**. Callers do not manually pair
-save, flush, stop, and start. Concurrent restart requests join the same preparation.
-Use a discriminated controller state:
+These stops save a checkpoint before the worker exits:
 
-```text
-running -> preparing -> ready(generation) -> replacing
-                \-> paused(error, retainedState) -> preparing on retry
+- A restart request, for example `paseo daemon restart`.
+- A shutdown request, for example `paseo daemon stop`.
+- SIGTERM or SIGINT to the supervisor.
 
-boot -> validate ready generation -> claim -> restoring -> running
+SIGTERM reaches the supervisor through `systemctl stop`, `systemctl restart`, a host shutdown, or
+the deployment wrapper. The unit sets `KillMode = "mixed"`, so only the supervisor receives SIGTERM.
+The supervisor then asks the worker to save the checkpoint and to stop its agents.
+
+A SIGKILL, a crash, or a power-off saves no checkpoint. [Limits](#limits) describes the result.
+
+`paseo daemon stop --force` sends SIGKILL after its `--timeout`. With `--force`, set a timeout
+above the checkpoint limit.
+
+## What a checkpoint saves
+
+A checkpoint is one JSON snapshot of the state that Paseo owns. The provider's native files supply
+the model's execution context. The snapshot contains:
+
+- Agent metadata and native session handles.
+- Raw timelines, child timelines, epochs, and sequences.
+- Accepted inputs that did not settle, in order, with their message IDs.
+- Finish-notification obligations.
+- Schedule ownership of the active runs whose agents the checkpoint saves for resume.
+- The workspace and script identity of each running managed service.
+
+Image bytes and inline attachments are part of the snapshot. Completed uploads stay under
+`PASEO_HOME/uploads`. The capture checks the referenced files and logs a missing file.
+
+A boot installs the saved history before it opens admissions. Then it resumes each agent that had
+unfinished work. The continuation goes through the `<paseo-system>` envelope with the interrupted
+input and every unsettled steer, in order. It keeps the original message IDs and user rows. The
+continuation row has its own identity, so it appears once. Never deduplicate by text. Two identical
+submissions stay two.
+
+The boot also restores schedules with their original run IDs and reattaches finish notifications.
+It relaunches managed services from their saved identities. Ordinary terminals and one-shot scripts
+are not restartable work. An explicitly stopped agent does not resume.
+
+An idle restored agent opens over its saved history. Opening it resumes the saved native session,
+because only a live session reports its modes and features. Opening never starts a fresh
+conversation.
+
+## Phases
+
+Clients read the phase from `server_info.restartRecoveryState` and the stage from
+`restartRecoveryStage`.
+
+| Phase       | Stage                    | Meaning                                                           |
+| ----------- | ------------------------ | ----------------------------------------------------------------- |
+| `running`   | none                     | Admissions are open.                                              |
+| `preparing` | `stopping`               | Admissions are frozen. Provider sessions stop.                    |
+| `preparing` | `checkpointing`          | The daemon captures and commits the snapshot.                     |
+| `paused`    | `ready`                  | Preparation ended, with or without a checkpoint.                  |
+| `paused`    | `replacing`              | The old worker waits for the supervisor to start its replacement. |
+| `restoring` | `installing`, `starting` | The new worker installs the checkpoint, then resumes its agents.  |
+
+`paused` never means an error. A failed checkpoint also reaches `paused` with stage `ready`, without
+a generation. `restartRecoveryGeneration` names the generation that was saved or restored.
+
+## Failures
+
+The daemon logs each failure as a warning with the step name. It then continues as follows.
+
+If a provider session fails to stop, the daemon logs the agent IDs and captures anyway. If the
+whole stop phase exceeds its limit, the daemon logs step `stop` and starts the capture. If accepted
+cancellations do not settle within the stop limit, the daemon logs step `controls` and continues.
+
+An agent with unfinished work but no native session handle cannot be saved. Nothing can resume it.
+Before the save, its timeline gets this error row, quoted from the code:
+`The restart interrupted this task before Paseo could save it. Send a message to continue it.`
+
+If the agent capture or the commit fails or exceeds the checkpoint limit, no checkpoint exists. The
+restart continues. The replacement starts without a checkpoint. A failed notification or service
+capture leaves that part empty and keeps the agents.
+
+A checkpoint keeps the scheduled runs whose agents it saves for resume, and leaves out the rest.
+A restored run waits for its agent's outcome. An agent that does not continue never sends one, so
+the schedule cannot tick, run, or be deleted. The next boot marks the omitted runs as failed, and
+their schedules stay usable.
+
+If the schedule capture fails or is slow, the checkpoint still lists the runs that the schedule
+store marks `running`, with the same filter. Without them, the next boot marks those runs as
+failed. It then archives their workspaces while their agents resume there.
+
+At boot, `loadAndClaim` can find a used, corrupt, or unreadable checkpoint. The daemon logs the
+reason as step `load`, marks that generation as used, and starts without it. [Single-use
+checkpoints](#single-use-checkpoints) gives the reason. When a user opens an agent, the agent loads
+its native history.
+
+If an agent's session resume fails or exceeds its limit, the daemon abandons that agent. Its run
+ends as `failed`. Its timeline gets this error row, quoted from the code:
+`Paseo could not resume this task after the restart. Send a message to continue it.` The other
+agents still resume.
+
+If the first event of a continuation does not arrive within the limit, the daemon logs it and
+continues with the next agent. That agent counts as resumed, and its continuation keeps running.
+
+Admissions can open before the resume reaches every agent, so a user can start new work first. If
+an agent already has newer work, it keeps that work. The daemon does not resume the saved task and
+writes no error row. Newer work is an active run or turn, or a run that settled after this boot.
+A client that opens an agent loads its session, so an open idle session is not newer work. That
+agent gets its continuation prompt on the open session.
+
+A restart or a stop can arrive during the boot restore. It does not wait for the restore. The resume
+stops, and the next checkpoint carries the agents that did not resume yet. This includes the agent
+that the resume worked on at that moment. A failed or late resume of that agent leaves it
+suspended. The worker can stop before it reported ready. The supervisor then still starts the
+replacement.
+
+If a managed service fails to relaunch, the daemon logs it and launches the next service.
+
+If restoration exceeds its limit, the boot opens admissions. The remaining resume work continues in
+the background.
+
+When the worker exits or its exit limit passes, the supervisor kills the worker's process tree with
+SIGKILL. If the worker still lives, the supervisor exits with code 1. On a restart, systemd then
+clears the service group and starts the service again, because the unit sets `Restart = "on-failure"`.
+
+## Time limits
+
+This section owns every restart and deployment limit. Other docs link here.
+
+| Limit                                    | Default | Covers                                                    | Set by                                    |
+| ---------------------------------------- | ------- | --------------------------------------------------------- | ----------------------------------------- |
+| `DEFAULT_SHUTDOWN_CHECKPOINT_TIMEOUT_MS` | 120 s   | Freeze, stop, capture, and commit.                        | `PASEO_SHUTDOWN_CHECKPOINT_TIMEOUT_MS`    |
+| `RESTART_STOP_TIMEOUT_MS`                | 30 s    | Freeze and provider stop. At most half the checkpoint.    | Constant                                  |
+| `RESTART_RESTORE_TIMEOUT_MS`             | 120 s   | Resume wait before a boot opens admissions.               | Constant                                  |
+| `SHUTDOWN_STOP_GRACE_MS`                 | 30 s    | `daemon.stop()` after the checkpoint.                     | Constant                                  |
+| `SHUTDOWN_CLEANUP_GRACE_MS`              | 25 s    | Service cgroup cleanup after the stop.                    | Constant                                  |
+| `RESTART_SCHEDULE_CAPTURE_TIMEOUT_MS`    | 10 s    | Schedule part of the capture.                             | Constant                                  |
+| `RESTART_RESUME_TIMEOUT_MS`              | 60 s    | Each agent's session resume and first continuation event. | `rescueTimeouts.restartResumeMs` in tests |
+| `resolveWorkerGracefulExitMs`            | 180 s   | Supervisor wait for the worker exit.                      | Checkpoint limit + 30 s + 25 s + 5 s      |
+| `WORKER_TERMINATION_GRACE_MS`            | 10 s    | Each supervisor kill, exit, and output wait.              | Constant                                  |
+| `TimeoutStopSec`                         | 240 s   | Whole `paseo.service` stop.                               | Checkpoint limit + 120 s                  |
+| `PASEO_DEPLOY_STOP_TIMEOUT`              | 300 s   | Deployment wrapper's `systemctl stop`.                    | Environment variable                      |
+| `PASEO_DEPLOY_READY_TIMEOUT`             | 300 s   | Deployment wrapper's wait for an answering daemon.        | Environment variable                      |
+| `paseo daemon restart --timeout`         | 600 s   | CLI wait for the replacement worker.                      | Option                                    |
+| `paseo daemon stop --timeout`            | 15 s    | CLI wait for the daemon exit.                             | Option                                    |
+
+The first five constants live in `packages/server/src/server/shutdown-checkpoint.ts`. The schedule
+limit lives in `bootstrap.ts`. The resume limit lives in `agent/agent-manager.ts`. The supervisor
+limit lives in `packages/server/scripts/supervisor.ts`.
+
+Keep the resume limit below `RESTART_RESTORE_TIMEOUT_MS`. Otherwise one slow agent can use the whole
+restore limit.
+
+The NixOS option `services.paseo.shutdownCheckpointTimeout` sets the checkpoint limit in seconds.
+It writes `PASEO_SHUTDOWN_CHECKPOINT_TIMEOUT_MS` and `TimeoutStopSec`. The worker and the supervisor
+derive their limits from that variable.
+
+`scripts/deploy-nixos.sh` also uses fixed limits:
+
+- 60 s for the stop after its SIGKILL.
+- 300 s for the system profile step.
+- 1800 s for the switch.
+- 120 s for the start of `paseo.service`.
+- 120 s for the start of `multi-user.target`.
+- 30 s for each status probe.
+
+With the defaults, the supervisor waits 180 s and systemd waits 240 s. The wrapper waits 300 s, so
+it kills only a stop that systemd did not end. If you raise `shutdownCheckpointTimeout` above 180,
+raise `PASEO_DEPLOY_STOP_TIMEOUT` above the new `TimeoutStopSec`.
+
+Measured on this VM, a save takes 0.5 to 18 s (median 5 s) for snapshots of 19 to 353 MB. A
+restore with agent resume takes 3 to 92 s (median 10 s).
+
+## Single-use checkpoints
+
+A boot writes `claimed.json` before it runs any recovered work. A claimed generation is never
+replayed. Without the marker, a crash after a restore replays the old checkpoint. That sends the
+continuation prompts again and overwrites newer work. A checkpoint that fails at every boot also
+causes a boot loop. The boot writes `restored.json` before it opens admissions.
+
+If a boot cannot load the ready checkpoint, `abandonReady` writes `claimed.json` for that
+generation. The boot then starts without the checkpoint and accepts new work. A later boot must
+never replay the old continuation prompts over that work. If the pointer or the generation
+directory is missing or unreadable, `abandonReady` does nothing. If a claim marker exists, it also
+does nothing.
+
+Never delete or rename the checkpoint files to force a replay.
+
+## Limits
+
+A crash, a SIGKILL, or a power-off loses everything that was not saved. The daemon then starts
+normally. Agents load their native history on demand, but nothing resumes automatically. Paseo-only
+rows and accepted inputs that were not saved can be lost.
+
+A resumed model can continue differently. An interrupted tool can run again. A repeated tool run is
+a new event in the timeline. A failed resume leaves an error row in that agent's timeline.
+
+## Check the result
+
+After a restart or a deployment, run `paseo daemon status` against the daemon's state directory:
+
+```sh
+paseo daemon status --home /home/agent/.local/state/paseo --json
 ```
 
-A failure closes admission and stops every session opened by the attempt while
-retaining listeners for late output and settlement. The daemon reports paused only
-after execution is confirmed stopped. Failed or uncertain teardown stays visibly
-blocked, with affected agents identified. An operator retry first rechecks stopping;
-it cannot capture or resume work until teardown and event drain are confirmed.
-While admission is closed, history reads use installed canonical state without starting
-provider sessions. Internal helpers return typed results; only the checkpoint store can
-produce readiness.
-Never report controlled recovery success after a failed save or silently force replacement.
+Read these fields:
 
-A retry operates on the current stopped inventory, including late output and agents
-that were never opened. `paseo daemon restart --retry-recovery` commits and claims
-a successor generation before continuing; it does not reinstall an older snapshot.
-Cancellation stays available during restoration and stopping, but is rejected once
-the immutable handoff is checkpointing, ready, or replacing. External effects of
-already executed tools cannot be undone by recovery.
+- `connectedDaemon`: `reachable` means that the daemon answers.
+- `recoveryState`: `running` means that admissions are open.
+- `restoredGeneration`: the restored checkpoint. A boot without a checkpoint omits it.
 
-## Explicit emergency replacement
+`paseo daemon restart` reports `checkpointRestored`. The value `true` means that the replacement
+restored the generation that this restart saved.
 
-On 2026-11-03 Raphael requested a remote escape when orderly recovery fails.
-The red host recovery banner offers `Restart anyway` to users with `daemon.manage` on supported hosts.
-Its confirmation explains possible loss of unsaved history and pending work.
-It also explains that saved tasks do not resume automatically and some tools can remain running.
-This explicit action sits outside the controlled restart guarantee.
-Ordinary restart, shutdown, and deployment keep their checkpoint guards.
+Then search the daemon log, `$PASEO_HOME/daemon.log`. The log rotates into dated files in the same
+directory.
 
-The app sends a separate `daemon.restart_anyway.request`, with the displayed error and generation.
-The daemon rejects an outdated error or a request against a healthy host.
-Concurrent requests join one emergency attempt.
-A request acknowledgment identifies the attempt, not successful recovery.
-The replacement reports that identity as `server_info.restartAnywayId` after reconnect.
-The app keeps its current session and does not reload.
-An interrupted send stops automatic retries when it observes a new emergency identity.
-It reports uncertain delivery rather than replaying an input against incomplete recovery state.
+```sh
+grep -E 'Shutdown checkpoint|Shutdown step failed|Restart checkpoint loaded|Starting without a restart checkpoint|Restart recovery|Restart step failed|Could not resume agent' \
+  /home/agent/.local/state/paseo/daemon.log
+```
 
-`restart/emergency-restart.ts` owns the escape and a separate attempt to save display history.
-It does not wait for checkpoint preparation, provider shutdown, or their failed promises.
-It allows one second for the separate history write before handing control to the supervisor.
-History export and JSON encoding still use the worker thread, so a completely frozen worker cannot accept this request.
-A write failure does not prevent replacement.
-Saved files under `PASEO_HOME/restart-anyway/` contain display history only.
-They carry no authority to replay inputs, notifications, schedules, or service launches.
-Late orderly callbacks cannot reopen admission or resume saved work after abandonment.
+| Message (`msg`)                                                                          | Meaning                                                                                   |
+| ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `Shutdown checkpoint committed; the next start restores it`                              | The old worker saved generation `generationId`.                                           |
+| `Shutdown checkpoint missing; stopping without it, agents will not resume automatically` | The old worker saved no checkpoint.                                                       |
+| `Shutdown step failed; continuing the stop`                                              | The old worker skipped a failed or slow `stop` or `cleanup`.                              |
+| `Restart checkpoint loaded; restoring after the listener starts`                         | The new worker claimed generation `generationId`.                                         |
+| `Starting without a restart checkpoint`                                                  | The new worker found no usable checkpoint.                                                |
+| `Restart step failed; continuing without it`                                             | Step `step` failed or ran out of time. `err` gives the reason.                            |
+| `Restart recovery resumed agents`                                                        | `resumed`, `superseded`, and `skipped` list agent IDs. `interrupted` marks a new restart. |
+| `Could not resume agent after the restart`                                               | The daemon abandoned agent `agentId`.                                                     |
+| `Restart recovery ended`                                                                 | Recovery is over. `restoredGeneration` is `null` without a checkpoint.                    |
 
-The worker advertises this action only when its supervisor declares support.
-This prevents a new worker from sending an ignored request to an older supervisor.
-The existing supervisor attempts to kill the worker and its observed descendants.
-An uncertain descendant cleanup does not prevent this explicit escape.
-The supervisor requires the worker itself to exit before it starts another worker.
-Processes outside its observed tree or signal authority can remain running.
-It closes inherited output pipes rather than waiting for unknown descendants to release them.
-If worker termination fails, the supervisor reports the error to the reachable worker for another attempt.
-An external shutdown of the supervisor takes precedence over an emergency restart.
-This action cannot complete or bypass an outstanding NixOS deployment.
+Report the resumed and the skipped agents to the user. A skipped agent continues after a new
+message. A superseded agent already had newer work, so the daemon did not resume its saved task.
 
-The supervisor passes the emergency identity to one replacement only.
-The worker removes it from its environment before it starts agent processes.
-That replacement bypasses checkpoint claiming and installs any readable rescued display history.
-It retains the current agent registry and loads native sessions when users open them.
-It does not resume old agent inputs, finish notifications, managed services, or scheduled runs.
-Persisted interrupted schedules follow the existing crash reconciliation rules.
-Existing checkpoint data and claim markers remain untouched.
-Before opening admission, the replacement marks an unclaimed ready generation as abandoned.
-This prevents an unrelated crash from replaying work from before the emergency.
-A failure to persist this marker leaves recovery paused.
-A corrupt ready pointer already blocks ordinary replay and remains untouched.
-If history rescue fails, native provider history remains available on demand.
-Paseo-only rows and unsaved accepted inputs can be lost.
+## Old clients
 
-A later orderly restart writes and restores a new checkpoint through the usual path.
-An unrelated crash receives no reusable emergency authorization.
-If the retained checkpoint is consumed or corrupt, ordinary boot stays visibly paused again.
-A dead supervisor, an unreachable host, or an unresponsive worker needs another route to the machine.
-Disk, permission, or bootstrap failures can still prevent startup.
-The button does not provide a guarantee against those failures.
+Old clients can still send the removed recovery operations. The daemon answers each one with an
+`rpc_error` with code `restart_operation_removed`. This covers a `restart_server_request` with
+`prepareOnly`, `retryRecovery`, or `acknowledgeCrash`, and a `daemon.restart_anyway.request`.
 
-## 1. Retain inputs and freeze admissions
+A plain `restart_server_request` still restarts the daemon. `server_info` keeps
+`features.restartRecovery`, `restartRecoveryState`, `restartRecoveryStage`,
+`restartRecoveryGeneration`, and `restartCheckpointFormat`. It no longer sends the recovery error,
+the emergency restart ID, or the affected agents. The protocol schemas keep those fields as optional
+fields. `COMPAT(restartRecoveryOperations)` in `session.ts` marks the shim for removal.
 
-Extend `agent/agent-run-state.ts` with serializable data alongside its existing
-promises. Capture each operation before provider dispatch: stable ID, original
-client message ID, acceptance order, full `AgentPromptInput` and attachments,
-queue/steer/replace intent, target attempt, run options, and execution state.
-Distinguish pending dispatch, active work, accepted steering, completion, explicit
-cancellation, and explicit replacement. Replacing work never deletes its input
-from the display. Internal inputs receive an ID once at admission.
+## Checkpoint files
 
-Do not serialize sessions, promises, or callbacks. The run owner releases settled
-payloads while their displayed rows remain. Native session handles and stored-agent
-configuration belong in the snapshot too.
-
-Own the admission gate inside `AgentManager`: cover `streamAgent`,
-`runSteerAdmission`/`recordAcceptedSteer`, and `tryRunOutOfBand`. Gate all of
-`replaceAgentRun` before it cancels the existing run. `streamAgent` registers a
-pending run synchronously, so a check only inside its generator is too late.
-Use private execution helpers rather than caller-managed begin/end calls or
-special recovery flags that every caller must remember.
-
-Apply the same phase check to create/resume, rewind, and configuration
-mutations affecting the snapshot. Explicit stop uses the controller's cancellation
-path. Resolve admitted operations; reject later ones
-before side effects. Schedule and agent-to-agent execution already reaches these
-manager paths. Ephemeral internal response-loop helpers are not user tasks to revive.
-
-## 2. Quiesce providers and other writers
-
-Add manager-owned `quiesceForRestart`, used only by the controller:
-
-1. Freeze admissions and scheduler ticks. Keep new internal notifications pending.
-   Resolve already-admitted handoffs and receipt writes without waiting for model
-   turns to finish. Do not send the client's whole queue through the harness.
-2. Capture continuation intent, then interrupt/close providers while subscriptions
-   remain attached. A real completion settles normally. Restart interruption
-   suspends work; it is not user cancellation or a child-finished event.
-3. Drain session-event tails, staged admission events, coalescers, and other
-   tracked writers. Snapshot stable stores before discarding runtime objects.
-
-Provider close must confirm execution stopped and drain final output before
-releasing its subscribers or resources. Keep that ownership after a failed attempt
-so retry can obtain fresh evidence; a second no-op close is not confirmation.
-SDK iterator cleanup can discard queued messages, so its ordering belongs in the
-provider adapter's shutdown contract tests.
-
-Process-tree shutdown covers the leader and descendants observed when close starts,
-and later descendants of surviving owned members. Retain their OS creation identities
-across failed attempts, verify those identities before signaling, and confirm every
-owned member stopped before accepting adapter output drain. An inspection failure
-keeps recovery blocked. If the first inspection finds an already-dead leader without
-an inventory, provider execution remains unconfirmed. A foreground turn result cannot
-prove that background tasks stopped. Only a completed one-shot command can justify
-ordinary post-mortem cleanup; EOF or a synthesized process-exit failure cannot.
-
-This inspection and signaling are separate operations, not atomic containment.
-Creation-identity checks reduce PID-reuse risk but leave a read-to-signal race; macOS
-process creation timestamps also have coarser precision than Linux start ticks.
-Descendants reparented outside the observed family before capture are outside the
-provider certificate. Starting a new process group or session alone does not escape
-traversal while the parent relationship remains owned.
-
-The NixOS service also owns a cgroup, the kernel group that contains its processes.
-After the checkpoint guard succeeds and the daemon stops, the worker clears remaining
-members of that exact group. It excludes itself and its supervisor. Cleanup sends
-SIGTERM first, waits ten seconds, then sends SIGKILL and waits ten seconds.
-It reads membership and creation identities before each signal. Failed inspection or
-uncertain termination blocks exit. A checkpoint failure or unexpected crash never
-enters this cleanup. Separate reads and signals retain the race described above.
-Agent subprocesses do not inherit the service cleanup setting.
-Windows Job Objects and containment for other launch paths require separate work.
-
-Bind completion obligations to the logical run, including across native-session
-replacement. Subscribe before dispatch so immediate completion cannot be missed.
-Record cancellation at the explicit stop initiator. Do not infer it from the final
-`idle` status or a free-text cancellation reason. Preserve whether a terminal event
-was genuine completion, explicit cancellation, or restart-induced interruption.
-
-Track out-of-band commands and worktree setup until their existing operations
-settle. `emitLiveTimelineItem` publishes provisional worktree output without a
-stored row; provider coalescer draining alone misses it. In the first version,
-wait for setup and its final canonical append before checkpoint commit. Do not
-make every provisional delta permanent or replay an uncertain slash command as a
-model prompt. A writer that cannot settle blocks preparation or reports failure,
-never permits replacement. This may extend preparation during workspace setup;
-it does not wait for an agent's entire task. Add no arbitrary timeout/history caps.
-
-## 3. Commit the snapshot
-
-Add snapshot/restore methods to `agent-timeline-store.ts` and
-`provider-subagents/store.ts`. Export raw rows, epochs, next sequences, timestamps,
-message IDs, provider correlations, and child descriptors/timelines. Include child
-timeline keys not yet associated with a descriptor. Do not snapshot a paginated
-or projected UI response.
-
-Use versioned JSON under `PASEO_HOME/restart-checkpoints/`:
+The store writes versioned JSON under `PASEO_HOME/restart-checkpoints/`:
 
 ```text
 <generation>/manifest.json
@@ -230,203 +283,49 @@ Use versioned JSON under `PASEO_HOME/restart-checkpoints/`:
 ready.json
 ```
 
-The manifest records the format version, generation ID, and snapshot checksum.
-One snapshot contains agent metadata/native handles, raw timelines and child
-timelines, unsettled inputs, notification obligations, and schedule ownership.
-A single file keeps the commit boundary small. Existing Zod schemas validate the
-whole generation before it can replace live state; incompatible versions fail closed.
+The manifest records the format version, the generation ID, and the snapshot checksum. The store
+flushes the generation files, then atomically replaces `ready.json`. It keeps older generations and
+has no retention sweep.
 
-Checkpoint format 4 also records the stable workspace/script identity of every
-running managed service. A successor validates those identities and relaunches the
-services before reopening mutation admission. If one launch fails, it stops only
-the service terminals created by that recovery attempt and retains the desired set
-for an explicit retry. Ordinary terminals and one-shot scripts are never inferred as
-restartable work.
+The store writes the snapshot as compact JSON, without indentation. V8 cannot build a string above
+about 512 MB, and the largest indented snapshot measured 353 MB. The readers accept both forms.
 
-Format 3 preserves owned text backings and range references, including rolling logs
-and edits within imported text. Formats 1 (inline strings) and 2 (shared leaves)
-retain their original readers. Older binaries must reject newer formats rather than
-restore empty placeholders. The deployment preflight and rollback requirements
-belong in [fork maintenance](fork-maintenance.md).
+The writer uses format 4. The readers accept formats 1 to 4:
 
-Image bytes and inline attachments are part of the snapshot. Completed file uploads
-already live under `PASEO_HOME/uploads` without expiry; checkpoint creation verifies
-the referenced file and size and flushes its bytes. Missing or incomplete files block
-replacement. Native resume reissues permission requests under the saved permission
-mode; the checkpoint never serializes a callback or grants approval.
+| Format | Adds                                                        |
+| ------ | ----------------------------------------------------------- |
+| 1      | Inline strings.                                             |
+| 2      | Shared text leaves.                                         |
+| 3      | Owned text backings and range references.                   |
+| 4      | Stable workspace and script identities of managed services. |
 
-The store writes and flushes files, writes and flushes the manifest and generation
-directory, then atomically replaces and flushes `ready.json` and its parent directory.
-`atomic-file.ts` currently provides rename without this durability barrier. Errors
-propagate; preserve prior generations. Flush required registry, receipt, and schedule
-writes and verify native handles before readiness. Do not swallow flush failures.
+A package that cannot read the current format starts without the checkpoint. Its agents do not
+resume.
 
-Carry forward restored histories even when their agents were not reopened. Use
-current registry state for their lifecycle; an old checkpoint must not resurrect a
-deleted agent or undo an archive. Add no retention, expiry, or automatic deletion.
+## Client sends during a restart
 
-At boot, validate then write/flush `claimed.json` before executing any recovered
-or new work. Write/flush `restored.json` before reopening ordinary admissions.
-Keep the ready pointer and claim after completion: later accepted work makes that
-snapshot unsafe to replay after an unrelated crash. A consumed, incomplete, corrupt,
-or incompatible generation leaves the listener reachable with execution and schedule
-recovery paused. The app shows the host, error, and generation on startup and workspace
-screens. Do not silently substitute native history or clear the pointer to bypass the
-failure. Preserve the files and reconcile later work before
-[deliberate crash recovery](fork-maintenance.md#deliberate-recovery-after-an-unexpected-crash).
-A crash during restoration remains outside the controlled-restart guarantee.
+While admissions are frozen, the daemon rejects a mutation with the RPC error `restart_in_progress`
+before any side effect. `packages/client/src/daemon-client.ts` keeps the payload and the message ID
+of `sendAgentMessage` and sends it again after the reconnect. Each attempt uses a fresh request ID.
+The receipt store in `agent/requests/index.ts` matches the message ID and fingerprint, so a retry
+after a lost acknowledgment returns the first outcome.
 
-## 4. Restore work and its completion obligations
+The app passes the queue item's ID through dispatch. `runtime/host-runtime.ts` keeps the queue until
+the restored agent permits it to drain. Validation errors and payload conflicts stay terminal.
 
-In `bootstrap.ts`, install saved stores and recovery ownership before admissions,
-client queue draining, and schedule recovery. Start the listener without waiting
-for every provider to launch. Expose restoring/paused state so an intermediate
-`idle` cannot trigger client queue delivery.
+## Validation
 
-Use `ensureAgentLoaded` and existing native resume with the saved handles. Seed
-exact epochs/sequences and set `historyPrimed` for checkpoint-owned history;
-`agent-loading.ts` must not force native hydration over it. Agents without a
-checkpoint retain native loading. Restoration resumes only continued work. After the
-daemon is running, opening an idle restored agent resumes its saved native session,
-because only a live session reports its modes and features. Opening never starts a
-first session. An agent without a saved native session shows only its installed history.
-Codex and Claude read the whole native transcript on resume. They keep that parsed copy
-while a restored session stays open, because checkpoint history replaces native replay.
-An unusable native session leaves its saved history and blocked task visible. Never
-silently create a fresh conversation.
+| Test                                         | Evidence                                                                                                                          |
+| -------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `controlled-restart.e2e.test.ts`             | Two real process replacements keep the saved history prefix and epoch, never duplicate a send, and never revive an explicit stop. |
+| `recovery-never-blocks.e2e.test.ts`          | A boot with a used or corrupt checkpoint reaches `running` and replays nothing.                                                   |
+| `controlled-restart-reconnect.e2e.test.ts`   | A live SDK client holds a frozen send, reconnects, and dispatches its original message ID once.                                   |
+| `controlled-restart-obligations.e2e.test.ts` | A suspended child sends no false completion and notifies its parent once after recovery.                                          |
+| `controlled-restart-schedule.e2e.test.ts`    | An active scheduled run keeps its run ID through two restarts and completes once.                                                 |
+| `controlled-restart-service.e2e.test.ts`     | A running workspace service is relaunched after the restart.                                                                      |
+| `controlled-restart.real.e2e.test.ts`        | Real Claude, Codex, and Pi resume their original native sessions after an interrupted shell tool call.                            |
+| `scripts/deploy-nixos.test.mjs`              | A failed build stops nothing, and activation always starts the service again.                                                     |
 
-Continue interrupted attempts through the existing `<paseo-system>` envelope,
-including the active input and all unsettled accepted steers in order. Keep the
-original logical IDs and user rows. Record the continuation with its own message
-identity and Paseo attribution. Correlate its provider echo by identity so it
-appears once. The app collapses that row by default. Never deduplicate by text.
-Two independent identical submissions remain two. A repeated real tool execution is a new event.
-Dispatch pending operations with their original queue/steer/replace semantics.
-Restore active work before permitting a client queue to drain.
-
-Check provider-child replay separately from top-level hydration. Use native
-identities or explicitly suppress historical replay on checkpoint resume; do not
-append old child history over a snapshot or guess duplicates by text.
-
-In `agent-prompt.ts`, turn `setupFinishNotification` closure state into records:
-watch ID, parent/child IDs, ownership rule, observed run, notified permission IDs,
-and pending notification identity/payload. Keep delivery pending until parent
-admission is confirmed; the current terminal `stopped` flag and log-and-drop catch
-are insufficient. Reattach subscriptions before children run. Restart suspension
-must not emit a false completion. An already-finished child with an undelivered
-obligation still notifies once.
-
-In `schedule/service.ts`, retain original schedule/run/agent/workspace IDs and
-manual-run/cadence context. Exclude checkpoint-owned runs from
-`recoverInterruptedRuns`, which currently fails them at boot. Reattach completion
-to `finishRun` for the original run. Typed restart suspension bypasses shutdown
-failure and workspace archival. Do not create a replacement scheduled run or agent.
-
-## 5. Preserve client sends across reconnect
-
-Extend `agent/requests/index.ts`, the existing receipt store. Match message ID and
-fingerprint; a retry after a lost acknowledgement returns the completed outcome.
-A frozen-admission rejection must occur before writing a pending receipt or write
-an explicit known-not-dispatched state that permits retry. Unknown provider effect
-is not rejection; do not blindly replay every pending receipt. Before ready, wait
-for admitted send handlers and their receipt writes.
-
-In `packages/client/src/daemon-client.ts`, let `sendAgentMessage` retain its payload
-and message ID across transport attempts, using a fresh wire request ID each time.
-Retry reconnect/restart-in-progress failures with the existing connection policy.
-Do not replay arbitrary RPC mutations. Validation errors and ID/payload conflicts
-remain terminal; disconnection alone must not reject the optimistic message.
-
-In `packages/app/src/composer/actions.ts`, pass the queue item's existing ID through
-dispatch instead of generating another. Retain encoded attachments until a definite
-outcome. In `runtime/host-runtime.ts`, defer queue draining until the restored agent
-permits it. Preserve `session-store.ts`'s existing live queue across reconnect.
-
-Add an optional restart-recovery capability and preparation/restoration status in
-`packages/protocol/src/messages.ts`. Use typed RPC errors for retryable rejection;
-keep the successful send response compatible. Gate new behavior on the capability
-and regenerate protocol validators through the existing script.
-
-## 6. Connect restart and Nix deployment
-
-For app/RPC restart, await checkpoint readiness before `daemon-worker.ts` sends
-`paseo:restart`. Return preparation errors to the caller. Worker and supervisor
-shutdown timers start only after readiness. Move plugin/provider teardown in
-`bootstrap.ts` after checkpointing; currently it starts before agent closure.
-
-Change CLI `daemon/restart.ts` to use this operation instead of SIGTERM followed by
-automatic forced stop on timeout. A running old daemon without the capability
-reports unsupported; an unreachable running daemon is not automatically killed.
-Explicit force remains outside the guarantee. A stopped daemon can start normally.
-
-Use the CLI-owned `daemon deploy --target-cli <replacement-paseo> -- <activation argv>` operation and the
-`scripts/deploy-nixos.sh` wrapper:
-
-1. Build/validate the immutable fork package and system closure while agents run.
-2. Check the immutable target's readable formats before preparation. Prepare the
-   old daemon's checkpoint, then have the target validate that exact ready
-   generation offline, without claiming it. Keep the old daemon paused.
-3. Only after validation, run the built closure's `switch-to-configuration switch`
-   with the operator's normal sudo access. Execute an argument array, not a shell
-   string. The daemon never runs privileged commands.
-4. Wait for the replacement daemon to report restoration of that generation.
-   Surface failures; serialize deployments and allow retry of a paused attempt.
-
-Run the finite deployment command outside `paseo.service`'s process group using
-the VM's existing detached `systemd-run` convention. This is not a resident process.
-Systemd/Nix stop timers then run after the checkpoint is secure. Increasing
-`TimeoutStopSec`, or failing an `ExecStop`, cannot alone abort a systemd restart.
-Raw signals, `systemctl restart`, and uncoordinated `nixos-rebuild switch` checkpoint
-a running daemon at stop, but they skip target validation and this ordering, so they
-are not the deployment entrypoint. The command owns preparation plus activation;
-the user never performs a two-command handoff.
-
-The initial handover from upstream is complete. Subsequent updates use the running
-fork's checkpoint path and preserve the packaging overrides in
-[fork-maintenance.md](fork-maintenance.md). A package without checkpoint support
-cannot participate in this update path.
-
-## Validation and rollout
-
-Keep the changes as `fork patch:` commits above the upstream base: snapshot storage,
-client/protocol support, daemon recovery, and restart/deployment operations. Their tests belong
-with the behavior they verify.
-
-The focused validation gates cover these boundaries:
-
-| Test                                         | Evidence                                                                                                                                                                                                                                                         |
-| -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `controlled-restart.e2e.test.ts`             | Real daemon process replacement twice on the same state and port; exact saved history prefix and epoch; unopened history survives; duplicate send does not dispatch; explicit stop does not resume; failed commit leaves the old daemon alive.                   |
-| `recovery-blocked.e2e.test.ts`               | A crash after restoration and newer work leaves a reachable paused daemon; no old dispatch, native history hydration, schedule mutation, or checkpoint rewrite. Corrupt ready state stays visible without a worker boot loop.                                    |
-| `controlled-restart-reconnect.e2e.test.ts`   | One live SDK client holds a frozen send, reconnects automatically, and dispatches its original message ID once. No dispatch occurs while paused.                                                                                                                 |
-| `controlled-restart-obligations.e2e.test.ts` | A child sends no false completion while suspended, notifies its parent once after recovery, and does not notify again after a second restart.                                                                                                                    |
-| `controlled-restart-schedule.e2e.test.ts`    | An active scheduled task keeps its original run ID through two restarts, completes once, and is never falsely failed or archived.                                                                                                                                |
-| `controlled-restart.real.e2e.test.ts`        | Real Claude, Codex, and Pi are interrupted inside a shell tool call and resume their original native session after a fresh daemon boot. Saved prefixes and epochs remain, retried user IDs do not duplicate, and a separately stopped active tool stays stopped. |
-| `deploy-activation.e2e.test.ts`              | CLI deployment uses real sockets and an activation subprocess to replace an isolated daemon. The replacement reports the prepared generation. Mismatched generations and failed checkpoint commits never touch the old process.                                  |
-| `scripts/deploy-nixos.test.mjs`              | Shell command ordering with substituted executables: build failure never prepares a restart; activation preserves exact argv; the complete operation runs outside the daemon's process group.                                                                    |
-
-Targeted manager/store/controller/client/app/provider/schedule tests cover sequence and
-attachment round trips, identical but distinct ordered inputs at every cut in a short
-message sequence, late close output, stale turn events, lost acknowledgements, stable
-retry payloads, stopped work, scheduled run ownership, frozen admissions, notification
-capture, corrupt manifests, concurrent claims, failed writes and fsync, and refusal to
-replace partially restored state. Repository typecheck, lint, formatting, and the server/CLI
-build also run before committing. Checkpoint generations are retained; no retention
-sweep is introduced.
-
-Run tests from their workspace to use that workspace's Vitest configuration. The real Pi
-run on this VM used `PI_REAL_TEST_MODEL=openrouter/z-ai/glm-5.3-flash`, matching the
-operator's configured model; the shared provider-test helper's automatic default did not
-select the configured backend. Native provider tests require the normal operator setup
-and fail visibly when it is unavailable.
-
-The isolated activation subprocess tests process replacement; it does not validate
-the Nix package. Before production rollout, build the immutable Nix package and
-validate the source-format handoff using isolated state and a separate port. Follow
-[fork-maintenance.md](fork-maintenance.md) for activation and generation verification.
-Benchmark large histories before promising a preparation time. Permission prompts retain their provider
-policy and must be reissued by the native provider; the real-provider tests above use
-unattended permission modes and do not verify an interactive approval across restart.
-
-Deferred features remain wait-until-idle restart, unexpected-crash recovery, persistent
-client outbox, shared multi-device queue, and a checkpoint-management UI.
+Run each test from its workspace. The real Pi run on this VM used
+`PI_REAL_TEST_MODEL=openrouter/z-ai/glm-5.3-flash`. The real-provider tests use unattended permission
+modes. They do not test an interactive approval across a restart.

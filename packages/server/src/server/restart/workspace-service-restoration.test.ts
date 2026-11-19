@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { WorkspaceScriptRuntimeStore } from "../workspace-script-runtime-store.js";
-import { WorkspaceServiceRestoration } from "./workspace-service-restoration.js";
+import type { WorkspaceServiceIdentity } from "./workspace-service-checkpoint.js";
+import {
+  WorkspaceServiceRelaunchError,
+  WorkspaceServiceRestoration,
+} from "./workspace-service-restoration.js";
 
 describe("WorkspaceServiceRestoration", () => {
   it("captures only running services with stable ordering", () => {
@@ -30,11 +34,7 @@ describe("WorkspaceServiceRestoration", () => {
       exitCode: null,
     });
 
-    const owner = new WorkspaceServiceRestoration(
-      runtime,
-      vi.fn(),
-      vi.fn(async () => undefined),
-    );
+    const owner = new WorkspaceServiceRestoration(runtime, vi.fn(), vi.fn());
 
     expect(owner.capture()).toEqual([
       { workspaceId: "workspace-a", scriptName: "api" },
@@ -42,61 +42,62 @@ describe("WorkspaceServiceRestoration", () => {
     ]);
   });
 
-  it("rolls back partial restoration while retaining retry intent", async () => {
-    const runtime = new WorkspaceScriptRuntimeStore();
-    const launch = vi
-      .fn()
-      .mockResolvedValueOnce({ terminalId: "terminal-api" })
-      .mockRejectedValueOnce(new Error("web failed"))
-      .mockResolvedValueOnce({ terminalId: "terminal-api-retry" })
-      .mockResolvedValueOnce({ terminalId: "terminal-web-retry" });
-    const stopTerminal = vi.fn(async () => undefined);
-    const owner = new WorkspaceServiceRestoration(runtime, launch, stopTerminal);
+  it("reports a failed launch as step service, skips it, and launches the other services", async () => {
+    const launchFailure = new Error("web failed");
+    const launch = vi.fn(async (identity: WorkspaceServiceIdentity) => {
+      if (identity.scriptName === "web") throw launchFailure;
+      return { terminalId: `terminal-${identity.scriptName}` };
+    });
+    const failures: { step: string; error: unknown }[] = [];
+    const owner = new WorkspaceServiceRestoration(
+      new WorkspaceScriptRuntimeStore(),
+      launch,
+      (step, error) => {
+        failures.push({ step, error });
+      },
+    );
     const snapshot = [
       { workspaceId: "workspace-a", scriptName: "api" },
       { workspaceId: "workspace-b", scriptName: "web" },
+      { workspaceId: "workspace-c", scriptName: "worker" },
     ];
 
     owner.install(snapshot);
-    await expect(owner.resume()).rejects.toThrow("web failed");
-    expect(stopTerminal).toHaveBeenCalledWith("terminal-api");
-    expect(owner.capture()).toEqual(snapshot);
+    await expect(owner.resume()).resolves.toBeUndefined();
 
-    await owner.resume();
-    expect(launch).toHaveBeenCalledTimes(4);
-    owner.finalize();
-    expect(owner.capture()).toEqual([]);
+    expect(launch.mock.calls).toEqual(snapshot.map((identity) => [identity]));
+    expect(failures).toHaveLength(1);
+    expect(failures[0]!.step).toBe("service");
+    expect(failures[0]!.error).toBeInstanceOf(WorkspaceServiceRelaunchError);
+    expect(failures[0]!.error).toMatchObject({
+      identity: { workspaceId: "workspace-b", scriptName: "web" },
+      cause: launchFailure,
+    });
   });
 
-  it("retains a failed rollback owner and blocks duplicate launch until cleanup succeeds", async () => {
-    const launch = vi
-      .fn()
-      .mockResolvedValueOnce({ terminalId: "owned-api" })
-      .mockRejectedValueOnce(new Error("web failed"))
-      .mockResolvedValue({ terminalId: "retry" });
-    const stop = vi
-      .fn()
-      .mockRejectedValueOnce(new Error("native stop unconfirmed"))
-      .mockResolvedValue(undefined);
-    const owner = new WorkspaceServiceRestoration(new WorkspaceScriptRuntimeStore(), launch, stop);
-    owner.install([
-      { workspaceId: "w", scriptName: "api" },
-      { workspaceId: "w", scriptName: "web" },
-    ]);
-    await expect(owner.resume()).rejects.toThrow("restoration and rollback failed");
-    await expect(owner.resume()).rejects.toThrow("already owns launched terminals");
-    expect(launch).toHaveBeenCalledTimes(2);
-    await owner.rollbackOrThrow();
-    expect(stop.mock.calls).toEqual([["owned-api"], ["owned-api"]]);
-    await owner.resume();
-    expect(launch).toHaveBeenCalledTimes(4);
+  it("captures the installed services until resume ends, then the running services", async () => {
+    const launched = Promise.withResolvers<{ terminalId: string }>();
+    const owner = new WorkspaceServiceRestoration(
+      new WorkspaceScriptRuntimeStore(),
+      () => launched.promise,
+      vi.fn(),
+    );
+    const snapshot = [{ workspaceId: "workspace-a", scriptName: "api" }];
+
+    owner.install(snapshot);
+    const resuming = owner.resume();
+    expect(owner.capture()).toEqual(snapshot);
+    launched.resolve({ terminalId: "terminal-api" });
+    await resuming;
+
+    expect(owner.capture()).toEqual([]);
   });
 
   it("rejects duplicate checkpoint identities before launching", () => {
     const owner = new WorkspaceServiceRestoration(
       new WorkspaceScriptRuntimeStore(),
       vi.fn(),
-      vi.fn(async () => undefined),
+      vi.fn(),
     );
 
     expect(() =>

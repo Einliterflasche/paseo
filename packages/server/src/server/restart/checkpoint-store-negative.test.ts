@@ -8,7 +8,7 @@ import { CheckpointStore } from "./checkpoint-store.js";
 import { AgentTimelineSnapshotSchema } from "../agent/agent-timeline-store.js";
 import { RestartController } from "./restart-controller.js";
 
-test("a snapshot fsync failure cannot publish readiness or invoke replacement", async () => {
+test("a snapshot fsync failure keeps the previous ready pointer and still invokes replacement", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-fsync-failure-"));
   const store = new CheckpointStore(home, z.string().parse);
   const previous = await store.commit("prior retained checkpoint");
@@ -20,16 +20,26 @@ test("a snapshot fsync failure cannot publish readiness or invoke replacement", 
     }
     return handle;
   });
+  const failures: { step: string; error: unknown }[] = [];
   const replace = vi.fn();
-  const controller = new RestartController({ store, capture: async () => "new checkpoint" });
+  const controller = new RestartController({
+    prepareTimeoutMs: 60_000,
+    stopTimeoutMs: 30_000,
+    restoreTimeoutMs: 60_000,
+    failed: (step, error) => {
+      failures.push({ step, error });
+    },
+    store,
+    capture: async () => "new checkpoint",
+  });
   try {
-    await expect(controller.replace(replace)).rejects.toThrow("injected fsync failure");
-    expect(replace).not.toHaveBeenCalled();
-    expect(controller.status.state).toBe("paused");
-    expect(await store.peekStatus()).toEqual({
-      generationId: previous.generationId,
-      claimed: false,
-    });
+    await controller.replace(replace);
+    expect(replace).toHaveBeenCalledWith({});
+    expect(failures).toMatchObject([
+      { step: "checkpoint", error: { message: "injected fsync failure" } },
+    ]);
+    expect(controller.status).toEqual({ state: "paused", stage: "replacing" });
+    expect(await store.loadAndClaim()).toEqual(previous);
   } finally {
     spy.mockRestore();
   }
@@ -85,7 +95,9 @@ test.each([{ version: 999 }, { generationId: "another-generation" }])(
     const manifest = JSON.parse(await readFile(file, "utf8"));
     await writeFile(file, JSON.stringify({ ...manifest, ...change }));
     await expect(store.loadAndClaim()).rejects.toMatchObject({ reason: "manifest_corrupt" });
-    expect(await store.peekStatus()).toEqual({ generationId, claimed: false });
+    await expect(
+      fs.access(join(home, "restart-checkpoints", generationId, "claimed.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
   },
 );
 

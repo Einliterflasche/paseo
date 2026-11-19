@@ -69,6 +69,7 @@ import type { WorkspaceScriptRuntimeStore } from "./workspace-script-runtime-sto
 import type { SpeechReadinessSnapshot, SpeechService } from "./speech/speech-runtime.js";
 import type { VoiceCallerContext, VoiceSpeakHandler } from "./voice-types.js";
 import { CURRENT_CHECKPOINT_FORMAT } from "./restart/daemon-checkpoint.js";
+import type { RestartStatus } from "./restart/restart-controller.js";
 import {
   computeNotificationPlan,
   isPushEligibleAttentionReason,
@@ -181,16 +182,7 @@ interface WebSocketServerConfig {
   daemonStatusRpc?: boolean;
   relayConfig?: boolean;
   startPaused?: boolean;
-  restartAnywaySupported?: boolean;
-  restartAnywayId?: string;
-  getRestartStatus?: () => {
-    state: "running" | "preparing" | "paused" | "restoring";
-    generationId?: string;
-    error?: string;
-    stage?: import("./restart/restart-controller.js").RestartStage;
-    previousGenerationId?: string;
-    affectedAgentIds?: string[];
-  };
+  getRestartStatus?: () => RestartStatus;
 }
 
 type WebSocketRuntimeMetrics = SessionRuntimeMetrics & CheckoutDiffMetrics;
@@ -612,8 +604,6 @@ export class VoiceAssistantWebSocketServer {
   private readonly workspaceSetupRuntime: WorkspaceSetupRuntime;
   private readonly providerSnapshotManager: ProviderSnapshotManager;
   private onLifecycleIntent!: SessionLifecycleHandler | null;
-  private restartAnywaySupported = false;
-  private restartAnywayId: string | undefined;
   private onBranchChanged!:
     | ((workspaceId: string, oldBranch: string | null, newBranch: string | null) => void)
     | null;
@@ -722,8 +712,6 @@ export class VoiceAssistantWebSocketServer {
     this.advertiseDaemonStatusRpc = wsConfig.daemonStatusRpc !== false;
     this.advertiseRelayConfig = wsConfig.relayConfig !== false;
     this.previewBroker = wsConfig.previewBroker ?? null;
-    this.restartAnywaySupported = wsConfig.restartAnywaySupported ?? false;
-    this.restartAnywayId = wsConfig.restartAnywayId;
     this.getRestartStatus = wsConfig.getRestartStatus;
     this.connectionLifecycle = wsConfig.startPaused === true ? "starting" : "accepting";
     this.serverId = serverId;
@@ -1543,19 +1531,7 @@ export class VoiceAssistantWebSocketServer {
         }
         return maxBuffered;
       },
-      onLifecycleIntent: (intent) =>
-        this.onLifecycleIntent?.(
-          intent.type === "restart" && (intent.acknowledgeCrash || intent.restartAnyway)
-            ? {
-                ...intent,
-                acknowledgmentRequester: {
-                  principalId: admission.principalId,
-                  clientId,
-                  sessionId: session.getSessionId(),
-                },
-              }
-            : intent,
-        ),
+      onLifecycleIntent: (intent) => this.onLifecycleIntent?.(intent),
       hubExecutionAgents: admission.hubExecutionAgents,
       hubRelationships: this.hubRelationships ?? undefined,
     });
@@ -1937,19 +1913,16 @@ export class VoiceAssistantWebSocketServer {
       source && this.previewSources?.capture(source as WebSocketLike)
         ? this.previewBroker?.describe()
         : undefined;
+    const restartStatus = this.getRestartStatus?.();
     return {
       status: "server_info",
       protocolVersion: WS_PROTOCOL_VERSION,
       ...(previews ? { servicePreviews: previews } : {}),
-      ...(this.getRestartStatus
+      ...(restartStatus
         ? {
-            restartAnywayId: this.restartAnywayId,
-            restartRecoveryState: this.getRestartStatus().state,
-            restartRecoveryGeneration: this.getRestartStatus().generationId,
-            restartRecoveryError: this.getRestartStatus().error,
-            restartRecoveryStage: this.getRestartStatus().stage,
-            restartRecoveryPreviousGeneration: this.getRestartStatus().previousGenerationId,
-            restartRecoveryAffectedAgents: this.getRestartStatus().affectedAgentIds,
+            restartRecoveryState: restartStatus.state,
+            restartRecoveryGeneration: restartStatus.generationId,
+            restartRecoveryStage: restartStatus.stage,
             restartCheckpointFormat: CURRENT_CHECKPOINT_FORMAT,
           }
         : {}),
@@ -1964,13 +1937,10 @@ export class VoiceAssistantWebSocketServer {
       features: {
         usageSources: true,
         ownedSubscriptions: true,
-        ...(this.restartAnywaySupported ? { restartAnyway: true } : {}),
         agentRequestReceipts: true,
         workspaceRequestReceipts: true,
         creationLifecycle: true,
-        ...(this.getRestartStatus
-          ? { restartRecovery: true, restartRecoveryRetry: true, restartCrashAcknowledgment: true }
-          : {}),
+        ...(restartStatus ? { restartRecovery: true } : {}),
         hubAgentRpc: true,
         // COMPAT(directorySync): added in v0.3.x, remove gate after 2027-02-12.
         directorySync: true,

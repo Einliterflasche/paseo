@@ -1,13 +1,15 @@
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test, vi } from "vitest";
+import { describe, expect, test } from "vitest";
 import { z } from "zod";
+import { RestartStepTimeoutError } from "./restart/best-effort.js";
 import { CheckpointStore } from "./restart/checkpoint-store.js";
 import { RestartController } from "./restart/restart-controller.js";
 import {
   DEFAULT_SHUTDOWN_CHECKPOINT_TIMEOUT_MS,
   SHUTDOWN_CHECKPOINT_TIMEOUT_ENV,
+  SHUTDOWN_CLEANUP_GRACE_MS,
   SHUTDOWN_STOP_GRACE_MS,
   resolveShutdownCheckpointTimeoutMs,
   resolveWorkerGracefulExitMs,
@@ -15,46 +17,84 @@ import {
   type ShutdownCheckpointDaemon,
 } from "./shutdown-checkpoint.js";
 
-function createLogger() {
-  return { info: vi.fn(), warn: vi.fn() };
+interface LoggedLine {
+  level: "info" | "warn";
+  fields: Record<string, unknown>;
+  message: string;
 }
 
-function createDaemon(
-  status: ReturnType<ShutdownCheckpointDaemon["getRestartStatus"]>,
-  prepare: () => Promise<{ generationId: string }>,
-) {
+function createLogger() {
+  const lines: LoggedLine[] = [];
+  return {
+    lines,
+    warnings: () => lines.filter((line) => line.level === "warn"),
+    info(fields: Record<string, unknown>, message: string) {
+      lines.push({ level: "info", fields, message });
+    },
+    warn(fields: Record<string, unknown>, message: string) {
+      lines.push({ level: "warn", fields, message });
+    },
+  };
+}
+
+function createDaemon(options: {
+  prepare: () => Promise<{ generationId?: string }>;
+  stop?: () => Promise<void>;
+}) {
   const calls: string[] = [];
   const daemon: ShutdownCheckpointDaemon = {
-    getRestartStatus: () => status,
-    prepareRestart: vi.fn(() => {
+    prepareRestart: () => {
       calls.push("prepare");
-      return prepare();
-    }),
-    stop: vi.fn(async () => {
+      return options.prepare();
+    },
+    stop: async () => {
       calls.push("stop");
-    }),
+      await options.stop?.();
+    },
+  };
+  return { daemon, calls };
+}
+
+const MessageSchema = z.object({ message: z.string() });
+
+function createController(home: string) {
+  return new RestartController({
+    store: new CheckpointStore(home, MessageSchema.parse),
+    capture: async () => ({ message: "retained" }),
+    failed: () => {},
+    prepareTimeoutMs: 5_000,
+    stopTimeoutMs: 1_000,
+    restoreTimeoutMs: 1_000,
+  });
+}
+
+function controllerDaemon(controller: RestartController<z.infer<typeof MessageSchema>>) {
+  const calls: string[] = [];
+  const daemon: ShutdownCheckpointDaemon = {
+    prepareRestart: () => controller.prepare(),
+    stop: async () => {
+      calls.push("stop");
+    },
   };
   return { daemon, calls };
 }
 
 describe("stopWithShutdownCheckpoint", () => {
   test("a running daemon commits a checkpoint before it stops", async () => {
-    const { daemon, calls } = createDaemon({ state: "running" }, async () => ({
-      generationId: "gen-1",
-    }));
+    const { daemon, calls } = createDaemon({ prepare: async () => ({ generationId: "gen-1" }) });
     const logger = createLogger();
 
     const outcome = await stopWithShutdownCheckpoint(daemon, { logger, reason: "test" });
 
     expect(outcome).toMatchObject({ checkpoint: "committed", generationId: "gen-1" });
     expect(calls).toEqual(["prepare", "stop"]);
-    expect(logger.warn).not.toHaveBeenCalled();
+    expect(logger.warnings()).toEqual([]);
   });
 
   test("service cleanup runs after the successful checkpoint and daemon stop", async () => {
-    const { daemon, calls } = createDaemon({ state: "running" }, async () => ({
-      generationId: "gen-cleanup",
-    }));
+    const { daemon, calls } = createDaemon({
+      prepare: async () => ({ generationId: "gen-cleanup" }),
+    });
     await stopWithShutdownCheckpoint(daemon, {
       logger: createLogger(),
       reason: "service stop",
@@ -65,137 +105,132 @@ describe("stopWithShutdownCheckpoint", () => {
     expect(calls).toEqual(["prepare", "stop", "cleanup"]);
   });
 
-  test("a failed checkpoint never starts destructive service cleanup", async () => {
-    const { daemon, calls } = createDaemon({ state: "running" }, async () => {
-      throw new Error("checkpoint write failed");
-    });
+  test.each([
+    ["missing", async () => ({})],
+    ["rejected", () => Promise.reject(new Error("checkpoint write failed"))],
+  ] as const)("a %s checkpoint still stops the daemon and runs cleanup", async (_name, prepare) => {
+    const { daemon, calls } = createDaemon({ prepare });
+    const logger = createLogger();
+
     const outcome = await stopWithShutdownCheckpoint(daemon, {
-      logger: createLogger(),
+      logger,
       reason: "service stop",
       cleanup: async () => {
         calls.push("cleanup");
       },
     });
-    expect(outcome.checkpoint).toBe("failed");
-    expect(calls).toEqual(["prepare"]);
-  });
 
-  test("a preparing daemon joins the checkpoint already in flight", async () => {
-    const { daemon, calls } = createDaemon({ state: "preparing" }, async () => ({
-      generationId: "gen-2",
-    }));
-
-    const outcome = await stopWithShutdownCheckpoint(daemon, {
-      logger: createLogger(),
-      reason: "test",
-    });
-
-    expect(outcome).toMatchObject({ checkpoint: "committed", generationId: "gen-2" });
-    expect(calls).toEqual(["prepare", "stop"]);
-  });
-
-  test("a paused ready generation stops without replacing the checkpoint", async () => {
-    const { daemon, calls } = createDaemon(
-      { state: "paused", stage: "ready", generationId: "gen-ready" },
-      async () => ({ generationId: "never" }),
+    expect(outcome).toMatchObject({ checkpoint: "missing" });
+    expect(calls).toEqual(["prepare", "stop", "cleanup"]);
+    expect(logger.warnings().map((line) => line.message)).toContainEqual(
+      expect.stringContaining("Shutdown checkpoint missing"),
     );
-    expect(
-      await stopWithShutdownCheckpoint(daemon, { logger: createLogger(), reason: "test" }),
-    ).toMatchObject({ checkpoint: "skipped", generationId: "gen-ready" });
-    expect(calls).toEqual(["stop"]);
-  });
-  test("a paused generation handed to replacement stops without replacing the checkpoint", async () => {
-    const { daemon, calls } = createDaemon(
-      { state: "paused", stage: "replacing", generationId: "gen-replacing" },
-      async () => ({ generationId: "never" }),
-    );
-    expect(
-      await stopWithShutdownCheckpoint(daemon, { logger: createLogger(), reason: "test" }),
-    ).toMatchObject({ checkpoint: "skipped", generationId: "gen-replacing" });
-    expect(calls).toEqual(["stop"]);
   });
 
-  test("a controlled restart can stop the worker it is replacing", async () => {
-    const home = await mkdtemp(join(tmpdir(), "paseo-shutdown-replacing-"));
-    const store = new CheckpointStore(home, z.object({ message: z.string() }).parse);
-    const controller = new RestartController({
-      store,
-      capture: async () => ({ message: "retained" }),
-    });
-    const stop = vi.fn(async () => {});
+  test("a controlled restart joins the checkpoint already in flight", async () => {
+    const controller = createController(await mkdtemp(join(tmpdir(), "paseo-shutdown-join-")));
+    const { daemon, calls } = controllerDaemon(controller);
     let outcome: Awaited<ReturnType<typeof stopWithShutdownCheckpoint>> | undefined;
 
     await controller.replace(async () => {
       // Replacement asks the supervisor to stop this worker while the stage is "replacing".
-      outcome = await stopWithShutdownCheckpoint(
-        {
-          getRestartStatus: () => controller.status,
-          prepareRestart: () => controller.prepare(),
-          stop,
-        },
-        { logger: createLogger(), reason: "controlled restart" },
-      );
+      outcome = await stopWithShutdownCheckpoint(daemon, {
+        logger: createLogger(),
+        reason: "controlled restart",
+      });
     });
 
-    expect(outcome).toMatchObject({
-      checkpoint: "skipped",
-      generationId: controller.status.generationId,
-    });
-    expect(stop).toHaveBeenCalledOnce();
+    const { generationId } = await controller.prepare();
+    expect(generationId).toEqual(expect.any(String));
+    expect(outcome).toMatchObject({ checkpoint: "committed", generationId });
+    expect(calls).toEqual(["stop"]);
   });
 
-  test.each(["paused", "restoring"] as const)(
-    "a blocked %s daemon retains execution ownership",
+  test.each(["running", "restoring", "paused"] as const)(
+    "a %s daemon still stops",
     async (state) => {
-      const { daemon, calls } = createDaemon(
-        { state, generationId: "gen-blocked", error: "later work" },
-        async () => ({ generationId: "never" }),
-      );
-      expect(
-        await stopWithShutdownCheckpoint(daemon, { logger: createLogger(), reason: "test" }),
-      ).toMatchObject({ checkpoint: "failed" });
-      expect(calls).toEqual([]);
+      const home = await mkdtemp(join(tmpdir(), `paseo-shutdown-${state}-`));
+      if (state === "restoring") await createController(home).prepare();
+      const controller = createController(home);
+      if (state === "restoring") await controller.claim();
+      if (state === "paused") await controller.prepare();
+      expect(controller.status.state).toBe(state);
+      const { daemon, calls } = controllerDaemon(controller);
+
+      const outcome = await stopWithShutdownCheckpoint(daemon, {
+        logger: createLogger(),
+        reason: "test",
+      });
+
+      expect(outcome).toMatchObject({ checkpoint: "committed" });
+      expect(calls).toEqual(["stop"]);
     },
   );
 
-  test("a failed checkpoint retains the daemon for retry", async () => {
-    const failure = new Error("agents did not quiesce");
-    const { daemon, calls } = createDaemon({ state: "running" }, () => Promise.reject(failure));
+  test("a slow stop is abandoned after the stop limit and cleanup still runs", async () => {
+    const { daemon, calls } = createDaemon({
+      prepare: async () => ({ generationId: "gen-slow" }),
+      stop: () => new Promise(() => {}),
+    });
     const logger = createLogger();
 
-    const outcome = await stopWithShutdownCheckpoint(daemon, { logger, reason: "test" });
-
-    expect(outcome).toMatchObject({ checkpoint: "failed", error: failure });
-    expect(calls).toEqual(["prepare"]);
-    expect(logger.warn).toHaveBeenCalledWith(
-      expect.objectContaining({ err: failure }),
-      expect.stringContaining("failed"),
-    );
-  });
-
-  test("a checkpoint timeout blocks the stop without abandoning preparation", async () => {
-    const { daemon, calls } = createDaemon({ state: "running" }, () => new Promise(() => {}));
-
     const outcome = await stopWithShutdownCheckpoint(daemon, {
-      logger: createLogger(),
+      logger,
       reason: "test",
-      timeoutMs: 20,
+      stopTimeoutMs: 20,
+      cleanup: async () => {
+        calls.push("cleanup");
+      },
     });
 
-    expect(outcome.checkpoint).toBe("failed");
-    expect(String((outcome as { error: unknown }).error)).toContain("did not commit within 20ms");
-    expect(calls).toEqual(["prepare"]);
+    expect(outcome).toMatchObject({ checkpoint: "committed", generationId: "gen-slow" });
+    expect(calls).toEqual(["prepare", "stop", "cleanup"]);
+    expect(logger.warnings()).toEqual([
+      expect.objectContaining({
+        fields: expect.objectContaining({
+          step: "stop",
+          err: new RestartStepTimeoutError("stop", 20),
+        }),
+      }),
+    ]);
   });
 
-  test("a failing stop propagates after the checkpoint outcome is known", async () => {
-    const { daemon } = createDaemon({ state: "running" }, async () => ({ generationId: "gen-3" }));
+  test("a failing stop and a failing cleanup are logged and the function returns", async () => {
     const stopFailure = new Error("server did not close");
-    (daemon.stop as ReturnType<typeof vi.fn>).mockRejectedValue(stopFailure);
+    const cleanupFailure = new Error("cgroup still busy");
+    const { daemon } = createDaemon({
+      prepare: async () => ({ generationId: "gen-3" }),
+      stop: () => Promise.reject(stopFailure),
+    });
+    const logger = createLogger();
 
-    await expect(
-      stopWithShutdownCheckpoint(daemon, { logger: createLogger(), reason: "test" }),
-    ).rejects.toBe(stopFailure);
-    expect(daemon.prepareRestart).toHaveBeenCalledTimes(1);
+    const outcome = await stopWithShutdownCheckpoint(daemon, {
+      logger,
+      reason: "test",
+      cleanup: () => Promise.reject(cleanupFailure),
+    });
+
+    expect(outcome).toMatchObject({ checkpoint: "committed", generationId: "gen-3" });
+    expect(logger.warnings().map((line) => line.fields)).toEqual([
+      expect.objectContaining({ step: "stop", err: stopFailure }),
+      expect.objectContaining({ step: "cleanup", err: cleanupFailure }),
+    ]);
+  });
+
+  test("a slow cleanup is abandoned after the cleanup limit", async () => {
+    const { daemon } = createDaemon({ prepare: async () => ({ generationId: "gen-4" }) });
+    const logger = createLogger();
+
+    await stopWithShutdownCheckpoint(daemon, {
+      logger,
+      reason: "test",
+      cleanup: () => new Promise(() => {}),
+      cleanupTimeoutMs: 20,
+    });
+
+    expect(logger.warnings().map((line) => line.fields)).toEqual([
+      expect.objectContaining({ step: "cleanup", err: new RestartStepTimeoutError("cleanup", 20) }),
+    ]);
   });
 });
 
@@ -203,14 +238,19 @@ describe("shutdown timing", () => {
   test("defaults the checkpoint timeout and derives the supervisor grace from it", () => {
     expect(resolveShutdownCheckpointTimeoutMs({})).toBe(DEFAULT_SHUTDOWN_CHECKPOINT_TIMEOUT_MS);
     expect(resolveWorkerGracefulExitMs({})).toBe(
-      DEFAULT_SHUTDOWN_CHECKPOINT_TIMEOUT_MS + SHUTDOWN_STOP_GRACE_MS,
+      DEFAULT_SHUTDOWN_CHECKPOINT_TIMEOUT_MS +
+        SHUTDOWN_STOP_GRACE_MS +
+        SHUTDOWN_CLEANUP_GRACE_MS +
+        5_000,
     );
   });
 
   test("reads the checkpoint timeout from the environment", () => {
     const env = { [SHUTDOWN_CHECKPOINT_TIMEOUT_ENV]: "5000" };
     expect(resolveShutdownCheckpointTimeoutMs(env)).toBe(5000);
-    expect(resolveWorkerGracefulExitMs(env)).toBe(5000 + SHUTDOWN_STOP_GRACE_MS);
+    expect(resolveWorkerGracefulExitMs(env)).toBe(
+      5000 + SHUTDOWN_STOP_GRACE_MS + SHUTDOWN_CLEANUP_GRACE_MS + 5_000,
+    );
     expect(resolveShutdownCheckpointTimeoutMs({ [SHUTDOWN_CHECKPOINT_TIMEOUT_ENV]: " " })).toBe(
       DEFAULT_SHUTDOWN_CHECKPOINT_TIMEOUT_MS,
     );

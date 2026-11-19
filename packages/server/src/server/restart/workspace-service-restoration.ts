@@ -1,3 +1,4 @@
+import { attempt, type RestartFailureReporter } from "./best-effort.js";
 import type { WorkspaceScriptRuntimeStore } from "../workspace-script-runtime-store.js";
 import type {
   WorkspaceServiceIdentity,
@@ -8,16 +9,27 @@ function key(identity: WorkspaceServiceIdentity): string {
   return `${identity.workspaceId}\0${identity.scriptName}`;
 }
 
+export class WorkspaceServiceRelaunchError extends Error {
+  constructor(
+    readonly identity: WorkspaceServiceIdentity,
+    cause: unknown,
+  ) {
+    super(`Workspace service ${identity.workspaceId}/${identity.scriptName} did not relaunch`, {
+      cause,
+    });
+    this.name = "WorkspaceServiceRelaunchError";
+  }
+}
+
 export class WorkspaceServiceRestoration {
   private desired: WorkspaceServiceRestartSnapshot = [];
-  private readonly launchedTerminalIds: string[] = [];
 
   constructor(
     private readonly runtimeStore: WorkspaceScriptRuntimeStore,
     private readonly launch: (
       identity: WorkspaceServiceIdentity,
     ) => Promise<{ terminalId: string }>,
-    private readonly stopTerminal: (terminalId: string) => Promise<void>,
+    private readonly report: RestartFailureReporter,
   ) {}
 
   capture(): WorkspaceServiceRestartSnapshot {
@@ -45,50 +57,20 @@ export class WorkspaceServiceRestoration {
     );
   }
 
+  /** Launches every installed service. A failed launch is reported as step `service` and
+   *  skipped. Never rejects. Forgets the installed list when it ends. */
   async resume(): Promise<void> {
-    if (this.launchedTerminalIds.length) {
-      throw new Error("Workspace service restoration already owns launched terminals");
+    for (const identity of this.desired) {
+      await attempt(
+        this.report,
+        "service",
+        () =>
+          this.launch(identity).catch((error: unknown) => {
+            throw new WorkspaceServiceRelaunchError(identity, error);
+          }),
+        null,
+      );
     }
-    try {
-      for (const identity of this.desired) {
-        const result = await this.launch(identity);
-        this.launchedTerminalIds.push(result.terminalId);
-      }
-    } catch (error) {
-      const cleanupErrors = await this.rollback();
-      if (cleanupErrors.length) {
-        const failure = new Error("Workspace service restoration and rollback failed", {
-          cause: error,
-        });
-        Object.assign(failure, { cleanupErrors });
-        throw failure;
-      }
-      throw error;
-    }
-  }
-
-  async rollback(): Promise<unknown[]> {
-    const errors: unknown[] = [];
-    for (const terminalId of this.launchedTerminalIds.toReversed()) {
-      try {
-        await this.stopTerminal(terminalId);
-        this.launchedTerminalIds.splice(this.launchedTerminalIds.indexOf(terminalId), 1);
-      } catch (error) {
-        errors.push(error);
-      }
-    }
-    return errors;
-  }
-
-  async rollbackOrThrow(): Promise<void> {
-    const errors = await this.rollback();
-    if (errors.length) {
-      throw new AggregateError(errors, "Failed to stop restored workspace services");
-    }
-  }
-
-  finalize(): void {
     this.desired = [];
-    this.launchedTerminalIds.length = 0;
   }
 }

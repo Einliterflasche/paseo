@@ -21,17 +21,8 @@ export function daemonRestartCommand(): Command {
   )
     .option("--timeout <seconds>", "Replacement readiness deadline (default: 600)")
     .option("--reason <text>", "Reason recorded in checkpoint")
-    .option("--retry-recovery", "Retry retained recovery in the current daemon")
-    .option(
-      "--acknowledge-crash <generation>",
-      "Reconcile the exact consumed generation without replay",
-    )
-    .option(
-      "--orphan-execution-reconciled",
-      "Attest orphan provider execution was inspected and stopped",
-    )
     .action(
-      withOutput<{ action: string; generationId: string | undefined }, []>((options, command) =>
+      withOutput<{ action: string; checkpointRestored: boolean }, []>((options, command) =>
         runRestartCommand(options, command),
       ),
     );
@@ -40,13 +31,7 @@ export function daemonRestartCommand(): Command {
 type ConnectedDaemonClient = Awaited<ReturnType<typeof connectToDaemon>>;
 export type RestartDaemonClient = Pick<
   ConnectedDaemonClient,
-  | "getLastServerInfoMessage"
-  | "getDaemonStatus"
-  | "restartServer"
-  | "retryRecovery"
-  | "acknowledgeCrash"
-  | "observeEvents"
-  | "close"
+  "getLastServerInfoMessage" | "getDaemonStatus" | "restartServer" | "observeEvents" | "close"
 >;
 export interface RestartCommandDependencies {
   connect(options: Parameters<typeof connectToDaemon>[0]): Promise<RestartDaemonClient>;
@@ -61,12 +46,16 @@ const defaultDependencies: RestartCommandDependencies = {
   sleep: delay,
 };
 
+/**
+ * Requests a restart and waits for a replacement worker. The checkpoint is best effort, so any
+ * daemon qualifies, also one that returns no generation or reports no recovery state. A lost
+ * connection during the request means the worker may already be exiting, so the wait continues.
+ */
 export async function runRestartCommand(
   options: CommandOptions,
   _command: Command,
   deps: RestartCommandDependencies = defaultDependencies,
 ) {
-  const operation = recoveryOperation(options);
   const target = options.daemonTarget;
   const deadline = deps.now() + parseTimeoutMs(options.timeout);
   const remaining = () => Math.max(1, deadline - deps.now());
@@ -89,16 +78,13 @@ export async function runRestartCommand(
   const serverId = client.getLastServerInfoMessage()?.serverId;
   let acknowledged = false;
   let generationId: string | undefined;
+  // Server info updates carry the saved generation when the connection drops before the reply.
   const observation = client.observeEvents(["status.server_info"]);
   try {
     await observation.ready;
-    if (operation !== "restart") {
-      await checkSupervisor();
-      return await recoverInCurrentDaemon(client, operation, options);
-    }
     workerPid = (await client.getDaemonStatus({ timeout: remaining() })).pid;
     await checkSupervisor();
-    const request = await requestControlledRestart(client, options.reason, remaining());
+    const request = await requestRestart(client, options.reason, remaining());
     generationId = request.generationId;
     acknowledged = request.acknowledged;
   } finally {
@@ -118,11 +104,11 @@ export async function runRestartCommand(
           throw new Error("Connected peer identity changed");
         const status = await replacement.getDaemonStatus({ timeout: Math.min(1_000, remaining()) });
         const info = replacement.getLastServerInfoMessage();
-        // The previous worker stays paused on the prepared checkpoint until it exits.
         const replaced = status.pid !== workerPid;
-        if (replaced) assertRecoveryHealthy(info);
-        if (replaced && isRestoredGeneration(info, generationId)) {
+        if (replaced && isRunning(info)) {
           await checkSupervisor();
+          const checkpointRestored =
+            generationId !== undefined && info?.restartRecoveryGeneration === generationId;
           return {
             type: "single" as const,
             data: {
@@ -133,12 +119,17 @@ export async function runRestartCommand(
               workerPid: status.pid,
               acknowledged,
               generationId,
+              checkpointRestored,
             },
             schema: {
               idField: "action" as const,
               columns: [],
               renderHuman: () =>
-                `Restarted worker ${workerPid} → ${status.pid} at ${describeDaemonTarget(target)}. Supervisor launch retained.`,
+                `Restarted worker ${workerPid} → ${status.pid} at ${describeDaemonTarget(target)}. Supervisor launch retained. ${
+                  checkpointRestored
+                    ? `Checkpoint ${generationId} restored.`
+                    : "No checkpoint restored; interrupted agents do not resume automatically."
+                }`,
             },
           };
         }
@@ -190,104 +181,34 @@ function isReconnectFailure(error: unknown): boolean {
 
 type RestartInfo = ReturnType<RestartDaemonClient["getLastServerInfoMessage"]>;
 
-async function requestControlledRestart(
+async function requestRestart(
   client: RestartDaemonClient,
   reason: unknown,
   timeout: number,
 ): Promise<{ generationId?: string; acknowledged: boolean }> {
-  const before = client.getLastServerInfoMessage();
-  if (before?.features?.restartRecovery !== true)
-    throw {
-      code: "RESTART_UNSUPPORTED",
-      message: "The selected daemon does not support controlled restart checkpoints.",
-    };
+  const before = client.getLastServerInfoMessage()?.restartRecoveryGeneration;
   try {
     const result = await client.restartServer(
       typeof reason === "string" ? reason : "cli_restart",
       undefined,
       { timeout },
     );
-    if (!result.generationId)
-      throw { code: "RESTART_NOT_CONFIRMED", message: "No checkpoint generation returned." };
     return { generationId: result.generationId, acknowledged: true };
   } catch (error) {
     if (!isReconnectFailure(error)) throw error;
     const observed = client.getLastServerInfoMessage()?.restartRecoveryGeneration;
-    return {
-      generationId: observed !== before.restartRecoveryGeneration ? observed : undefined,
-      acknowledged: false,
-    };
+    return { generationId: observed !== before ? observed : undefined, acknowledged: false };
   }
 }
 
-function assertRecoveryHealthy(info: RestartInfo): void {
-  if (info?.restartRecoveryState === "paused")
-    throw {
-      code: "RESTART_RECOVERY_FAILED",
-      message: info.restartRecoveryError ?? "Restoration paused; checkpoint retained.",
-    };
+// A daemon without restart recovery reports no state; it is ready once it answers.
+function isRunning(info: RestartInfo): boolean {
+  const state = info?.restartRecoveryState;
+  return state === undefined || state === "running";
 }
 
 function describeObservedWorker(pid: number, replaced: boolean, info: RestartInfo): string {
   const state = info?.restartRecoveryState ?? "no recovery state";
   const generation = info?.restartRecoveryGeneration ?? "none";
   return `${replaced ? "Replacement" : "Previous"} worker ${pid} reports ${state} on generation ${generation}`;
-}
-
-function isRestoredGeneration(info: RestartInfo, generationId: string | undefined): boolean {
-  return (
-    !!generationId &&
-    info?.restartRecoveryState === "running" &&
-    info.restartRecoveryGeneration === generationId
-  );
-}
-
-function recoveryOperation(options: CommandOptions): "restart" | "retry" | "crash" {
-  const retry = options.retryRecovery === true;
-  const crash = typeof options.acknowledgeCrash === "string" && options.acknowledgeCrash.length > 0;
-  const attested = options.orphanExecutionReconciled === true;
-  if (options.force === true || (retry && crash) || crash !== attested) {
-    throw {
-      code: "INVALID_OPTIONS",
-      message:
-        "Recovery retry and crash acknowledgment are separate operations; crash acknowledgment requires reconciliation. Forced replacement is unsupported.",
-    };
-  }
-  if (crash) return "crash";
-  return retry ? "retry" : "restart";
-}
-
-async function recoverInCurrentDaemon(
-  client: RestartDaemonClient,
-  operation: "retry" | "crash",
-  options: CommandOptions,
-) {
-  const features = client.getLastServerInfoMessage()?.features;
-  const supported =
-    operation === "retry" ? features?.restartRecoveryRetry : features?.restartCrashAcknowledgment;
-  if (!supported)
-    throw {
-      code: "RECOVERY_UNSUPPORTED",
-      message: "The selected daemon does not support this recovery operation.",
-    };
-  const result =
-    operation === "retry"
-      ? await client.retryRecovery()
-      : await client.acknowledgeCrash(String(options.acknowledgeCrash), true);
-  const info = client.getLastServerInfoMessage();
-  assertRecoveryHealthy(info);
-  if (!isRestoredGeneration(info, result.generationId)) {
-    throw {
-      code: "RECOVERY_NOT_CONFIRMED",
-      message: "The daemon did not report the recovered generation running.",
-    };
-  }
-  return {
-    type: "single" as const,
-    data: {
-      action: operation === "retry" ? "recovery_retried" : "crash_acknowledged",
-      generationId: result.generationId,
-    },
-    schema: { idField: "action" as const, columns: [] },
-  };
 }

@@ -19,11 +19,6 @@
     "declaration": false,
     "sourceMap": true
   },
-  "include": [
-    "scripts/supervisor-entrypoint.ts",
-    "scripts/dev-runner.ts",
-    "scripts/supervisor.ts",
-    "scripts/cleanup-prepared-service.ts"
-  ],
+  "include": ["scripts/supervisor-entrypoint.ts", "scripts/dev-runner.ts", "scripts/supervisor.ts"],
   "exclude": ["node_modules", "dist"]
 }

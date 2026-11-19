@@ -5,7 +5,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
 
-async function runWorker(worker: string, publicationDelay = 0) {
+interface RunWorkerOptions {
+  publicationDelayMs?: number;
+  gracefulExitTimeoutMs?: number;
+}
+
+async function runWorker(worker: string, options: RunWorkerOptions = {}) {
   const home = await mkdtemp(path.join(tmpdir(), "paseo-readiness-"));
   const workerPath = path.join(home, "worker.mjs");
   const runnerPath = path.join(home, "runner.mjs");
@@ -20,9 +25,10 @@ async function runWorker(worker: string, publicationDelay = 0) {
     const record = (event) => appendFile(${JSON.stringify(eventsPath)}, JSON.stringify(event) + "\\n");
     runSupervisor({
       name: "ReadinessTest", startupMessage: "starting", restartOnCrash: true,
+      gracefulExitTimeoutMs: ${options.gracefulExitTimeoutMs ?? 10_000},
       resolveWorkerEntry: () => ${JSON.stringify(workerPath)}, workerArgs: [], workerExecArgv: [],
       onWorkerReady: async ({ listen }) => {
-        await new Promise(resolve => setTimeout(resolve, ${publicationDelay}));
+        await new Promise(resolve => setTimeout(resolve, ${options.publicationDelayMs ?? 0}));
         await record(listen);
       },
       onWorkerExit: () => record(null),
@@ -99,12 +105,38 @@ test("a replacement worker must independently reach ready", async () => {
   expect(result.events, result.output).toEqual(["test-endpoint", null, null]);
 });
 
+test("a restart requested before first readiness replaces the worker", async () => {
+  const result = await runWorker(
+    `
+    import { existsSync, writeFileSync } from "node:fs";
+    const marker = process.argv[1] + ".started";
+    const replacement = existsSync(marker);
+    writeFileSync(marker, "started");
+    process.on("message", message => {
+      if (message.type === "paseo:graceful-shutdown") process.exit(0);
+    });
+    if (replacement) {
+      process.send({ type: "paseo:ready", listen: "replacement", serverId: "srv_test" });
+      process.send({ type: "paseo:shutdown" });
+    } else {
+      // Still restoring: the restart arrives before this worker reports ready.
+      process.send({ type: "paseo:restart", reason: "restart_during_restore" });
+      setInterval(() => {}, 1000);
+    }
+  `,
+    { gracefulExitTimeoutMs: 300 },
+  );
+  expect(result.code, result.output).toBe(0);
+  expect(result.output).not.toContain("before successful readiness");
+  expect(result.events, result.output).toEqual([null, "replacement", null]);
+});
+
 test("exit clears publication after an in-flight ready write", async () => {
   const result = await runWorker(
     `
     process.send({ type: "paseo:ready", listen: "test-endpoint", serverId: "srv_test" }, () => process.exit(0));
   `,
-    100,
+    { publicationDelayMs: 100 },
   );
   expect(result.code).toBe(0);
   expect(result.events.at(-1)).toBeNull();
@@ -121,34 +153,30 @@ test("requested shutdown before first readiness exits successfully", async () =>
   expect(result.events).toEqual([null]);
 });
 
-test("an explicit emergency restart replaces an uncooperative worker and passes its bypass only once", async () => {
-  const restartId = "12345678-1234-1234-1234-123456789abc";
-  const result = await runWorker(`
+test("an ordinary restart replaces an uncooperative worker after the grace period", async () => {
+  const result = await runWorker(
+    `
     import { existsSync, readFileSync, writeFileSync } from "node:fs";
     const marker = process.argv[1] + ".count";
     const count = existsSync(marker) ? Number(readFileSync(marker, "utf8")) : 0;
     writeFileSync(marker, String(count + 1));
     if (count === 0) {
-      process.send({ type: "paseo:ready", listen: "blocked", serverId: "srv_test" });
-      process.send({ type: "paseo:restart-anyway", restartId: "${restartId}" });
-      process.send({ type: "paseo:restart-anyway", restartId: "${restartId}" });
+      process.send({ type: "paseo:ready", listen: "uncooperative", serverId: "srv_test" });
+      process.send({ type: "paseo:restart" });
+      process.send({ type: "paseo:restart" });
       // Deliberately ignore graceful shutdown and keep the worker alive.
       setInterval(() => {}, 1000);
     } else {
       process.on("message", message => {
         if (message.type === "paseo:graceful-shutdown") process.exit(0);
       });
-      process.send({ type: "paseo:ready", listen: process.env.PASEO_RESTART_ANYWAY_ID ?? "ordinary", serverId: "srv_test" });
-      process.send({ type: count === 1 ? "paseo:restart" : "paseo:shutdown" });
+      const bypass = process.env.PASEO_RESTART_ANYWAY_ID ?? process.env.PASEO_SUPERVISOR_RESTART_ANYWAY;
+      process.send({ type: "paseo:ready", listen: bypass ?? "replacement", serverId: "srv_test" });
+      process.send({ type: "paseo:shutdown" });
     }
-  `);
+  `,
+    { gracefulExitTimeoutMs: 300 },
+  );
   expect(result.code, result.output).toBe(0);
-  expect(result.events, result.output).toEqual([
-    "blocked",
-    null,
-    restartId,
-    null,
-    "ordinary",
-    null,
-  ]);
+  expect(result.events, result.output).toEqual(["uncooperative", null, "replacement", null]);
 });

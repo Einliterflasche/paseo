@@ -21,6 +21,7 @@ import {
 } from "./provider-initialization-cleanup-error.js";
 import { AdmissionGate } from "../restart/admission-gate.js";
 import { AgentRestartSuspendedError, RestartInProgressError } from "../restart/restart-errors.js";
+import { RestartStepTimeoutError } from "../restart/best-effort.js";
 import { type AgentCheckpoint } from "../restart/agent-checkpoint.js";
 import {
   continuationPrompt,
@@ -133,6 +134,8 @@ import { extractAttention } from "../persistence-hooks.js";
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
 const IMPORTABLE_SESSION_LIST_TIMEOUT_MS = 90_000;
+// Below the boot's restore limit (120 s), so one hung agent cannot use the whole restore window.
+export const RESTART_RESUME_TIMEOUT_MS = 60_000;
 const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: false,
   supportsSessionPersistence: true,
@@ -216,6 +219,22 @@ interface TimeoutOptions {
   operation: Promise<void>;
   timeoutMs: number;
   onLateError?: (error: unknown) => void;
+}
+
+async function consumeOwnedStream(iterator: AsyncGenerator<AgentStreamEvent>): Promise<void> {
+  for await (const _event of iterator) {
+    /* the recovered run owns its stream */
+  }
+}
+
+function resolveRescueTimeouts(
+  timeouts: AgentManagerRescueTimeouts | undefined,
+): Required<AgentManagerRescueTimeouts> {
+  return {
+    reloadSessionCloseMs: timeouts?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
+    interruptSessionMs: timeouts?.interruptSessionMs ?? INTERRUPT_SESSION_TIMEOUT_MS,
+    restartResumeMs: timeouts?.restartResumeMs ?? RESTART_RESUME_TIMEOUT_MS,
+  };
 }
 
 function formatProviderList(providers: readonly string[]): string {
@@ -324,6 +343,8 @@ export interface ProviderAvailability {
 interface AgentManagerRescueTimeouts {
   reloadSessionCloseMs?: number;
   interruptSessionMs?: number;
+  /** Longest wait for one agent's session resume, and for its first continuation dispatch. */
+  restartResumeMs?: number;
 }
 
 interface ProviderEnabledFlag {
@@ -772,6 +793,10 @@ export class AgentManager {
   private readonly sessionStops = new Map<string, Promise<void>>();
   private readonly explicitStops = new Set<string>();
   private readonly recoveryRegistrations = new Map<string, Promise<ManagedAgent>>();
+  /** Agents whose timeline already says that a restart interrupted their unsaved task. */
+  private readonly unsavedRestartNotices = new Set<string>();
+  /** Advances when a restart quiesce begins; a running resume compares it to stop starting. */
+  private restartQuiesceEpoch = 0;
   private readonly activeDraftProbes = new Map<AgentProbe, string>();
   private readonly outOfBandCompletions = new Map<string, Set<Promise<void>>>();
   private readonly uncertainStarts = new Set<string>();
@@ -819,60 +844,62 @@ export class AgentManager {
     ];
   }
 
-  async pauseForRecoveryFailure(): Promise<void> {
-    await this.quiesceRestartExecution();
+  /** Marks every agent with unfinished work (a run, an active turn, or lifecycle `running`) as
+   *  suspended for restart, with its pending inputs. Skips internal and explicitly stopped agents.
+   *  Safe to call more than once. */
+  private recordRestartSuspensions(): void {
+    for (const agent of this.agents.values()) {
+      // A stopped session decided its continuation when it stopped; a later terminal settled it.
+      if (agent.internal || this.explicitStops.has(agent.id) || this.quiescedSessions.has(agent.id))
+        continue;
+      const hasUnfinishedWork =
+        this.runs.hasRun(agent.id) || agent.activeTurnId !== null || agent.lifecycle === "running";
+      if (!hasUnfinishedWork) continue;
+      const inputs = this.runs.recoveryInputs(agent.id);
+      if (inputs.length || !this.suspendedForRestart.has(agent.id))
+        this.suspendedForRestart.set(agent.id, inputs);
+    }
   }
 
-  /** Stop every owned provider before reporting pause; failed closes remain uncertified. */
+  /** Stops every live provider session before a restart. Records suspensions first. A session or a
+   *  probe that fails to stop, and a retained event failure, are logged with the agent IDs. Never
+   *  rejects because a stop is unconfirmed. Makes a running `resumeRestartCheckpoint` stop
+   *  starting more agents. */
   async quiesceRestartExecution(): Promise<void> {
-    await this.freezeRestartAdmissions();
+    this.restartQuiesceEpoch++;
+    // A probe that does not stop must not end the admission drain early.
+    await Promise.allSettled([this.admissions.freeze(), this.stopProviderProbes()]);
     await Promise.all([
       ...this.foregroundMutationTails.values(),
       ...this.lifecycleMutationTails.values(),
     ]);
     const live = [...this.agents.values()];
-    for (const agent of live) {
-      await this.drainSessionEvents(agent.id);
-      if (
-        !agent.internal &&
-        !this.explicitStops.has(agent.id) &&
-        (this.runs.hasRun(agent.id) || agent.activeTurnId || agent.lifecycle === "running")
-      ) {
-        const inputs = this.runs.recoveryInputs(agent.id);
-        if (inputs.length || !this.suspendedForRestart.has(agent.id))
-          this.suspendedForRestart.set(agent.id, inputs);
-      }
-    }
+    for (const agent of live) await this.drainSessionEvents(agent.id);
+    this.recordRestartSuspensions();
     // A rejection cannot short-circuit cleanup of the other providers.
-    const stopped = await Promise.allSettled([
+    await Promise.allSettled([
       ...live.map((agent) => this.stopRestartSession(agent)),
       this.stopProviderProbes(),
     ]);
-    const errors = stopped.flatMap((result) =>
-      result.status === "rejected" ? [result.reason] : [],
-    );
     await Promise.all(
       [...this.failedUnregisteredStops].map(([session, failure]) =>
         this.closeUnregisteredSession(session, failure.agentId),
       ),
     );
     await this.flushForShutdown();
-    if (
-      errors.length ||
-      this.failedSessionStops.size ||
-      this.failedUnregisteredStops.size ||
-      this.eventFailures.size
-    ) {
-      throw new AggregateError(
-        [
-          ...errors,
-          ...this.failedSessionStops.values(),
-          ...[...this.failedUnregisteredStops.values()].map((failure) => failure.error),
-          ...this.eventFailures.values(),
-        ],
-        "Cannot certify provider teardown and event drain",
+    const unconfirmed = [
+      ...[...this.failedSessionStops].map(([agentId, error]) => ({ agentId, error })),
+      ...this.failedUnregisteredStops.values(),
+      ...[...this.eventFailures].map(([agentId, error]) => ({ agentId, error })),
+    ];
+    if (unconfirmed.length)
+      this.logger.warn(
+        {
+          agentIds: [...new Set(unconfirmed.map((failure) => failure.agentId))],
+          errors: unconfirmed.map((failure) => failure.error),
+        },
+        "Restart continues without confirmed provider teardown or event drain",
       );
-    }
   }
 
   private async stopProviderProbes(): Promise<void> {
@@ -951,8 +978,66 @@ export class AgentManager {
     }
   }
 
-  async quiesceForRestart(): Promise<AgentCheckpoint> {
-    await this.quiesceRestartExecution();
+  /** Builds the checkpoint from the current state. Does not wait for provider stops. Calls
+   *  `recordRestartSuspensions` first. An agent that has unfinished work but no native session
+   *  handle is saved with `continue: false`, logged, and gets one error row in its timeline. A
+   *  failed upload check (`verifyRecoveryInputFiles`) is logged and does not reject. */
+  async captureRestartCheckpoint(): Promise<AgentCheckpoint> {
+    this.recordRestartSuspensions();
+    const inventory = await this.collectRestartInventory();
+    // A continuation can start during the inventory awaits.
+    this.recordRestartSuspensions();
+    const agents: AgentCheckpoint["agents"] = [];
+    const withoutSessionHandle: string[] = [];
+    for (const entry of inventory.values()) {
+      const inputs = this.suspendedForRestart.get(entry.record.id);
+      const hasUnfinishedWork = inputs !== undefined && !this.explicitStops.has(entry.record.id);
+      const hasSessionHandle = Boolean(entry.record.persistence?.sessionId);
+      if (hasUnfinishedWork && !hasSessionHandle) {
+        withoutSessionHandle.push(entry.record.id);
+        this.noteUnsavedRestartTask(entry.record);
+      }
+      const resume = hasUnfinishedWork && hasSessionHandle;
+      agents.push({
+        record: entry.record,
+        continue: resume,
+        inputs: resume ? inputs : [],
+        runId: this.runs.getLogicalId(entry.record.id) ?? entry.runId,
+      });
+    }
+    if (withoutSessionHandle.length)
+      this.logger.warn(
+        { agentIds: withoutSessionHandle },
+        "Agents without a native session handle will not resume after the restart",
+      );
+    await this.registry?.flush();
+    const snapshot: AgentCheckpoint = {
+      timelines: this.timelineStore.exportAll(),
+      children: this.providerSubagents.exportSnapshot(),
+      agents,
+    };
+    await this.runRecoveryStep("Checkpoint keeps inputs whose uploaded files are missing", () =>
+      verifyRecoveryInputFiles(snapshot.agents.flatMap((agent) => agent.inputs)),
+    );
+    return snapshot;
+  }
+
+  /** Without a native session handle nothing resumes the task, so its timeline says so once. */
+  private noteUnsavedRestartTask(record: AgentCheckpoint["agents"][number]["record"]): void {
+    if (this.unsavedRestartNotices.has(record.id) || !this.timelineStore.has(record.id)) return;
+    this.unsavedRestartNotices.add(record.id);
+    this.commitTimeline(
+      record.id,
+      {
+        type: "error",
+        message:
+          "The restart interrupted this task before Paseo could save it. Send a message to continue it.",
+      },
+      record.provider,
+    );
+  }
+
+  private async collectRestartInventory(): Promise<Map<string, AgentCheckpoint["agents"][number]>> {
     // Installed agents which have never launched still own their input and configuration.
     const inventory = new Map<string, AgentCheckpoint["agents"][number]>();
     for (const [id, entry] of this.recoveryInventory) {
@@ -973,29 +1058,25 @@ export class AgentManager {
       await this.registry?.upsert(record);
       inventory.set(agent.id, { record, continue: false, inputs: [] });
     }
-    const agents: AgentCheckpoint["agents"] = [];
-    for (const entry of inventory.values()) {
-      const inputs = this.suspendedForRestart.get(entry.record.id);
-      const resume = inputs !== undefined && !this.explicitStops.has(entry.record.id);
-      if (resume && !entry.record.persistence?.sessionId)
-        throw new Error(
-          `Cannot recover agent ${entry.record.id} without its native session handle`,
-        );
-      agents.push({
-        record: entry.record,
-        continue: resume,
-        inputs: resume ? inputs : [],
-        runId: this.runs.getLogicalId(entry.record.id) ?? entry.runId,
-      });
+    return inventory;
+  }
+
+  /** Runs one best-effort recovery step; a failure is logged with `failureMessage`. */
+  private async runRecoveryStep(
+    failureMessage: string,
+    operation: () => unknown | Promise<unknown>,
+  ): Promise<void> {
+    try {
+      await operation();
+    } catch (error) {
+      this.logger.warn({ err: error }, failureMessage);
     }
-    await this.registry?.flush();
-    const snapshot: AgentCheckpoint = {
-      timelines: this.timelineStore.exportAll(),
-      children: this.providerSubagents.exportSnapshot(),
-      agents,
-    };
-    await verifyRecoveryInputFiles(snapshot.agents.flatMap((agent) => agent.inputs));
-    return snapshot;
+  }
+
+  /** `quiesceRestartExecution()` then `captureRestartCheckpoint()`. */
+  async quiesceForRestart(): Promise<AgentCheckpoint> {
+    await this.quiesceRestartExecution();
+    return this.captureRestartCheckpoint();
   }
 
   private retainRecoveryEntry(entry: AgentCheckpoint["agents"][number]): void {
@@ -1006,20 +1087,6 @@ export class AgentManager {
     this.recoveryInventory.set(entry.record.id, { ...entry, runId });
     this.runs.restoreInputs(entry.record.id, entry.inputs, runId);
     if (entry.continue) this.suspendedForRestart.set(entry.record.id, entry.inputs);
-  }
-
-  exportEmergencyHistory(): Pick<AgentCheckpoint, "timelines" | "children"> {
-    return {
-      timelines: this.timelineStore.exportAll(),
-      children: this.providerSubagents.exportSnapshot(),
-    };
-  }
-
-  installEmergencyHistory(snapshot: Pick<AgentCheckpoint, "timelines" | "children">): void {
-    for (const [id, timeline] of Object.entries(snapshot.timelines)) {
-      if (!this.timelineStore.has(id)) this.timelineStore.restoreSnapshot(id, timeline);
-    }
-    this.providerSubagents.restoreSnapshot(snapshot.children);
   }
 
   async installRestartCheckpoint(snapshot: AgentCheckpoint): Promise<void> {
@@ -1035,97 +1102,318 @@ export class AgentManager {
       if (!this.timelineStore.has(id)) this.timelineStore.restoreSnapshot(id, timeline);
     }
     this.providerSubagents.restoreSnapshot(snapshot.children);
-    for (const entry of this.recoveryInventory.values()) await this.registry?.upsert(entry.record);
-    await this.registry?.flush();
+    // The installed inventory serves reads and the next checkpoint without these writes.
+    for (const entry of this.recoveryInventory.values()) {
+      try {
+        await this.registry?.upsert(entry.record);
+      } catch (error) {
+        this.logger.warn({ err: error, agentId: entry.record.id }, "Failed to save restored agent");
+      }
+    }
+    try {
+      await this.registry?.flush();
+    } catch (error) {
+      this.logger.warn({ err: error }, "Failed to flush restored agents");
+    }
   }
 
+  /** Resumes each agent that the checkpoint marks `continue`, one after the other. Bounds each
+   *  session resume and each first dispatch with the resume limit. A rejection abandons that agent
+   *  (`abandonRestartResume`). A resume timeout abandons that agent. A dispatch timeout stops the
+   *  wait and leaves the dispatch running. `beforeRuns` and `beforeOpen` failures are logged. When
+   *  the loop ends, every `continue` agent that was not resumed is abandoned, unless
+   *  `quiesceRestartExecution` began (then it stays suspended and the next checkpoint carries it).
+   *  An agent that already holds newer work when the loop reaches it only loses its suspension;
+   *  one with a live idle session continues on that session. After a quiesce began, a failed or
+   *  late resume or dispatch leaves the agent suspended.
+   *  Logs one summary line with the resumed, superseded, and skipped agent IDs. Never rejects. */
   async resumeRestartCheckpoint(
     snapshot: AgentCheckpoint,
     beforeRuns?: () => void | Promise<void>,
     beforeOpen?: () => Promise<void>,
   ): Promise<void> {
+    const epoch = this.restartQuiesceEpoch;
+    const isInterrupted = () => this.restartQuiesceEpoch !== epoch;
     await this.admissions.freeze();
-    try {
-      for (const entry of snapshot.agents) this.retainRecoveryEntry(entry);
-      await this.retireIdleRestartSessions(snapshot);
-      for (const entry of snapshot.agents.filter((candidate) => candidate.continue)) {
-        const { record } = entry;
-        if (this.explicitStops.has(record.id)) continue;
-        const handle = toAgentPersistenceHandle(
-          this.getRegisteredProviderIds(),
-          record.persistence,
-        );
-        if (!handle) throw new Error(`Cannot recover native session for ${record.id}`);
-        const existing = this.agents.get(record.id);
-        if (existing) {
-          if (!this.quiescedSessions.has(record.id))
-            throw new Error(`Agent ${record.id} was not stopped`);
-          this.agents.delete(record.id);
-          this.quiescedSessions.delete(record.id);
-        }
-        // Private controller-to-manager work has no AsyncLocalStorage admission privilege.
-        const registration = this.trackAgentRegistrationOperation(
-          this.resumeAgentFromPersistenceInternal(
-            handle,
-            buildConfigOverrides(record),
-            record.id,
-            extractTimestamps(record),
-          ),
-        );
-        this.recoveryRegistrations.set(record.id, registration);
-        try {
-          await registration;
-        } finally {
-          this.recoveryRegistrations.delete(record.id);
-        }
-        // A stop accepted during provider initialization belongs to this attempt.
-        if (this.explicitStops.has(record.id)) {
-          await this.stopRestartSession(this.requireAgent(record.id));
-          continue;
-        }
-        this.runs.clearOutcome(record.id);
-        this.requireAgent(record.id).lifecycle = "running";
+    for (const entry of snapshot.agents) this.retainRecoveryEntry(entry);
+    await this.retireIdleRestartSessions(snapshot);
+    const continuing = snapshot.agents.filter((entry) => entry.continue);
+    const registered: AgentCheckpoint["agents"] = [];
+    const superseded: string[] = [];
+    for (const entry of continuing) {
+      if (isInterrupted()) break;
+      const agentId = entry.record.id;
+      if (this.explicitStops.has(agentId)) continue;
+      if (this.hasNewerRestartWork(entry)) {
+        this.keepNewerRestartWork(agentId);
+        superseded.push(agentId);
+        continue;
       }
-      await beforeRuns?.();
-      for (const entry of snapshot.agents.filter((candidate) => candidate.continue)) {
-        const { record, inputs } = entry;
-        if (this.explicitStops.has(record.id)) continue;
-        const iterator = this.streamAgentInternal(
-          record.id,
-          continuationPrompt(inputs),
-          {
-            ...inputs[0]?.options,
-            clientMessageId: randomUUID(),
-            sender: { kind: "system", source: "Restart recovery" },
-          },
-          (operation) => Promise.resolve().then(operation),
-        );
-        this.runs.restoreInputs(
-          record.id,
-          inputs,
-          entry.runId ?? this.recoveryInventory.get(record.id)!.runId,
-        );
-        await iterator.next();
-        this.suspendedForRestart.delete(record.id);
-        this.emitState(this.requireAgent(record.id));
-        void (async () => {
-          for await (const _event of iterator) {
-            /* owned stream */
-          }
-        })().catch((error) =>
-          this.logger.error({ err: error, agentId: record.id }, "Recovered agent run failed"),
-        );
+      // A client that opened the agent loaded its session already; the continuation uses it.
+      if (this.agents.has(agentId) && !this.quiescedSessions.has(agentId)) {
+        this.markRestartContinuationPending(agentId);
+        registered.push(entry);
+        continue;
       }
-      await beforeOpen?.();
-      // Standalone manager users have no controller; production opens only through its owner.
-      if (!this.recoveryLifecycle) {
-        await this.finalizeRestartRestoration();
-        this.admissions.open();
+      try {
+        if (await this.registerRestartResume(entry, isInterrupted)) registered.push(entry);
+      } catch (error) {
+        this.failRestartResume(entry, error, isInterrupted);
       }
-    } catch (error) {
-      if (!this.recoveryLifecycle) await this.quiesceRestartExecution();
-      throw error;
     }
+    await this.runRecoveryStep("Restart recovery preparation failed before continuations", () =>
+      beforeRuns?.(),
+    );
+    const resumed: string[] = [];
+    for (const entry of registered) {
+      if (isInterrupted()) break;
+      if (this.explicitStops.has(entry.record.id)) continue;
+      if (this.hasNewerRestartWork(entry)) {
+        this.keepNewerRestartWork(entry.record.id);
+        superseded.push(entry.record.id);
+        continue;
+      }
+      try {
+        if (await this.dispatchRestartContinuation(entry, isInterrupted))
+          resumed.push(entry.record.id);
+      } catch (error) {
+        this.failRestartResume(entry, error, isInterrupted);
+      }
+    }
+    const interrupted = isInterrupted();
+    const skipped = this.settleSkippedRestartResumes(
+      continuing,
+      [...resumed, ...superseded],
+      interrupted,
+    );
+    this.logger.info(
+      { resumed, superseded, skipped, interrupted },
+      "Restart recovery resumed agents",
+    );
+    await this.runRecoveryStep("Restart recovery completion step failed", () => beforeOpen?.());
+    // Standalone manager users have no controller; production opens only through its owner.
+    // A quiesce that began owns admissions for the next restart.
+    if (this.recoveryLifecycle || interrupted) return;
+    await this.runRecoveryStep("Failed to retire recovery sessions", () =>
+      this.finalizeRestartRestoration(),
+    );
+    this.admissions.open();
+  }
+
+  /** Admissions can open before the resume loop reaches every agent, so a client may already
+   *  have started a run there. Outcomes live only in this process, so a terminal outcome whose
+   *  run is not the restored run belongs to a run that started and settled after this boot. A
+   *  live idle session alone is not newer work: opening an agent in a client loads it. */
+  private hasNewerRestartWork(entry: AgentCheckpoint["agents"][number]): boolean {
+    const agentId = entry.record.id;
+    const activeTurnId = this.agents.get(agentId)?.activeTurnId ?? null;
+    if (this.runs.hasRun(agentId) || activeTurnId !== null) return true;
+    const outcome = this.runs.getOutcome(agentId);
+    const restoredRunId = entry.runId ?? this.recoveryInventory.get(agentId)?.runId;
+    const isTerminal =
+      outcome?.type === "completed" ||
+      outcome?.type === "failed" ||
+      outcome?.type === "user_canceled";
+    return isTerminal && outcome.runId !== restoredRunId;
+  }
+
+  /** The agent shows its interrupted task as running until the continuation starts. */
+  private markRestartContinuationPending(agentId: string): void {
+    this.runs.clearOutcome(agentId);
+    this.requireAgent(agentId).lifecycle = "running";
+  }
+
+  /** A quiesce that began owns the agent's suspension; the next checkpoint continues it. */
+  private failRestartResume(
+    entry: AgentCheckpoint["agents"][number],
+    error: unknown,
+    isInterrupted: () => boolean,
+  ): void {
+    if (!isInterrupted()) {
+      this.abandonRestartResume(entry, error);
+      return;
+    }
+    this.logger.warn(
+      { err: error, agentId: entry.record.id },
+      "Agent resume failed after a restart quiesce began; the next checkpoint continues it",
+    );
+  }
+
+  /** The newer work owns the agent; a continuation would collide with it. */
+  private keepNewerRestartWork(agentId: string): void {
+    this.logger.info({ agentId }, "Agent has newer work; restart recovery does not resume it");
+    this.suspendedForRestart.delete(agentId);
+    const agent = this.agents.get(agentId);
+    if (agent) this.emitState(agent);
+  }
+
+  /** Abandons each continuing agent that was neither handled nor stopped, unless a restart
+   *  quiesce began. Returns the IDs that did not resume. */
+  private settleSkippedRestartResumes(
+    continuing: AgentCheckpoint["agents"],
+    handled: string[],
+    interrupted: boolean,
+  ): string[] {
+    const skipped: string[] = [];
+    for (const entry of continuing) {
+      const agentId = entry.record.id;
+      if (handled.includes(agentId) || this.explicitStops.has(agentId)) continue;
+      skipped.push(agentId);
+      if (!interrupted && this.suspendedForRestart.has(agentId))
+        this.abandonRestartResume(entry, new Error("Restart recovery did not reach this agent"));
+    }
+    return skipped;
+  }
+
+  /** Registers the native session of one continuing agent. Resolves false when the agent must not
+   *  continue: a stop arrived during registration, or a restart quiesce began. */
+  private async registerRestartResume(
+    entry: AgentCheckpoint["agents"][number],
+    isInterrupted: () => boolean,
+  ): Promise<boolean> {
+    const { record } = entry;
+    const handle = toAgentPersistenceHandle(this.getRegisteredProviderIds(), record.persistence);
+    if (!handle) throw new Error(`Cannot recover native session for ${record.id}`);
+    // The caller continues an unquiesced live session in place; only a quiesced one remains.
+    this.agents.delete(record.id);
+    this.quiescedSessions.delete(record.id);
+    // Private controller-to-manager work has no AsyncLocalStorage admission privilege.
+    const registration = this.trackAgentRegistrationOperation(
+      this.resumeAgentFromPersistenceInternal(
+        handle,
+        buildConfigOverrides(record),
+        record.id,
+        extractTimestamps(record),
+      ),
+    );
+    // A registration that outlives the resume limit still owns its session; a stop waits for it.
+    this.recoveryRegistrations.set(record.id, registration);
+    void registration
+      .finally(() => {
+        if (this.recoveryRegistrations.get(record.id) === registration)
+          this.recoveryRegistrations.delete(record.id);
+      })
+      .catch(() => undefined);
+    const settlement = await this.waitWithTimeout({
+      operation: registration.then(() => undefined),
+      timeoutMs: this.rescueTimeouts.restartResumeMs,
+      onLateError: (error) =>
+        this.logger.warn({ err: error, agentId: record.id }, "Late agent resume failed"),
+    });
+    if (settlement === "timed_out")
+      throw new RestartStepTimeoutError(
+        `resume agent ${record.id}`,
+        this.rescueTimeouts.restartResumeMs,
+      );
+    // A stop accepted during provider initialization belongs to this attempt. A quiesce that
+    // began during it may have missed the new session.
+    if (this.explicitStops.has(record.id) || isInterrupted()) {
+      await this.stopRestartSession(this.requireAgent(record.id)).catch((error: unknown) =>
+        this.logger.warn({ err: error, agentId: record.id }, "Failed to stop resumed agent"),
+      );
+      return false;
+    }
+    this.markRestartContinuationPending(record.id);
+    return true;
+  }
+
+  /** Resolves false when a restart quiesce began during the dispatch; the agent then stays
+   *  suspended. */
+  private async dispatchRestartContinuation(
+    entry: AgentCheckpoint["agents"][number],
+    isInterrupted: () => boolean,
+  ): Promise<boolean> {
+    const { record, inputs } = entry;
+    const iterator = this.streamAgentInternal(
+      record.id,
+      continuationPrompt(inputs),
+      {
+        ...inputs[0]?.options,
+        clientMessageId: randomUUID(),
+        sender: { kind: "system", source: "Restart recovery" },
+      },
+      (operation) => Promise.resolve().then(operation),
+    );
+    this.runs.restoreInputs(
+      record.id,
+      inputs,
+      entry.runId ?? this.recoveryInventory.get(record.id)!.runId,
+    );
+    const firstEvent = iterator.next();
+    void firstEvent
+      .then(() => consumeOwnedStream(iterator))
+      .catch((error: unknown) =>
+        this.logger.error({ err: error, agentId: record.id }, "Recovered agent run failed"),
+      );
+    const settlement = await this.waitWithTimeout({
+      operation: firstEvent.then(() => undefined),
+      timeoutMs: this.rescueTimeouts.restartResumeMs,
+      onLateError: (error) => this.failRestartResume(entry, error, isInterrupted),
+    });
+    if (settlement === "timed_out")
+      this.logger.warn(
+        { agentId: record.id, timeoutMs: this.rescueTimeouts.restartResumeMs },
+        "Continuation dispatch is still running after the resume limit",
+      );
+    if (isInterrupted()) return false;
+    this.suspendedForRestart.delete(record.id);
+    this.emitState(this.requireAgent(record.id));
+    return true;
+  }
+
+  /** Marks one agent as not resumed: clears its suspension, publishes a `failed` run outcome with
+   *  the error, commits a timeline row `{ type: "error", message }` that says Paseo could not
+   *  resume the task after the restart and that a message continues it, and emits its state. */
+  private abandonRestartResume(entry: AgentCheckpoint["agents"][number], error: unknown): void {
+    const agentId = entry.record.id;
+    this.logger.warn({ err: error, agentId }, "Could not resume agent after the restart");
+    this.suspendedForRestart.delete(agentId);
+    this.runs.forgetInputs(agentId);
+    const outcome = this.runs.getOutcome(agentId);
+    // A real terminal that arrived before the failure already settled this run.
+    const isSettled =
+      outcome?.type === "completed" ||
+      outcome?.type === "failed" ||
+      outcome?.type === "user_canceled";
+    if (!isSettled) {
+      this.publishRunOutcome({
+        type: "failed",
+        agentId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      if (this.timelineStore.has(agentId))
+        this.commitTimeline(
+          agentId,
+          {
+            type: "error",
+            message:
+              "Paseo could not resume this task after the restart. Send a message to continue it.",
+          },
+          entry.record.provider,
+        );
+    }
+    const agent = this.agents.get(agentId);
+    if (agent) {
+      // A provider turn that did start keeps the agent running until its own terminal.
+      if (agent.activeTurnId === null) {
+        this.uncertainStarts.delete(agentId);
+        this.runs.clearAgentRun(agentId);
+        // An error state stays visible; any other state ends with the abandoned run.
+        if (agent.lifecycle !== "error") agent.lifecycle = "idle";
+        this.touchUpdatedAt(agent);
+      }
+      this.emitState(agent);
+      return;
+    }
+    const retained = this.recoveryInventory.get(agentId);
+    if (!retained) return;
+    retained.record = { ...retained.record, lastStatus: "closed" };
+    this.dispatchStoredAgentState(retained.record);
+    void this.registry
+      ?.upsert(retained.record)
+      .catch((persistError: unknown) =>
+        this.logger.warn({ err: persistError, agentId }, "Failed to save abandoned agent"),
+      );
   }
 
   private async retireIdleRestartSessions(snapshot: AgentCheckpoint): Promise<void> {
@@ -1134,11 +1422,17 @@ export class AgentManager {
     for (const entry of snapshot.agents.filter((candidate) => !candidate.continue)) {
       const agent = this.agents.get(entry.record.id);
       if (!agent) continue;
-      if (!this.quiescedSessions.has(agent.id))
-        throw new Error(`Agent ${agent.id} was not stopped`);
+      if (!this.quiescedSessions.has(agent.id)) {
+        this.logger.warn({ agentId: agent.id }, "Keeping an idle session that did not stop");
+        continue;
+      }
       const closed = this.prepareAgentForClosure(agent, "restart idle session");
       this.quiescedSessions.delete(agent.id);
-      await this.persistSnapshot(closed);
+      try {
+        await this.persistSnapshot(closed);
+      } catch (error) {
+        this.logger.warn({ err: error, agentId: agent.id }, "Failed to save retired idle session");
+      }
     }
   }
 
@@ -1230,12 +1524,7 @@ export class AgentManager {
     this.resolvePaseoToolPolicy = options.resolvePaseoToolPolicy ?? (() => undefined);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
     this.logger = options.logger.child({ module: "agent", component: "agent-manager" });
-    this.rescueTimeouts = {
-      reloadSessionCloseMs:
-        options.rescueTimeouts?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
-      interruptSessionMs:
-        options.rescueTimeouts?.interruptSessionMs ?? INTERRUPT_SESSION_TIMEOUT_MS,
-    };
+    this.rescueTimeouts = resolveRescueTimeouts(options.rescueTimeouts);
     this.beforeSteerUnavailableFallback = options.beforeSteerUnavailableFallback;
     this.agentStreamCoalescer = new AgentStreamCoalescer({
       windowMs: options.agentStreamCoalesceWindowMs ?? AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS,
@@ -4429,7 +4718,7 @@ export class AgentManager {
       this.failedUnregisteredStops.set(session, { agentId, error });
       this.logger.warn(
         { err: error },
-        "Failed to close unregistered agent session; recovery blocked",
+        "Failed to close unregistered agent session; its stop is unconfirmed",
       );
     }
   }

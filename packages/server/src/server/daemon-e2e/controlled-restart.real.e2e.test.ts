@@ -199,9 +199,9 @@ async function runControlledRestartCheck(provider: RealProvider): Promise<void> 
     // Quiesce-for-restart closes every still-open provider session, including an
     // already-cancelled-but-not-yet-closed one. That close can legitimately append its
     // own settling rows (e.g. a rejected-tool result), same as the deterministic fixture's
-    // "late-close-output". Snapshot AFTER prepareRestart, not before, so this checkpoint
+    // "late-close-output". Snapshot AFTER the checkpoint, not before, so this checkpoint
     // is the baseline compared against post-restart — matching how `prefix` below is taken.
-    const checkpoint = await firstClient.prepareRestart("controlled-restart real e2e");
+    const checkpoint = await first.daemon.prepareRestart();
     expect(checkpoint.generationId).toBeTruthy();
 
     const stoppedTimelineBefore = await firstClient.fetchAgentTimeline(stopped.id, {

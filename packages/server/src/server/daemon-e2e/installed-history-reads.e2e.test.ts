@@ -1,39 +1,40 @@
-import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { expect, onTestFinished, test } from "vitest";
-import { AgentManager } from "../agent/agent-manager.js";
-import { AgentStorage } from "../agent/agent-storage.js";
-import { RestartInProgressError } from "../restart/restart-errors.js";
 import { createCheckpointAgentClient } from "../test-utils/checkpoint-agent-client.js";
 import { DaemonClient } from "../test-utils/daemon-client.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
-import { createTestLogger } from "../../test-utils/test-logger.js";
 
-test("MCP activity and WebSocket fork context read unopened checkpoint history after metadata persistence fails", async () => {
-  const sourceHome = await mkdtemp(join(tmpdir(), "paseo-installed-history-source-"));
-  const logger = createTestLogger();
-  const registry = new AgentStorage(join(sourceHome, "agents"), logger);
-  await registry.initialize();
-  const source = new AgentManager({
-    clients: { codex: createCheckpointAgentClient() },
-    registry,
-    logger,
+test("MCP activity and WebSocket fork context read restored history after metadata persistence fails, and the boot runs", async () => {
+  const sourceRoot = await mkdtemp(join(tmpdir(), "paseo-installed-history-source-"));
+  onTestFinished(() => rm(sourceRoot, { recursive: true, force: true }));
+  const source = await createTestPaseoDaemon({
+    paseoHomeRoot: sourceRoot,
+    cleanup: false,
+    agentClients: { codex: createCheckpointAgentClient() },
   });
-  onTestFinished(async () => {
-    await source.closeAgentsForShutdown();
-    await source.flushForShutdown();
-    await rm(sourceHome, { recursive: true, force: true });
-  });
-  const agent = await source.createAgent(
-    { provider: "codex", cwd: sourceHome, title: "Retained source", modeId: "full-access" },
+  const agent = await source.daemon.agentManager.createAgent(
+    { provider: "codex", cwd: sourceRoot, title: "Retained source", modeId: "full-access" },
     undefined,
     { workspaceId: "installed-history-workspace" },
   );
-  await source.runAgent(agent.id, "finish", { clientMessageId: "saved-input" });
-  const checkpoint = await source.quiesceForRestart();
+  await source.daemon.agentManager.runAgent(agent.id, "finish", { clientMessageId: "saved-input" });
+  const { generationId } = await source.daemon.prepareRestart();
+  expect(generationId).toBeTruthy();
+  await source.close();
+
+  // The target boots from the source checkpoint, but cannot write the agent's metadata.
+  const targetRoot = await mkdtemp(join(tmpdir(), "paseo-installed-history-target-"));
+  const targetHome = join(targetRoot, ".paseo");
+  await cp(join(source.paseoHome, "restart-checkpoints"), join(targetHome, "restart-checkpoints"), {
+    recursive: true,
+  });
+  const [projectDir] = await readdir(join(source.paseoHome, "agents"));
+  await mkdir(join(targetHome, "agents"), { recursive: true });
+  await writeFile(join(targetHome, "agents", projectDir!), "block the agent metadata directory");
 
   let providerStarts = 0;
   const provider = createCheckpointAgentClient();
@@ -43,25 +44,26 @@ test("MCP activity and WebSocket fork context read unopened checkpoint history a
   };
   provider.createSession = forbiddenFactory;
   provider.resumeSession = forbiddenFactory;
-  const target = await createTestPaseoDaemon({ agentClients: { codex: provider } });
+  const target = await createTestPaseoDaemon({
+    paseoHomeRoot: targetRoot,
+    agentClients: { codex: provider },
+  });
   onTestFinished(() => target.close());
-  const recordsPath = join(target.paseoHome, "agents");
-  const parkedRecordsPath = join(target.paseoHome, "agents-before-write-failure");
-  await mkdir(recordsPath, { recursive: true });
-  await rename(recordsPath, parkedRecordsPath);
-  await writeFile(recordsPath, "block the metadata directory during installation");
-  try {
-    await expect(target.daemon.agentManager.installRestartCheckpoint(checkpoint)).rejects.toThrow(
-      "ENOTDIR",
-    );
-  } finally {
-    await rm(recordsPath);
-    await rename(parkedRecordsPath, recordsPath);
-  }
   expect(await target.daemon.agentStorage.get(agent.id)).toBeNull();
   expect(target.daemon.agentManager.getAgent(agent.id)).toBeNull();
   expect(target.daemon.agentManager.hasInstalledHistory(agent.id)).toBe(true);
-  expect(() => target.daemon.agentManager.assertAcceptingWork()).toThrow(RestartInProgressError);
+  expect(() => target.daemon.agentManager.assertAcceptingWork()).not.toThrow();
+
+  const client = new DaemonClient({
+    url: `ws://127.0.0.1:${target.port}/ws`,
+    reconnect: { enabled: false },
+  });
+  onTestFinished(() => client.close());
+  await client.connect();
+  expect(client.getLastServerInfoMessage()).toMatchObject({
+    restartRecoveryState: "running",
+    restartRecoveryGeneration: generationId,
+  });
 
   const mcp = new Client({ name: "installed-history-read-test", version: "1" });
   await mcp.connect(
@@ -80,12 +82,6 @@ test("MCP activity and WebSocket fork context read unopened checkpoint history a
     content: "Showing all 2 activities\n\n[User] finish\npartial-output",
   });
 
-  const client = new DaemonClient({
-    url: `ws://127.0.0.1:${target.port}/ws`,
-    reconnect: { enabled: false },
-  });
-  onTestFinished(() => client.close());
-  await client.connect();
   const fork = await client.buildAgentForkContext(agent.id, { requestId: "retained-fork" });
   expect(fork).toEqual({
     requestId: "retained-fork",
@@ -99,7 +95,7 @@ test("MCP activity and WebSocket fork context read unopened checkpoint history a
         "<chat-history-summary>\n" +
         "Chat history from a previous Paseo agent.\n" +
         "Source agent: Retained source\n" +
-        `Source directory: ${sourceHome}\n\n` +
+        `Source directory: ${sourceRoot}\n\n` +
         "[User] finish\n[Assistant] partial-output\n</chat-history-summary>",
     },
     itemCount: 2,
@@ -108,6 +104,12 @@ test("MCP activity and WebSocket fork context read unopened checkpoint history a
     error: null,
   });
   expect(target.daemon.agentManager.getAgent(agent.id)).toBeNull();
-  expect(() => target.daemon.agentManager.assertAcceptingWork()).toThrow(RestartInProgressError);
   expect(providerStarts).toBe(0);
+  const schedule = await client.scheduleCreate({
+    prompt: "new work after the restored boot",
+    target: { type: "agent", agentId: agent.id },
+    cadence: { type: "cron", expression: "0 0 1 1 *" },
+    runOnCreate: false,
+  });
+  expect(schedule.error).toBeNull();
 }, 30_000);

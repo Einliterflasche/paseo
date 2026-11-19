@@ -24,7 +24,6 @@ type SupervisorLifecycleMessage =
       listen: string;
       serverId: string;
     }
-  | { type: "paseo:restart-anyway"; restartId: string }
   | {
       type: "paseo:restart";
       reason?: string;
@@ -135,17 +134,12 @@ function applyCliFlagOverrides(config: ReturnType<typeof loadConfig>): void {
 }
 
 async function main() {
-  // COMPAT(restartAnywaySupervisor): added in fork v0.10.0, remove gate after 2027-05-03.
-  const supervisorSupportsRestartAnyway = process.env.PASEO_SUPERVISOR_RESTART_ANYWAY === "1";
-  delete process.env.PASEO_SUPERVISOR_RESTART_ANYWAY;
-  const restartAnywayId = process.env.PASEO_RESTART_ANYWAY_ID;
-  delete process.env.PASEO_RESTART_ANYWAY_ID;
   const serviceCgroup = process.env.PASEO_SERVICE_CGROUP;
   // Agent-launched daemons must never inherit authority over this service group.
   delete process.env.PASEO_SERVICE_CGROUP;
   const { paseoHome, logger, config } = bootstrapFromEnvironment();
   let daemon: Awaited<ReturnType<typeof createPaseoDaemon>> | null = null;
-  let shutdownPromise: Promise<number | null> | null = null;
+  let shutdownPromise: Promise<number> | null = null;
 
   applyCliFlagOverrides(config);
   // Resolve at boot, not at shutdown, so a malformed budget fails visibly.
@@ -166,37 +160,31 @@ async function main() {
       );
 
       shutdownPromise = (async () => {
-        try {
-          if (!daemon) {
-            logger.error("Shutdown requested before daemon initialization completed");
-            return 1;
-          }
-          // A running daemon checkpoints first so the next start restores this
-          // work instead of pausing recovery.
-          const outcome = await stopWithShutdownCheckpoint(daemon, {
-            logger,
-            reason,
-            timeoutMs: shutdownCheckpointTimeoutMs,
-            cleanup: serviceCgroup
-              ? async () =>
-                  cleanupServiceCgroup(
-                    await openServiceCgroup(serviceCgroup, [process.pid, process.ppid]),
-                  )
-              : undefined,
-          });
-          if (outcome.checkpoint === "failed") return null;
-          logger.info("Server closed");
-          return options?.successExitCode ?? 0;
-        } catch (err) {
-          logger.error({ err }, "Shutdown failed; execution ownership remains retained");
-          return null;
+        if (!daemon) {
+          logger.error("Shutdown requested before daemon initialization completed");
+          return 1;
         }
+        // The checkpoint, the stop, and the cleanup are each bounded and never reject.
+        await stopWithShutdownCheckpoint(daemon, {
+          logger,
+          reason,
+          cleanup: serviceCgroup
+            ? async () =>
+                cleanupServiceCgroup(
+                  await openServiceCgroup(serviceCgroup, [process.pid, process.ppid]),
+                )
+            : undefined,
+        });
+        logger.info("Server closed");
+        return options?.successExitCode ?? 0;
       })();
-      void shutdownPromise.then((exitCode) => {
-        if (exitCode === null) shutdownPromise = null;
-        else process.exit(exitCode);
-        return undefined;
-      });
+      void shutdownPromise.then(
+        (exitCode) => process.exit(exitCode),
+        (err: unknown) => {
+          logger.error({ err }, "Shutdown failed; exiting");
+          exitAfterPinoFlush();
+        },
+      );
     } else {
       logger.info(
         { signal, reason, ...getProcessDiagnostics() },
@@ -219,26 +207,6 @@ async function main() {
   };
 
   const handleLifecycleIntent = async (intent: DaemonLifecycleIntent) => {
-    if (intent.type === "restart" && intent.restartAnyway) {
-      if (!supervisorSupportsRestartAnyway || !process.send || !process.connected)
-        throw new Error("The restart supervisor is unavailable");
-      await new Promise<void>((resolve, reject) => {
-        process.send!(
-          {
-            type: "paseo:restart-anyway",
-            restartId: intent.requestId,
-          } satisfies SupervisorLifecycleMessage,
-          (error: Error | null) => {
-            if (error) {
-              reject(error);
-              return;
-            }
-            resolve();
-          },
-        );
-      });
-      return;
-    }
     if (intent.type === "shutdown") {
       logger.warn(
         { clientId: intent.clientId, requestId: intent.requestId, reason: intent.reason },
@@ -303,13 +271,6 @@ async function main() {
         return;
       }
       const type = (message as { type?: unknown }).type;
-      if (type === "paseo:restart-anyway-failed") {
-        const error = (message as { error?: unknown }).error;
-        daemon?.restartAnywayFailed(
-          new Error(typeof error === "string" ? error : "Emergency restart failed"),
-        );
-        return;
-      }
       if (type === "paseo:supervisor-heartbeat") {
         lastSupervisorHeartbeatAt = Date.now();
         return;
@@ -350,11 +311,7 @@ async function main() {
       {
         ...config,
         onLifecycleIntent: handleLifecycleIntent,
-        restartAnywaySupported:
-          supervisorSupportsRestartAnyway &&
-          typeof process.send === "function" &&
-          process.connected,
-        restartAnywayId,
+        restartPrepareTimeoutMs: shutdownCheckpointTimeoutMs,
       },
       logger,
     );

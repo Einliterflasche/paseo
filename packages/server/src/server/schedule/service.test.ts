@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { AgentManager } from "../agent/agent-manager.js";
-import { AgentStorage } from "../agent/agent-storage.js";
+import { AgentStorage, parseStoredAgentRecord } from "../agent/agent-storage.js";
 import { AgentTurnStartUncertainError } from "../agent/agent-turn-start-uncertain-error.js";
 import { createAgentCommand } from "../agent/create-agent/create.js";
 import type {
@@ -36,6 +36,8 @@ import {
 import { archiveByScope, type ActiveWorkspaceRef } from "../workspace-archive-service.js";
 import { AgentRestartSuspendedError, RestartInProgressError } from "../restart/restart-errors.js";
 import {
+  keepContinuingScheduleRuns,
+  ScheduleRestartSnapshotSchema,
   ScheduleService,
   ScheduleTargetGoneError,
   type ScheduleServiceOptions,
@@ -3849,6 +3851,119 @@ describe("ScheduleService", () => {
     await expect(service.snapshotForRestart()).rejects.toThrow("Schedule admission did not settle");
   });
 
+  test("controlled restart: fallback snapshot keeps a running run owned after an admission failure", async () => {
+    const agentId = "55555555-5555-4555-8555-555555555555";
+    const workspaceId = "wks_fallback";
+    const store = new ScheduleStore(join(tempDir, "schedules"));
+    const assignAgent = (record: StoredSchedule): StoredSchedule => ({
+      ...record,
+      runs: [{ ...record.runs[0]!, agentId, workspaceId }],
+    });
+    const runner = vi.fn(async (schedule: StoredSchedule) => {
+      await store.update(schedule.id, assignAgent);
+      throw new RestartInProgressError();
+    });
+    const agentManager = new AgentManager({ logger: createTestLogger() });
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner,
+    });
+    const created = await service.create({
+      prompt: "rejected after assignment",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: {
+        type: "new-agent",
+        config: { provider: "claude", cwd: tempDir, archiveOnFinish: true },
+      },
+    });
+    await service.runOnce(created.id);
+    const runId = (await service.inspect(created.id)).runs[0]!.id;
+
+    await expect(service.snapshotForRestart()).rejects.toThrow("Schedule admission did not settle");
+    const snapshot = await service.snapshotRunningRunsForRestart();
+    expect(snapshot).toEqual({
+      runs: [
+        expect.objectContaining({
+          scheduleId: created.id,
+          runId,
+          agentId,
+          workspaceId,
+          manual: true,
+        }),
+      ],
+    });
+
+    const archiveWorkspace = vi.fn(async () => {});
+    const restored = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      archiveWorkspace,
+      now: () => now,
+      runner: vi.fn(),
+    });
+    vi.spyOn(agentManager, "subscribeRunOutcome").mockImplementation(() => () => {});
+    restored.restoreAfterRestart(ScheduleRestartSnapshotSchema.parse(snapshot));
+    await restored.initializeRecoveryState();
+
+    expect((await restored.inspect(created.id)).runs).toEqual([
+      expect.objectContaining({ id: runId, status: "running", endedAt: null }),
+    ]);
+    expect((await restored.snapshotRunningRunsForRestart()).archives).toBeUndefined();
+    restored.resumeAfterRestartFailure();
+    await restored.stop();
+    expect(archiveWorkspace).not.toHaveBeenCalled();
+  });
+
+  test("controlled restart: fallback snapshot skips a run without an agent", async () => {
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner: () => new Promise<ScheduleExecutionResult>(() => {}),
+    });
+    const created = await service.create({
+      prompt: "stalls before an agent exists",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+    now = new Date("2026-01-01T00:01:00.000Z");
+    void service.tick();
+    await vi.waitFor(async () => {
+      expect((await service.inspect(created.id)).runs).toHaveLength(1);
+    });
+
+    expect(await service.snapshotRunningRunsForRestart()).toEqual({ runs: [] });
+  });
+
+  test("controlled restart: fallback snapshot is empty when the store cannot be read", async () => {
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+    });
+    const list = vi
+      .spyOn(ScheduleStore.prototype, "list")
+      .mockRejectedValueOnce(new Error("disk unavailable"));
+
+    expect(await service.snapshotRunningRunsForRestart()).toEqual({ runs: [] });
+    expect(list).toHaveBeenCalledTimes(1);
+    list.mockRestore();
+  });
+
   test.each(["suspended", "write failed"] as const)(
     "controlled restart: restored run stays owned when %s",
     async (outcome) => {
@@ -3935,6 +4050,145 @@ describe("ScheduleService", () => {
       update.mockRestore();
     },
   );
+
+  test("controlled restart: keepContinuingScheduleRuns keeps only runs whose agent continues", () => {
+    const run = (agentId: string) => ({
+      scheduleId: `schedule-${agentId}`,
+      runId: `run-${agentId}`,
+      agentId,
+      workspaceId: null,
+      manual: false,
+    });
+    const agent = (id: string, shouldContinue: boolean) => ({
+      record: parseStoredAgentRecord({
+        id,
+        provider: "claude",
+        cwd: tempDir,
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+      }),
+      continue: shouldContinue,
+      inputs: [],
+    });
+    const archives = [{ scheduleId: "schedule-x", runId: "run-x", workspaceId: "wks_x" }];
+    const schedules = {
+      runs: [run("continuing"), run("stopped"), run("missing"), run("")],
+      archives,
+    };
+    const before = structuredClone(schedules);
+
+    const kept = keepContinuingScheduleRuns(schedules, [
+      agent("continuing", true),
+      agent("stopped", false),
+      agent("", true),
+    ]);
+
+    expect(kept).toEqual({ runs: [run("continuing")], archives });
+    expect(schedules).toEqual(before);
+  });
+
+  test("controlled restart: a run left out for a non-continuing agent fails at boot and frees its schedule", async () => {
+    const keptAgentId = "55555555-5555-4555-8555-555555555555";
+    const droppedAgentId = "77777777-7777-4777-8777-777777777777";
+    const manager = new AgentManager({ logger: createTestLogger() });
+    vi.spyOn(manager, "subscribeRunOutcome").mockImplementation(() => () => {});
+    const archiveWorkspace = vi.fn(async () => {});
+    const runner = vi.fn(async () => ({ agentId: null, output: "next tick" }));
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: manager,
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      archiveWorkspace,
+      now: () => now,
+      runner,
+    });
+    const target = {
+      type: "new-agent" as const,
+      config: { provider: "claude", cwd: tempDir, archiveOnFinish: true },
+    };
+    const cadence = { type: "every" as const, everyMs: 60_000 };
+    const kept = await service.create({ prompt: "kept", cadence, target });
+    const dropped = await service.create({ prompt: "dropped", cadence, target });
+    const store = new ScheduleStore(join(tempDir, "schedules"));
+    const runningRun = (id: string, agentId: string) => ({
+      id,
+      agentId,
+      workspaceId: `wks_${id}`,
+      scheduledFor: now.toISOString(),
+      startedAt: now.toISOString(),
+      endedAt: null,
+      status: "running" as const,
+      output: null,
+      error: null,
+    });
+    await store.update(kept.id, (record) => ({
+      ...record,
+      runs: [runningRun("kept-run", keptAgentId)],
+    }));
+    await store.update(dropped.id, (record) => ({
+      ...record,
+      runs: [runningRun("dropped-run", droppedAgentId)],
+    }));
+    const snapshotRun = (scheduleId: string, runId: string, agentId: string) => ({
+      scheduleId,
+      runId,
+      agentId,
+      workspaceId: `wks_${runId}`,
+      logicalRunId: runId,
+      manual: false,
+    });
+    const agent = (id: string, shouldContinue: boolean) => ({
+      record: parseStoredAgentRecord({
+        id,
+        provider: "claude",
+        cwd: tempDir,
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+      }),
+      continue: shouldContinue,
+      inputs: [],
+    });
+
+    service.restoreAfterRestart(
+      keepContinuingScheduleRuns(
+        {
+          runs: [
+            snapshotRun(kept.id, "kept-run", keptAgentId),
+            snapshotRun(dropped.id, "dropped-run", droppedAgentId),
+          ],
+        },
+        [agent(keptAgentId, true), agent(droppedAgentId, false)],
+      ),
+    );
+    await service.initializeRecoveryState();
+
+    expect((await service.inspect(dropped.id)).runs).toEqual([
+      expect.objectContaining({ id: "dropped-run", status: "failed" }),
+    ]);
+    expect((await service.inspect(kept.id)).runs).toEqual([
+      expect.objectContaining({ id: "kept-run", status: "running" }),
+    ]);
+    expect((await service.snapshotRunningRunsForRestart()).archives).toEqual([
+      { scheduleId: dropped.id, runId: "dropped-run", workspaceId: "wks_dropped-run" },
+    ]);
+
+    now = new Date("2026-01-01T00:01:00.000Z");
+    await service.tick();
+    await vi.waitFor(async () => {
+      expect((await service.inspect(dropped.id)).runs).toEqual(
+        expect.arrayContaining([expect.objectContaining({ status: "succeeded" })]),
+      );
+    });
+    expect(runner).toHaveBeenCalledTimes(1);
+    await expect(service.runOnce(kept.id)).rejects.toThrow("already running");
+    await expect(service.delete(kept.id)).rejects.toThrow("Wait for the current run");
+    await vi.waitFor(() => expect(service.delete(dropped.id)).resolves.toBeUndefined());
+    expect((await service.list()).map((schedule) => schedule.id)).toEqual([kept.id]);
+    service.resumeAfterRestartFailure();
+    await service.stop();
+  });
 
   test("controlled restart: a failed terminal write retains its decision and retries that same outcome before checkpointing", async () => {
     const originalUpdate = ScheduleStore.prototype.update;
